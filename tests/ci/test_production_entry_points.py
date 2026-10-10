@@ -68,12 +68,6 @@ INSTALL_PROVIDES: dict[str, frozenset[str]] = {
     "--disable-pip-version-check --require-hashes --only-binary=:all: "
     "-r requirements/release.lock": (CORE_MODULES - frozenset({"tongs"}))
     | frozenset({"jsonschema"}),
-    # The PyPI build job installs the same hash-locked closure, and no tongs.
-    "python -I -m pip install --isolated --disable-pip-version-check "
-    "--require-hashes --only-binary=:all: -r requirements/release.lock": (
-        CORE_MODULES - frozenset({"tongs"})
-    )
-    | frozenset({"jsonschema"}),
     '"$CANDIDATE_PYTHON" -I -m pip install --isolated '
     "--disable-pip-version-check --no-deps --no-build-isolation -e .": frozenset(
         {"tongs"}
@@ -81,8 +75,9 @@ INSTALL_PROVIDES: dict[str, frozenset[str]] = {
     '"$CANDIDATE_PYTHON" -I -m pip install --isolated '
     '--disable-pip-version-check -e ".[dev]" '
     '"sigstore==${SIGSTORE_VERSION}"': CORE_MODULES | DEV_MODULES,
-    # The tag-path RPM job and the installed-core fixture wheel install the
-    # same lock into the runner's Python, and the RPM job then tongs alone.
+    # The PyPI build job, the tag-path RPM job and the installed-core fixture
+    # wheel install the same lock into the runner's Python; only the RPM job
+    # then installs tongs, alone.
     "python -I -m pip install --isolated --disable-pip-version-check "
     "--require-hashes --only-binary=:all: -r requirements/release.lock": (
         CORE_MODULES - frozenset({"tongs"})
