@@ -401,6 +401,63 @@ test("a paused submission returns to editing beside Resume without sending more"
     view.queryAllByRole("button", { name: "Submit review" }).length,
     1,
   );
+  // The attempt was returned to editing, so it is no longer offered for
+  // recovery.
+  assert.equal(
+    view.queryAllByRole("button", { name: /Recover paused attempt/ }).length,
+    0,
+  );
+});
+
+test("a listed paused attempt returned to editing leaves the recovery list", async () => {
+  const review = "review-drawer-listed-paused-return";
+  const kept = content({ body: "Kept summary", verdict: "approve" });
+  const paused = {
+    ...submission(review, "paused", 2),
+    state: "submitting",
+    failure: {
+      code: "invalid_input",
+      message: "The forge rejected this request as invalid.",
+      retryable: false,
+      step_id: "verdict",
+    },
+  };
+  const view = renderDiff(
+    diffBridge(review, {
+      listReviewDrafts: () =>
+        read({ cursor: 0, next_cursor: null, drafts: [draft(review, 2, kept)] }),
+      listReviewSubmissions: () =>
+        read({ cursor: 0, next_cursor: null, attempts: [paused] }),
+      reconcileReviewSubmission: async () => ({
+        ...submission(review, "editable", 2),
+        state: "editable",
+      }),
+      getReviewDraft: () => read(draft(review, 4, kept)),
+    }),
+    review,
+  );
+  fireEvent.click(await view.findByRole("button", { name: /Your review/ }));
+  fireEvent.click(
+    await view.findByRole("button", { name: /Recover paused attempt/ }),
+  );
+  fireEvent.click(
+    await view.findByRole("button", { name: "Return draft to editing" }),
+  );
+  await waitFor(() =>
+    assert.equal(
+      view.queryAllByRole("button", { name: "Return draft to editing" }).length,
+      0,
+    ),
+  );
+  assert.equal(view.queryAllByLabelText("Submission steps").length, 0);
+  assert.equal(
+    view.queryAllByRole("button", { name: /Recover paused attempt/ }).length,
+    0,
+  );
+  assert.equal(
+    view.queryAllByText("Durable submission recovery").length,
+    0,
+  );
 });
 
 test("a refused start adopts the stored draft version before the next save", async () => {
