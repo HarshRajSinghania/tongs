@@ -60,6 +60,14 @@ export interface ReviewFailureDto extends ServiceErrorDto { readonly repository:
 export interface ListReviewsParams { readonly scope: string; readonly repository?: OpaqueHandle; readonly state?: string; readonly per_page?: number; readonly cursor?: string; readonly fresh?: boolean; }
 /** `next_cursor` is set when a repository-scoped All Open read has another page. */
 export interface ReviewListResult { readonly items: readonly ReviewListItemDto[]; readonly failures: readonly ReviewFailureDto[]; readonly next_cursor?: string | null; }
+/** A list read leaves CI `unknown` where the forge would need a request per row. */
+export type CIStatusValue = "pending" | "running" | "success" | "failed" | "canceled" | "skipped" | "unknown";
+export const CI_STATUS_VALUES: readonly CIStatusValue[] = Object.freeze([
+  "pending", "running", "success", "failed", "canceled", "skipped", "unknown",
+]);
+/** `fresh` reads past the service's CI cache, as after an explicit refresh. */
+export interface ReviewCIStatusParams { readonly review: OpaqueHandle; readonly fresh?: boolean; }
+export interface ReviewCIStatusResult { readonly ci_status: CIStatusValue; }
 export interface ReviewSnapshotDto {
   readonly handle: OpaqueHandle; readonly repository: OpaqueHandle;
   readonly detail: ReviewDetailDto; readonly capabilities: ForgeCapabilitiesDto;
@@ -130,6 +138,7 @@ export interface DesktopBridge extends CIDesktopBridge, ReviewDesktopBridge, Wor
   openRepository(params: OpenRepositoryParams): DesktopRead<RepositoryDto>;
   listReviews(params: ListReviewsParams): DesktopRead<ReviewListResult>;
   getReview(review: OpaqueHandle): DesktopRead<ReviewSnapshotDto>;
+  getReviewCIStatus(params: ReviewCIStatusParams): DesktopRead<ReviewCIStatusResult>;
   openDiff(params: OpenDiffParams): DesktopRead<DiffPage>;
   pageDiff(params: PageParams): DesktopRead<DiffPage>;
   listDiscussions(review: OpaqueHandle): DesktopRead<DiscussionsPage>;
@@ -153,7 +162,8 @@ export interface DesktopBridge extends CIDesktopBridge, ReviewDesktopBridge, Wor
 
 export const IPC_CHANNELS = Object.freeze({
   discoverRepositories: "tongs:repositories.discover", openRepository: "tongs:repositories.open",
-  listReviews: "tongs:reviews.list", getReview: "tongs:reviews.get", openDiff: "tongs:diff.open",
+  listReviews: "tongs:reviews.list", getReview: "tongs:reviews.get",
+  getReviewCIStatus: "tongs:reviews.ci-status", openDiff: "tongs:diff.open",
   pageDiff: "tongs:diff.page", listDiscussions: "tongs:discussions.list",
   pageDiscussions: "tongs:discussions.page", listCommits: "tongs:commits.list",
   listPipelines: "tongs:pipelines.list", listReviewPipelines: "tongs:review-pipelines.list", listJobs: "tongs:jobs.list",
