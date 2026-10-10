@@ -37,6 +37,18 @@ from tongs.forges.models import (
     User,
 )
 
+# The pull request files API lists at most this many files.
+_PR_FILES_CAP = 3000
+
+
+def _files_overflowed(changed_files: object) -> bool:
+    """Return whether a pull request has more files than the files API lists."""
+    return (
+        isinstance(changed_files, int)
+        and not isinstance(changed_files, bool)
+        and changed_files > _PR_FILES_CAP
+    )
+
 
 def _parse_datetime(value: str | None) -> datetime | None:
     if not value:
@@ -956,6 +968,7 @@ class GitHubClient(ForgeClient):
             changes_count=data.get("changed_files", 0),
             head_sha=data.get("head", {}).get("sha", ""),
             base_sha=data.get("base", {}).get("sha", ""),
+            changes_overflow=_files_overflowed(data.get("changed_files")),
         )
 
     def _parse_review_comment(self, data: dict) -> InlineComment:

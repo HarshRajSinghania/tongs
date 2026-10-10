@@ -179,6 +179,42 @@ class TestRevisionMetadata:
         assert detail.start_sha is None
 
 
+class TestChangesOverflow:
+    """GitHub's pull request files API lists at most 3,000 files."""
+
+    @pytest.mark.parametrize(
+        ("changed_files", "count", "overflow"),
+        [
+            (3001, 3001, True),
+            (3000, 3000, False),
+            (12, 12, False),
+        ],
+    )
+    def test_detail_flags_more_files_than_the_api_lists(
+        self, changed_files: int, count: int, overflow: bool
+    ):
+        client, _ = _make_github_client(lambda _: httpx.Response(200))
+        data = _pr_api_json({"changed_files": changed_files})
+        detail = client._parse_pr_detail(data, "acme/repo")
+        assert detail.changes_count == count
+        assert detail.changes_overflow is overflow
+
+    @pytest.mark.parametrize("changed_files", [None, True, "5000"])
+    def test_detail_without_an_integer_count_does_not_overflow(
+        self, changed_files: object
+    ):
+        client, _ = _make_github_client(lambda _: httpx.Response(200))
+        data = _pr_api_json({"changed_files": changed_files})
+        detail = client._parse_pr_detail(data, "acme/repo")
+        assert detail.changes_overflow is False
+
+    def test_missing_changed_files_does_not_overflow(self):
+        client, _ = _make_github_client(lambda _: httpx.Response(200))
+        detail = client._parse_pr_detail(_pr_api_json(), "acme/repo")
+        assert detail.changes_count == 0
+        assert detail.changes_overflow is False
+
+
 class TestCreateInlineComment:
     @pytest.mark.asyncio
     async def test_single_line_no_start_line_or_start_side(self):

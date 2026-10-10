@@ -9,7 +9,13 @@ from tongs.forges.models import CIStatus, MRDetail, ReviewDecision
 
 def test_mr_detail_revision_fields_are_appended_for_positional_compatibility():
     names = [field.name for field in fields(MRDetail)]
-    assert names[-3:] == ["head_sha", "base_sha", "start_sha"]
+    assert names[-4:-1] == ["head_sha", "base_sha", "start_sha"]
+
+
+def test_mr_detail_changes_overflow_is_appended_last_and_defaults_false():
+    detail_fields = fields(MRDetail)
+    assert detail_fields[-1].name == "changes_overflow"
+    assert detail_fields[-1].default is False
 
 
 class TestForgeModels:
