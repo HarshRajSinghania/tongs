@@ -9,7 +9,7 @@ from urllib.parse import quote as urlquote
 
 import httpx
 
-from tongs.errors import ForgeError, NetworkError, redact_credentials
+from tongs.errors import ForgeError, NetworkError, NotFoundError, redact_credentials
 from tongs.forges.base import ForgeClient
 from tongs.forges.http import map_http_error, paginate, request, request_page
 from tongs.forges.models import (
@@ -30,6 +30,15 @@ from tongs.forges.models import (
     SourceCleanupStatus,
     User,
 )
+
+_DIFFS_PER_PAGE = 100
+_DIFFS_MAX_PAGES = 30
+"""Pages of ``/diffs`` read at most for one merge request.
+
+GitLab's diff limits cap a merge request diff at 1000 files by default, and an
+administrator can raise the "Maximum number of files per diff" to 3000 at
+most, so 30 pages of 100 files hold the largest diff GitLab will return.
+"""
 
 
 def _encode_project(repo_path: str) -> str:
@@ -386,13 +395,21 @@ class GitLabClient(ForgeClient):
         per-file shape, ``a_mode``/``b_mode`` included.  Whether GitLab capped
         the changed file list is still read from the merge request's
         ``changes_count``, so the overflow banner does not depend on this call.
+        GitLab added ``/diffs`` in 15.7, so a 404 from it falls back once to
+        ``/changes`` and older self-managed instances keep working.
         """
         project = _encode_project(repo_path)
-        data = await paginate(
-            self._http,
-            f"/projects/{project}/merge_requests/{number}/diffs",
-            per_page=100,
-        )
+        base = f"/projects/{project}/merge_requests/{number}"
+        try:
+            data = await paginate(
+                self._http,
+                f"{base}/diffs",
+                per_page=_DIFFS_PER_PAGE,
+                max_pages=_DIFFS_MAX_PAGES,
+            )
+        except NotFoundError:
+            legacy = await request(self._http, "GET", f"{base}/changes")
+            data = legacy.get("changes", []) if isinstance(legacy, dict) else []
         return [change for change in data if isinstance(change, dict)]
 
     async def list_mr_commits(self, repo_path: str, number: int) -> list[Commit]:

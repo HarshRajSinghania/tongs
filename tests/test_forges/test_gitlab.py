@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import httpx
 import pytest
 
-from tongs.errors import ForgeError
+from tongs.errors import ForgeError, NotFoundError
 from tongs.forges.gitlab import (
     GitLabClient,
     _encode_project,
@@ -1118,3 +1118,64 @@ async def test_overflow_signal_still_comes_from_the_merge_request() -> None:
         detail = await client.get_mr("acme/widgets", 42)
 
     assert detail.changes_overflow is True
+
+
+@pytest.mark.asyncio
+async def test_get_mr_diff_falls_back_to_changes_before_gitlab_15_7() -> None:
+    """GitLab older than 15.7 has no ``/diffs``; ``/changes`` is read once."""
+    seen: list[str] = []
+    legacy = {**_diff_entry(0), "b_mode": "100755"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.raw_path.decode().split("?", 1)[0]
+        seen.append(path)
+        if path.endswith("/diffs"):
+            return httpx.Response(404, json={"message": "404 Not Found"})
+        if path.endswith("/changes"):
+            return httpx.Response(200, json={"iid": 42, "changes": [legacy]})
+        return httpx.Response(500, json={"message": "unexpected request"})
+
+    client, http = _make_gitlab_client(handler)
+    async with http:
+        changes = await client.get_mr_diff("acme/widgets", 42)
+
+    base = "/api/v4/projects/acme%2Fwidgets/merge_requests/42"
+    assert seen == [f"{base}/diffs", f"{base}/changes"]
+    assert changes == [legacy]
+
+
+@pytest.mark.asyncio
+async def test_get_mr_diff_reports_a_missing_merge_request_after_one_fallback() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.raw_path.decode().split("?", 1)[0])
+        return httpx.Response(404, json={"message": "404 Not Found"})
+
+    client, http = _make_gitlab_client(handler)
+    async with http:
+        with pytest.raises(NotFoundError):
+            await client.get_mr_diff("acme/widgets", 42)
+
+    assert [path.rsplit("/", 1)[1] for path in seen] == ["diffs", "changes"]
+
+
+@pytest.mark.asyncio
+async def test_get_mr_diff_stops_paging_at_gitlab_largest_diff() -> None:
+    """GitLab returns at most 3000 files, so paging stops after 30 pages."""
+    pages: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = request.url.params.get("page", "")
+        pages.append(page)
+        start = (int(page) - 1) * 100
+        return httpx.Response(
+            200, json=[_diff_entry(index) for index in range(start, start + 100)]
+        )
+
+    client, http = _make_gitlab_client(handler)
+    async with http:
+        changes = await client.get_mr_diff("acme/widgets", 42)
+
+    assert pages == [str(page) for page in range(1, 31)]
+    assert len(changes) == 3000
