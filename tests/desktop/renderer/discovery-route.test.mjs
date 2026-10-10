@@ -20,16 +20,45 @@ Object.assign(globalThis, {
 });
 dom.window.requestAnimationFrame = globalThis.requestAnimationFrame;
 dom.window.HTMLCanvasElement.prototype.getContext = () => null;
-const { fireEvent, queryByLabelText, waitFor } = desktopRequire(
+const React = desktopRequire("react");
+const { fireEvent, queryByLabelText, render, waitFor } = desktopRequire(
   "@testing-library/react",
 );
 
 after(() => dom.window.close());
 
+const STOPPED = "Local service not running. Quit and reopen Tongs.";
+const UPDATES = "Updates are available. Refresh the current view.";
+const DISCOVERY_FAILURE = "The configured scan root could not be read";
+
+// The app mounts itself when its module loads, so every test in this file
+// shares one mounted app over one bridge fixture.
+const fixture = bridgeFixture();
+let mounted = null;
+function mountApp() {
+  if (mounted === null) {
+    Object.defineProperty(window, "tongs", { value: fixture.bridge });
+    mounted = import("../../../desktop/dist/src/renderer/app.js");
+  }
+  return mounted;
+}
+
 test("mounted app reconciles successful discovery without losing review work", async () => {
-  const fixture = bridgeFixture();
-  Object.defineProperty(window, "tongs", { value: fixture.bridge });
-  await import("../../../desktop/dist/src/renderer/app.js");
+  // The first discovery fails, so the main pane says why and offers a retry
+  // instead of waiting for discovery forever.
+  fixture.discoveries.unshift(discoveryFailure());
+  await mountApp();
+  await waitFor(() => assert.equal(mainRetryCount(), 1));
+  assert.equal(mainText().includes(DISCOVERY_FAILURE), true);
+  assert.equal(
+    mainText().includes("Waiting for local repository discovery"),
+    false,
+  );
+  assert.equal(mainRetryDisabled(), false);
+  fireEvent.click(mainRetry());
+  await waitFor(() => assert.equal(hasButton("Repo A"), true));
+  assert.equal(mainRetryCount(), 0);
+  assert.equal(mainText().includes(DISCOVERY_FAILURE), false);
 
   await waitFor(() => assert.ok(button("Repo A")));
   fireEvent.click(button("Repo A"));
@@ -169,12 +198,131 @@ test("mounted app reconciles successful discovery without losing review work", a
   // The header follows the main-process service status, not only the probe.
   await waitFor(() => assert.equal(serviceStatus(), "Local service connected"));
   fixture.publishServiceStatus({ state: "stopped", revision: 1 });
-  await waitFor(() =>
-    assert.equal(serviceStatus(), "Local service not running"),
-  );
+  await waitFor(() => assert.equal(serviceStatus(), STOPPED));
   fixture.publishServiceStatus({ state: "connected", revision: 2 });
   await waitFor(() => assert.equal(serviceStatus(), "Local service connected"));
 });
+
+test("the header warns about updates only on a resync and a route change clears it", async () => {
+  await mountApp();
+  await waitFor(() => assert.equal(serviceStatus(), "Local service connected"));
+
+  // Review and pipeline changes refresh the views that own them.
+  fixture.emit("service.changed", { kind: "review_changed", resource: "review-a" });
+  fixture.emit("service.changed", { kind: "pipeline_changed", resource: null });
+  fixture.emit("service.changed", { kind: "repositories_changed" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(serviceStatus(), "Local service connected");
+  assert.equal(serviceStatusClass(), "service-status service-status-ready");
+
+  fixture.emit("protocol.resync_required", { reason: "event_overflow" });
+  await waitFor(() => assert.equal(serviceStatus(), UPDATES));
+  assert.equal(serviceStatusClass(), "service-status service-status-warning");
+  fireEvent.click(await awaitButton("All reviews"));
+  await waitFor(() => assert.equal(serviceStatus(), "Local service connected"));
+
+  fixture.emit("service.changed", { kind: "resync_required" });
+  await waitFor(() => assert.equal(serviceStatus(), UPDATES));
+  fireEvent.click(await awaitButton("Repo B"));
+  await waitFor(() => assert.equal(serviceStatus(), "Local service connected"));
+  assert.equal(title(), "Repo B");
+});
+
+test("the view error fallback offers Try again, which mounts the view afresh", async () => {
+  const { ErrorBoundary } = await mountApp();
+  let failing = true;
+  let mounts = 0;
+  function FlakyView() {
+    if (failing) throw new Error("raw failure text with token ghp_secret");
+    React.useEffect(() => {
+      mounts += 1;
+    }, []);
+    return React.createElement("p", { className: "flaky-view" }, "Recovered view");
+  }
+  const logged = [];
+  const original = console.error;
+  console.error = (...args) => logged.push(args.map((arg) => String(arg)));
+  const host = document.createElement("div");
+  document.body.append(host);
+  let view;
+  try {
+    view = render(
+      React.createElement(ErrorBoundary, null, React.createElement(FlakyView)),
+      { container: host },
+    );
+    await waitFor(() =>
+      assert.equal(host.querySelectorAll("[role='alert']").length, 1),
+    );
+  } finally {
+    console.error = original;
+  }
+  assert.equal(
+    host.querySelector(".view-title")?.textContent ?? null,
+    "This view could not be displayed",
+  );
+  const tryAgain = () =>
+    [...host.querySelectorAll("button")].filter(
+      (item) => item.textContent.trim() === "Try again",
+    );
+  assert.equal(tryAgain().length, 1);
+  assert.equal(tryAgain()[0].disabled, false);
+  // The boundary's own log line is the safe text alone.
+  const own = logged.filter(
+    (args) =>
+      args.length === 1 &&
+      args[0] === "The local service could not complete this read.",
+  );
+  assert.equal(own.length, 1);
+  assert.equal(mounts, 0);
+
+  failing = false;
+  fireEvent.click(tryAgain()[0]);
+  await waitFor(() =>
+    assert.equal(host.querySelector(".flaky-view")?.textContent ?? null, "Recovered view"),
+  );
+  assert.equal(mounts, 1);
+  assert.equal(tryAgain().length, 0);
+  assert.equal(host.querySelectorAll("[role='alert']").length, 0);
+  view.unmount();
+  host.remove();
+});
+
+function discoveryFailure() {
+  return Object.assign(new Error(DISCOVERY_FAILURE), {
+    code: "scan_failed",
+    retryable: true,
+  });
+}
+
+function mainText() {
+  return document.querySelector("main#content")?.textContent ?? "";
+}
+
+function mainRetryButtons() {
+  return [...document.querySelectorAll("main#content button")].filter(
+    (item) => item.textContent.trim() === "Retry",
+  );
+}
+
+function mainRetryCount() {
+  return mainRetryButtons().length;
+}
+
+function mainRetryDisabled() {
+  return mainRetryButtons()[0]?.disabled ?? null;
+}
+
+function mainRetry() {
+  return mainRetryButtons()[0];
+}
+
+function hasButton(name) {
+  return button(name) !== undefined;
+}
+
+function serviceStatusClass() {
+  return document.querySelector("#service-status")?.className ?? null;
+}
 
 function serviceStatus() {
   return document.querySelector("#service-status")?.textContent ?? null;
@@ -187,6 +335,8 @@ function bridgeFixture() {
   const reviewReads = [];
   const writes = [];
   const serviceListeners = new Set();
+  const eventListeners = new Set();
+  let eventSequence = 0;
   const read = (value) => ({
     requestToken: `request-${++sequence}`,
     result:
@@ -245,7 +395,10 @@ function bridgeFixture() {
     listAssets: () => read([]),
     setLocation: async () => ({ accepted: true }),
     cancelRead: async () => true,
-    onEvent: () => () => {},
+    onEvent: (listener) => {
+      eventListeners.add(listener);
+      return () => eventListeners.delete(listener);
+    },
     getServiceStatus: async () => ({ state: "connected", revision: 0 }),
     onServiceStatus: (listener) => {
       serviceListeners.add(listener);
@@ -256,7 +409,11 @@ function bridgeFixture() {
   const publishServiceStatus = (status) => {
     for (const listener of serviceListeners) listener(status);
   };
-  return { bridge, discoveries, reviewReads, writes, publishServiceStatus };
+  const emit = (name, data) => {
+    const event = { sequence: ++eventSequence, name, data };
+    for (const listener of [...eventListeners]) listener(event);
+  };
+  return { bridge, discoveries, reviewReads, writes, publishServiceStatus, emit };
 }
 
 function repositoryA(displayName = "Repo A") {

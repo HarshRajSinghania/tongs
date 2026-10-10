@@ -12,6 +12,7 @@ import {
   ServiceNotices,
   ServiceStatusLine,
   ServiceStatusModel,
+  isResyncEvent,
 } from "../../../desktop/dist/src/renderer/core/service-status.js";
 import { harness, launch, transportFor } from "../electron/fake-sidecar.mjs";
 
@@ -84,7 +85,7 @@ test("header changes from connected to not running when the service stops, and b
   await act(async () => {
     fake.children[0].finish(1, null);
   });
-  assert.equal(headerText(), "Local service not running");
+  assert.equal(headerText(), SERVICE_STATUS_TEXT.stopped);
   assert.equal(headerClass(), "service-status service-status-error");
 
   await act(async () => {
@@ -113,7 +114,7 @@ test("header shows not running when the connection fails on a bad frame", async 
     fake.children[0].stdout.write("not json\n");
     await assert.rejects(pending, { code: "invalid_frame" });
   });
-  assert.equal(headerText(), "Local service not running");
+  assert.equal(headerText(), SERVICE_STATUS_TEXT.stopped);
   publisher.dispose();
   await transport.stop();
 });
@@ -128,7 +129,7 @@ test("a header mounted after the service stopped starts at not running", async (
   model.probeSucceeded();
   render(React.createElement(ServiceStatusLine, { model, bridge }));
   await settle();
-  assert.equal(headerText(), "Local service not running");
+  assert.equal(headerText(), SERVICE_STATUS_TEXT.stopped);
   publisher.dispose();
   await transport.stop();
 });
@@ -152,6 +153,55 @@ test("not running outranks the updates notice, and a reconnect clears it", () =>
   assert.equal(model.view.text, SERVICE_STATUS_TEXT.stopped);
   model.applyStatus({ state: "connected", revision: 3 });
   assert.equal(model.view.text, SERVICE_STATUS_TEXT.connected);
+});
+
+test("the stopped header tells the user how to recover", () => {
+  const model = new ServiceStatusModel();
+  model.applyStatus({ state: "stopped", revision: 1 });
+  assert.equal(model.view.text, SERVICE_STATUS_TEXT.stopped);
+  assert.equal(model.view.text.startsWith("Local service not running"), true);
+  assert.equal(model.view.text.includes("Quit and reopen Tongs"), true);
+});
+
+test("only a resync warns that updates are available", () => {
+  assert.equal(isResyncEvent("protocol.resync_required", {}), true);
+  assert.equal(
+    isResyncEvent("service.changed", { kind: "resync_required" }),
+    true,
+  );
+  for (const kind of [
+    "review_changed",
+    "pipeline_changed",
+    "repositories_changed",
+    "draft_changed",
+  ]) {
+    assert.equal(isResyncEvent("service.changed", { kind }), false, kind);
+  }
+  assert.equal(isResyncEvent("service.changed", null), false);
+  assert.equal(isResyncEvent("service.changed", "resync_required"), false);
+  assert.equal(isResyncEvent("plugin.event", { kind: "resync_required" }), false);
+});
+
+test("clearing the updates notice restores the connection text", () => {
+  const model = new ServiceStatusModel();
+  let changes = 0;
+  model.subscribe(() => {
+    changes += 1;
+  });
+  model.applyStatus({ state: "connected", revision: 1 });
+  model.updatesAvailable();
+  assert.equal(model.view.text, SERVICE_STATUS_TEXT.updates);
+  assert.equal(model.view.className, "service-status service-status-warning");
+  model.clearUpdates();
+  assert.equal(model.view.text, SERVICE_STATUS_TEXT.connected);
+  assert.equal(changes, 3);
+  // Clearing again, or while stopped, changes nothing the header shows.
+  model.clearUpdates();
+  assert.equal(changes, 3);
+  model.applyStatus({ state: "stopped", revision: 2 });
+  model.clearUpdates();
+  assert.equal(model.view.text, SERVICE_STATUS_TEXT.stopped);
+  assert.equal(changes, 4);
 });
 
 test("malformed status reports are ignored", () => {
@@ -211,7 +261,7 @@ test("after a failed recovery the reloaded header says not running", async () =>
   assert.equal(recovered, false);
   assert.deepEqual(steps, ["reset", "restart", "load", "failure"]);
   assert.equal(transport.serviceState, "stopped");
-  assert.equal(headerText(), "Local service not running");
+  assert.equal(headerText(), SERVICE_STATUS_TEXT.stopped);
   assert.equal(headerClass(), "service-status service-status-error");
   assert.equal(document.querySelectorAll("#service-status").length, 1);
   publisher.dispose();

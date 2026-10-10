@@ -266,6 +266,7 @@ export class SidecarTransport extends EventEmitter {
       },
       false,
       this.startupTimeoutMs,
+      startupTimeout,
     );
     try {
       const result = await handshake.result;
@@ -292,6 +293,7 @@ export class SidecarTransport extends EventEmitter {
     params: JsonObject,
     read: boolean,
     timeoutMs: number,
+    timedOut: () => SidecarError = read ? readTimeout : mutationTimeout,
   ): SidecarRequest<T> {
     if (!this.child?.stdin.writable) {
       throw new SidecarError("not_running", "The desktop service is not running.");
@@ -316,15 +318,7 @@ export class SidecarTransport extends EventEmitter {
       if (!pending) return;
       if (pending.read) this.cancelRead(requestId);
       this.pending.delete(requestId);
-      pending.reject(
-        pending.read
-          ? new SidecarError("timeout", "The desktop read timed out.", true)
-          : new SidecarError(
-              "mutation_timeout",
-              "The CI mutation response timed out. Its outcome is unknown.",
-              true,
-            ),
-      );
+      pending.reject(timedOut());
     }, timeoutMs);
     this.pending.set(requestId, {
       method,
@@ -618,6 +612,28 @@ function mutationErrorCode(
   return typeof serviceCode === "string" && SERVICE_ERROR_CODES.has(serviceCode)
     ? serviceCode
     : protocolCode;
+}
+
+function readTimeout(): SidecarError {
+  return new SidecarError("timeout", "The desktop read timed out.", true);
+}
+
+/** A mutation may have run, so its timeout says the outcome is unknown. */
+function mutationTimeout(): SidecarError {
+  return new SidecarError(
+    "mutation_timeout",
+    "The CI mutation response timed out. Its outcome is unknown.",
+    true,
+  );
+}
+
+/** The handshake changes nothing, so its timeout only says startup failed. */
+function startupTimeout(): SidecarError {
+  return new SidecarError(
+    "startup_timeout",
+    "The desktop service did not start in time.",
+    true,
+  );
 }
 
 const NO_NOTICES: readonly string[] = Object.freeze([]);

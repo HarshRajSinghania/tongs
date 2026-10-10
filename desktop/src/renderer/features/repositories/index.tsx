@@ -20,6 +20,12 @@ interface Props {
   readonly selected: RepositoryDto | null | undefined;
   readonly navigate: (route: AppRoute) => void;
   readonly onDiscovery: (repositories: readonly RepositoryDto[]) => void;
+  /**
+   * Reports a discovery that failed before any succeeded, as text safe to show,
+   * with the retry that runs discovery again. It reports null when there is no
+   * such failure, including while a retry is running.
+   */
+  readonly onDiscoveryError?: (message: string | null, retry: () => void) => void;
   readonly pluginNavigation?: ReactNode;
 }
 
@@ -42,6 +48,7 @@ export function RepositoryNavigation({
   selected,
   navigate,
   onDiscovery,
+  onDiscoveryError,
   pluginNavigation,
 }: Props): ReactNode {
   const begin = useCallback(() => bridge.discoverRepositories(), [bridge]);
@@ -59,6 +66,11 @@ export function RepositoryNavigation({
   useEffect(() => {
     if (state.value) onDiscovery(state.value.repositories);
   }, [onDiscovery, state.value]);
+  const firstFailure =
+    state.error && !state.value ? safeError(state.error) : null;
+  useEffect(() => {
+    onDiscoveryError?.(firstFailure, state.refresh);
+  }, [onDiscoveryError, firstFailure, state.refresh]);
 
   const focusFirstRepository = (
     event: KeyboardEvent<HTMLInputElement>,

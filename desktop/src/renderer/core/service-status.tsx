@@ -8,7 +8,7 @@ import type {
 export const SERVICE_STATUS_TEXT = Object.freeze({
   connecting: "Connecting to the local service…",
   connected: "Local service connected",
-  stopped: "Local service not running",
+  stopped: "Local service not running. Quit and reopen Tongs.",
   unavailable: "Local service unavailable",
   updates: "Updates are available. Refresh the current view.",
 } as const);
@@ -87,6 +87,13 @@ export class ServiceStatusModel {
 
   updatesAvailable(): void {
     this.#updates = true;
+    this.#refresh();
+  }
+
+  /** Drops the updates notice, for example once the user opens another view. */
+  clearUpdates(): void {
+    if (!this.#updates) return;
+    this.#updates = false;
     this.#refresh();
   }
 
@@ -193,6 +200,22 @@ export function ServiceNotices({
 }
 
 const NO_NOTICES: readonly string[] = Object.freeze([]);
+
+/**
+ * Whether a service event means the views may be out of date as a whole. Only
+ * a protocol resync or a service resync does: the review and pipeline change
+ * events refresh the views that own them, so they never warn in the header.
+ */
+export function isResyncEvent(name: string, data: unknown): boolean {
+  if (name === "protocol.resync_required") return true;
+  return (
+    name === "service.changed" &&
+    data !== null &&
+    typeof data === "object" &&
+    "kind" in data &&
+    data.kind === "resync_required"
+  );
+}
 
 function statusNotices(status: ServiceStatusDto): readonly string[] {
   const notices: unknown = (status as { notices?: unknown }).notices;
