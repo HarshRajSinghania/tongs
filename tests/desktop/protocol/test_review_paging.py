@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from pathlib import Path
@@ -15,6 +15,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
+from tongs.cache.cached_client import CachedForgeClient
 from tongs.cache.store import CacheStore
 from tongs.config import Config
 from tongs.desktop.protocol.messages import (
@@ -142,7 +143,7 @@ class _Forge:
 
 
 class _Registry:
-    def __init__(self, client: GitHubClient) -> None:
+    def __init__(self, client: ForgeClient | CachedForgeClient) -> None:
         self.client = client
 
     def active_hostnames(self) -> list[str]:
@@ -152,7 +153,7 @@ class _Registry:
         return _HOST if hostname == _HOST.hostname else None
 
     async def get_client(self, _hostname: str) -> ForgeClient:
-        return self.client
+        return cast(ForgeClient, self.client)
 
     async def close_all(self) -> None:
         await self.client.close()
@@ -221,15 +222,30 @@ def _result(frame: dict[str, object]) -> dict[str, object]:
 
 @pytest_asyncio.fixture
 async def wired(tmp_path: Path) -> AsyncIterator[tuple[_Wire, _Forge, dict[str, str]]]:
+    async with _serve(tmp_path) as served:
+        yield served
+
+
+@asynccontextmanager
+async def _serve(
+    tmp_path: Path, *, cached: bool = False
+) -> AsyncIterator[tuple[_Wire, _Forge, dict[str, str]]]:
     forge = _Forge()
     http = httpx.AsyncClient(
         transport=httpx.MockTransport(forge.handle), base_url=_HOST.api_base
     )
+    cache = CacheStore(db_path=tmp_path / "cache.db")
+    client: ForgeClient | CachedForgeClient = GitHubClient(_HOST, http)
+    if cached:
+        # As the real registry does when the cache is on.
+        client = CachedForgeClient(
+            cast(ForgeClient, client), cache, hostname=_HOST.hostname
+        )
     session = ApplicationSession(
         config=Config(),
-        cache=CacheStore(db_path=tmp_path / "cache.db"),
+        cache=cache,
         draft_store=DraftStore(tmp_path / "drafts.db"),
-        forge_registry=cast(object, _Registry(GitHubClient(_HOST, http))),  # type: ignore[arg-type]
+        forge_registry=cast(object, _Registry(client)),  # type: ignore[arg-type]
     )
     server = DesktopSidecarServer(
         session=session,
@@ -385,6 +401,60 @@ async def test_forged_and_mismatched_cursors_are_invalid_params(
 
     # No rejected cursor reached the forge.
     assert len(forge.list_requests) == list_reads
+
+
+@pytest.mark.asyncio
+async def test_refresh_reads_past_the_cached_first_page(tmp_path: Path) -> None:
+    async with _serve(tmp_path, cached=True) as (wire, forge, handles):
+        params: JsonObject = {"scope": "all_open", "repository": handles["acme/small"]}
+        first = _result(await wire.call("reviews.list", params))
+        cached = _result(await wire.call("reviews.list", params))
+        assert cached == first
+        assert len(forge.list_requests) == 1
+
+        # A new review is opened; a plain read still serves the cached page.
+        forge.pulls["acme/small"].insert(
+            0, _pull("acme/small", 9100, _NEWEST + timedelta(hours=1))
+        )
+        stale = _result(await wire.call("reviews.list", params))
+        assert stale == first
+        assert len(forge.list_requests) == 1
+
+        refreshed = _result(await wire.call("reviews.list", {**params, "fresh": True}))
+        assert len(forge.list_requests) == 2
+        numbers = [
+            cast(dict, item["summary"])["number"]
+            for item in cast(list[dict[str, object]], refreshed["items"])
+        ]
+        assert numbers == [9100, 9000, 9001, 9002]
+
+        # The refreshed page is what a plain read serves from now on, and an
+        # explicit fresh=False is a plain read.
+        after = _result(await wire.call("reviews.list", {**params, "fresh": False}))
+        assert after["items"] == refreshed["items"]
+        assert len(forge.list_requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_fresh_must_be_a_boolean(
+    wired: tuple[_Wire, _Forge, dict[str, str]],
+) -> None:
+    wire, forge, handles = wired
+    for value in ("true", 1, 0, None, [], {}):
+        frame = await wire.call(
+            "reviews.list",
+            cast(
+                JsonObject,
+                {
+                    "scope": "all_open",
+                    "repository": handles["acme/small"],
+                    "fresh": value,
+                },
+            ),
+        )
+        error = cast(dict[str, object], frame["error"])
+        assert error["code"] == "invalid_params", value
+    assert forge.list_requests == []
 
 
 @pytest.mark.asyncio

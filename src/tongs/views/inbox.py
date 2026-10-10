@@ -90,9 +90,10 @@ class InboxScreen(Screen):
         self.action_focus_tab("reviews")
 
     def action_refresh(self) -> None:
-        tabbed = self.query_one(TabbedContent)
-        self._loaded_tabs.discard(tabbed.active)
-        self.action_focus_tab(tabbed.active)
+        """Reload the current tab from the forge, past the list cache."""
+        tab_id = self.query_one(TabbedContent).active
+        self._loaded_tabs.add(tab_id)
+        self._load_tab(tab_id, fresh=True)
 
     def action_go_back(self) -> None:
         if self.scoped_repo:
@@ -116,12 +117,7 @@ class InboxScreen(Screen):
         tab_id = event.pane.id
         if tab_id and tab_id not in self._loaded_tabs:
             self._loaded_tabs.add(tab_id)
-            if tab_id == "reviews":
-                self.load_reviews()
-            elif tab_id == "my-mrs":
-                self.load_my_mrs()
-            elif tab_id == "all-open":
-                self.load_all_open()
+            self._load_tab(tab_id)
 
     def action_focus_tab(self, tab_id: str) -> None:
         tabbed = self.query_one(TabbedContent)
@@ -129,12 +125,15 @@ class InboxScreen(Screen):
         if tab_id in self._loaded_tabs:
             return
         self._loaded_tabs.add(tab_id)
+        self._load_tab(tab_id)
+
+    def _load_tab(self, tab_id: str, *, fresh: bool = False) -> None:
         if tab_id == "reviews":
-            self.load_reviews()
+            self.load_reviews(fresh=fresh)
         elif tab_id == "my-mrs":
-            self.load_my_mrs()
+            self.load_my_mrs(fresh=fresh)
         elif tab_id == "all-open":
-            self.load_all_open()
+            self.load_all_open(fresh=fresh)
 
     def action_open_in_browser(self) -> None:
         table = self._active_table()
@@ -155,7 +154,7 @@ class InboxScreen(Screen):
                 self.app.push_screen(MRDetailScreen(mr))
 
     @work(exclusive=True, group="reviews")
-    async def load_reviews(self) -> None:
+    async def load_reviews(self, fresh: bool = False) -> None:
         self.loading_reviews = True
         table = self.query_one("#reviews-table", MRTable)
         table.loading = True
@@ -163,14 +162,14 @@ class InboxScreen(Screen):
             if not self.scoped_repo and not self.app.repos:
                 table.clear()
                 return
-            await self._load_page(table, ReviewScope.MY_REVIEWS, "Reviews")
+            await self._load_page(table, ReviewScope.MY_REVIEWS, "Reviews", fresh=fresh)
         finally:
             self.loading_reviews = False
             with suppress(NoScreen):
                 table.loading = False
 
     @work(exclusive=True, group="my-mrs")
-    async def load_my_mrs(self) -> None:
+    async def load_my_mrs(self, fresh: bool = False) -> None:
         self.loading_my_mrs = True
         table = self.query_one("#my-mrs-table", MRTable)
         table.loading = True
@@ -178,14 +177,14 @@ class InboxScreen(Screen):
             if not self.scoped_repo and not self.app.repos:
                 table.clear()
                 return
-            await self._load_page(table, ReviewScope.MY_MRS, "My MRs")
+            await self._load_page(table, ReviewScope.MY_MRS, "My MRs", fresh=fresh)
         finally:
             self.loading_my_mrs = False
             with suppress(NoScreen):
                 table.loading = False
 
     @work(exclusive=True, group="all-open")
-    async def load_all_open(self) -> None:
+    async def load_all_open(self, fresh: bool = False) -> None:
         self.loading_all_open = True
         table = self.query_one("#all-open-table", MRTable)
         table.loading = True
@@ -193,16 +192,18 @@ class InboxScreen(Screen):
             if not self.scoped_repo and not self.app.repos:
                 table.clear()
                 return
-            await self._load_page(table, ReviewScope.ALL_OPEN, "All Open")
+            await self._load_page(table, ReviewScope.ALL_OPEN, "All Open", fresh=fresh)
         finally:
             self.loading_all_open = False
             with suppress(NoScreen):
                 table.loading = False
 
-    async def _load_page(self, table: MRTable, scope: ReviewScope, label: str) -> None:
+    async def _load_page(
+        self, table: MRTable, scope: ReviewScope, label: str, *, fresh: bool = False
+    ) -> None:
         try:
             page = await self.app.services.list_reviews(
-                scope, repository=self.scoped_repo
+                scope, repository=self.scoped_repo, fresh=fresh
             )
         except ServiceError as error:
             self.notify(f"{label}: {error.message}", severity="warning", markup=False)

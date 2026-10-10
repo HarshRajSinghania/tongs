@@ -38,6 +38,18 @@ def _finish_background_invalidation(
         pass
 
 
+def _key_under(key: str, prefix: str) -> bool:
+    """Return whether ``key`` is ``prefix`` or below it across a ':' boundary.
+
+    This matches what ``CacheStore.invalidate_prefix`` removes: MR 1 does not
+    cover MR 12, and ``o/r`` does not cover ``o/r-docs``. Like the store, the
+    comparison ignores case.
+    """
+    key = key.casefold()
+    stem = prefix.casefold().removesuffix(":")
+    return key == stem or key.startswith(f"{stem}:")
+
+
 def _serialize_datetime(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt else None
 
@@ -123,6 +135,9 @@ class CachedForgeClient:
         self._diff_ttl = diff_ttl
         self._dirty_review_prefixes: dict[str, int] = {}
         self._dirty_generation = 0
+        # The latest generation that marked each prefix dirty, kept after the
+        # invalidation finishes so a read can tell whether one covered it.
+        self._marked_generations: dict[str, int] = {}
         self._invalidation_tasks: dict[tuple[str, ...], asyncio.Task[bool]] = {}
         self._closed = False
 
@@ -132,21 +147,41 @@ class CachedForgeClient:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
+    def _is_dirty(self, key: str) -> bool:
+        return any(_key_under(key, prefix) for prefix in self._dirty_review_prefixes)
+
+    def _may_store(self, key: str, generation: int) -> bool:
+        """Return whether no invalidation covering ``key`` began after ``generation``.
+
+        ``generation`` is ``_dirty_generation`` read before the forge read. A
+        mutation that lands while that read is in flight may make its result
+        older than the mutation, so the result is then not stored. Invalidations
+        of other repositories and reviews do not count.
+        """
+        if self._dirty_generation == generation:
+            return True
+        return not any(
+            marked > generation and _key_under(key, prefix)
+            for prefix, marked in self._marked_generations.items()
+        )
+
     # -- Cached reads --
 
     async def list_mrs(
         self, repo_path: str, state: str = "open", per_page: int = 100
     ) -> list[MRSummary]:
         key = self._key(repo_path, "mrs", state)
-        if any(key.startswith(prefix) for prefix in self._dirty_review_prefixes):
+        if self._is_dirty(key):
             return await self._inner.list_mrs(repo_path, state, per_page)
         cached = await self._cache.get_json(key)
         if cached is not None:
             return [_dict_to_mr_summary(d) for d in cached]
+        generation = self._dirty_generation
         result = await self._inner.list_mrs(repo_path, state, per_page)
-        await self._cache.put_json(
-            key, [_mr_summary_to_dict(mr) for mr in result], self._mr_list_ttl
-        )
+        if self._may_store(key, generation):
+            await self._cache.put_json(
+                key, [_mr_summary_to_dict(mr) for mr in result], self._mr_list_ttl
+            )
         return result
 
     async def list_mrs_page(
@@ -168,7 +203,7 @@ class CachedForgeClient:
         if page != 1:
             await self._cache.invalidate(key)
             return await read_mr_page(self._inner, repo_path, state, page, per_page)
-        if any(key.startswith(prefix) for prefix in self._dirty_review_prefixes):
+        if self._is_dirty(key):
             return await read_mr_page(self._inner, repo_path, state, page, per_page)
         cached = await self._cache.get_json(key)
         if isinstance(cached, dict) and isinstance(cached.get("items"), list):
@@ -176,26 +211,30 @@ class CachedForgeClient:
                 tuple(_dict_to_mr_summary(d) for d in cached["items"]),
                 has_next=bool(cached.get("has_next")),
             )
+        generation = self._dirty_generation
         result = await read_mr_page(self._inner, repo_path, state, page, per_page)
-        await self._cache.put_json(
-            key,
-            {
-                "items": [_mr_summary_to_dict(mr) for mr in result.items],
-                "has_next": result.has_next,
-            },
-            self._mr_list_ttl,
-        )
+        if self._may_store(key, generation):
+            await self._cache.put_json(
+                key,
+                {
+                    "items": [_mr_summary_to_dict(mr) for mr in result.items],
+                    "has_next": result.has_next,
+                },
+                self._mr_list_ttl,
+            )
         return result
 
     async def get_mr_diff(self, repo_path: str, number: int) -> list[dict]:
         key = self._key(repo_path, "mr", number, "diff")
-        if any(key.startswith(prefix) for prefix in self._dirty_review_prefixes):
+        if self._is_dirty(key):
             return await self._inner.get_mr_diff(repo_path, number)
         cached = await self._cache.get_json(key)
         if cached is not None:
             return cached
+        generation = self._dirty_generation
         result = await self._inner.get_mr_diff(repo_path, number)
-        await self._cache.put_json(key, result, self._diff_ttl)
+        if self._may_store(key, generation):
+            await self._cache.put_json(key, result, self._diff_ttl)
         return result
 
     async def get_mr_fresh(self, repo_path: str, number: int) -> MRDetail:
@@ -361,6 +400,17 @@ class CachedForgeClient:
         generation = self._mark_review_dirty(prefixes)
         return await self._invalidate_marked(prefixes, generation)
 
+    async def invalidate_repository_reads(self, repo_path: str) -> bool:
+        """Drop every cached read of one repository, such as its review lists.
+
+        Returns whether the stored entries are gone. Until they are, reads of
+        the repository in this process bypass the cache and store nothing, and
+        a read already in flight never stores its older result.
+        """
+        prefixes = (self._key(repo_path),)
+        generation = self._mark_review_dirty(prefixes)
+        return await self._invalidate_marked(prefixes, generation)
+
     async def _invalidate_marked(
         self, prefixes: tuple[str, ...], generation: int
     ) -> bool:
@@ -416,6 +466,7 @@ class CachedForgeClient:
         self._dirty_generation += 1
         for prefix in prefixes:
             self._dirty_review_prefixes[prefix] = self._dirty_generation
+            self._marked_generations[prefix] = self._dirty_generation
         return self._dirty_generation
 
     def _review_prefixes(self, repo_path: str, number: int) -> tuple[str, str]:

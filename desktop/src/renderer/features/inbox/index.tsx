@@ -382,6 +382,9 @@ function InboxResults({
   // refresh keeps showing the previous pages and swaps them in when complete.
   const liveRead = useRef(false);
   const hasValue = useRef(false);
+  // Set by the Refresh button and consumed by the read it starts, so only an
+  // explicit refresh reads past the service's list cache.
+  const freshRead = useRef(false);
   const cancelMoreReads = useCallback(() => {
     const cancelled = new Set(moreReads.current.values());
     for (const key of moreReads.current.keys()) void queries.cancel(key);
@@ -410,6 +413,8 @@ function InboxResults({
     const controller = new AbortController();
     discoveredRead.current = controller;
     const sources = repository ? [repository] : repositories;
+    const fresh = freshRead.current;
+    freshRead.current = false;
     const live = !hasValue.current;
     liveRead.current = live;
     if (live)
@@ -436,6 +441,7 @@ function InboxResults({
           }
         : undefined,
       depths,
+      fresh,
     );
   }, [
     bridge,
@@ -459,6 +465,11 @@ function InboxResults({
     readDependencies,
     repositoriesReady,
   );
+  const { refresh } = state;
+  const refreshFresh = useCallback(() => {
+    freshRead.current = true;
+    refresh();
+  }, [refresh]);
   useEffect(() => {
     if (feeds) rememberLoadedDepth(readKey, feeds);
   }, [feeds, readKey]);
@@ -559,7 +570,7 @@ function InboxResults({
         <button
           className="button button-secondary"
           disabled={state.loading}
-          onClick={state.refresh}
+          onClick={refreshFresh}
         >
           {state.loading && state.value ? "Refreshing…" : "Refresh reviews"}
         </button>
@@ -635,6 +646,8 @@ export const DISCOVERED_REVIEW_CONCURRENCY = 8;
  * `requestTokens` grows as reads start, so a coordinator cancelling this read
  * reaches every read in flight at that moment. Aborting `signal` also cancels
  * the reads in flight, starts none of the queued ones, and rejects the result.
+ * `fresh` marks each repository's first page read as an explicit refresh, so
+ * the service reads it from the forge instead of its list cache.
  */
 export function listDiscoveredReviews(
   bridge: DesktopBridge,
@@ -644,6 +657,7 @@ export function listDiscoveredReviews(
   signal?: AbortSignal,
   onRepository?: (index: number, feed: RepositoryFeed) => void,
   depths?: ReadonlyMap<string, number>,
+  fresh = false,
 ): CoordinatedRead<DiscoveredReviews> {
   const handles = repositories.map((repository) => repository.handle);
   const requestTokens: string[] = [];
@@ -666,9 +680,11 @@ export function listDiscoveredReviews(
     let outcome: ReviewListResult;
     try {
       const read = bridge.listReviews(
-        cursor === undefined
-          ? { scope, state, repository: handle }
-          : { scope, state, repository: handle, cursor },
+        cursor !== undefined
+          ? { scope, state, repository: handle, cursor }
+          : fresh
+            ? { scope, state, repository: handle, fresh: true }
+            : { scope, state, repository: handle },
       );
       token = read.requestToken;
       requestTokens.push(token);

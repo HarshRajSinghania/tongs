@@ -192,17 +192,26 @@ class TUIServiceAdapter:
             ) from None
 
     async def list_reviews(
-        self, scope: ReviewScope, *, repository: Repo | None = None
+        self,
+        scope: ReviewScope,
+        *,
+        repository: Repo | None = None,
+        fresh: bool = False,
     ) -> ReviewPage:
-        """Run an inbox read with the terminal's local workspace semantics."""
+        """Run an inbox read with the terminal's local workspace semantics.
+
+        ``fresh`` marks an explicit refresh, which reads past the list cache.
+        """
         if repository is not None:
             page = await self.session.list_reviews(
-                ReviewQuery(scope, repository=self.repository_ref(repository))
+                ReviewQuery(
+                    scope, repository=self.repository_ref(repository), fresh=fresh
+                )
             )
         elif scope is ReviewScope.ALL_OPEN:
-            page = await self._list_all_open()
+            page = await self._list_all_open(fresh=fresh)
         else:
-            page = await self._list_personal(scope)
+            page = await self._list_personal(scope, fresh=fresh)
         self._remember_review_refs(page.items)
         return page
 
@@ -637,15 +646,19 @@ class TUIServiceAdapter:
         """Allocate one stable ID for a complete user command."""
         return f"tui:{action}:{uuid4().hex}"
 
-    async def _list_personal(self, scope: ReviewScope) -> ReviewPage:
+    async def _list_personal(
+        self, scope: ReviewScope, *, fresh: bool = False
+    ) -> ReviewPage:
         hostnames = tuple(
             sorted({ref.hostname for ref in self._repository_refs.values()})
         )
         if not hostnames:
             return ReviewPage((), ())
-        return await self.session.list_reviews(ReviewQuery(scope, hostnames=hostnames))
+        return await self.session.list_reviews(
+            ReviewQuery(scope, hostnames=hostnames, fresh=fresh)
+        )
 
-    async def _list_all_open(self) -> ReviewPage:
+    async def _list_all_open(self, *, fresh: bool = False) -> ReviewPage:
         refs_by_host: dict[str, list[RepositoryRef]] = {}
         for ref in dict.fromkeys(self._repository_refs.values()):
             refs_by_host.setdefault(ref.hostname, []).append(ref)
@@ -659,7 +672,7 @@ class TUIServiceAdapter:
                 failures: list[HostFailure] = []
                 for ref in refs:
                     page = await self.session.list_reviews(
-                        ReviewQuery(ReviewScope.ALL_OPEN, repository=ref)
+                        ReviewQuery(ReviewScope.ALL_OPEN, repository=ref, fresh=fresh)
                     )
                     items.extend(page.items)
                     failures.extend(page.failures)

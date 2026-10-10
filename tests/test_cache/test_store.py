@@ -83,6 +83,56 @@ class TestInvalidate:
         assert await store.get("pr:2") is None
         assert await store.get("ci:1") == b"c"
 
+    @pytest.mark.asyncio
+    async def test_invalidate_prefix_stops_at_a_key_boundary(self, store):
+        """MR 1 does not cover MR 12, and a repository not its sibling."""
+        keys = (
+            "github.com:o/r",
+            "github.com:o/r:mr:1",
+            "github.com:o/r:mr:1:diff",
+            "github.com:o/r:mr:12:diff",
+            "github.com:o/r-docs:mrs:open",
+        )
+        for key in keys:
+            await store.put(key, b"v", ttl=60)
+
+        await store.invalidate_prefix("github.com:o/r:mr:1")
+        remaining = await _keys(store)
+        assert remaining == {
+            "github.com:o/r",
+            "github.com:o/r:mr:12:diff",
+            "github.com:o/r-docs:mrs:open",
+        }
+
+        await store.invalidate_prefix("github.com:o/r")
+        assert await _keys(store) == {"github.com:o/r-docs:mrs:open"}
+
+    @pytest.mark.asyncio
+    async def test_invalidate_prefix_matches_wildcards_literally(self, store):
+        """'_' and '%' in a path match only themselves."""
+        await store.put("github.com:o/a_b:mrs:open", b"1", ttl=60)
+        await store.put("github.com:o/axb:mrs:open", b"2", ttl=60)
+        await store.put("github.com:o/a%b:mrs:open", b"3", ttl=60)
+        await store.put("github.com:o/a-long-b:mrs:open", b"4", ttl=60)
+
+        await store.invalidate_prefix("github.com:o/a_b")
+        await store.invalidate_prefix("github.com:o/a%b")
+
+        assert await _keys(store) == {
+            "github.com:o/axb:mrs:open",
+            "github.com:o/a-long-b:mrs:open",
+        }
+
+    @pytest.mark.asyncio
+    async def test_invalidate_prefix_ignores_case(self, store):
+        """Forge paths ignore case, so the invalidation does as well."""
+        await store.put("github.com:Acme/Repo:mrs:open", b"1", ttl=60)
+        await store.put("github.com:acme/repository:mrs:open", b"2", ttl=60)
+
+        await store.invalidate_prefix("github.com:acme/repo:")
+
+        assert await _keys(store) == {"github.com:acme/repository:mrs:open"}
+
 
 class TestClearAndPrune:
     @pytest.mark.asyncio
@@ -134,6 +184,34 @@ class TestSizeLimit:
         remaining = {row[0] for row in await cursor.fetchall()}
         assert remaining == {"k0", "k3", "k4", "k5", "k6", "k7", "k8"}
 
+    @pytest.mark.asyncio
+    async def test_a_single_oversized_entry_is_evicted(self, store):
+        """Below four rows a quarter is zero rows; one row still has to go."""
+        await store.put("huge", b"x" * (1024 * 1024 + 1), ttl=3600)
+
+        assert await _keys(store) == set()
+
+    @pytest.mark.asyncio
+    async def test_eviction_repeats_until_the_total_fits(self, store):
+        """One quarter is not always enough; eviction ends under the limit."""
+        clock = iter(range(1, 100))
+        small = b"x" * 1024
+        with patch("tongs.cache.store.time") as mock_time:
+            mock_time.time.side_effect = lambda: 1_000_000.0 + next(clock)
+            for index in range(7):
+                await store.put(f"small{index}", small, ttl=3600)
+            await store.put("big", b"y" * (1024 * 1024 - 2 * 1024), ttl=3600)
+
+        cursor = await store._db.execute(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM cache"
+        )
+        total = (await cursor.fetchone())[0]
+        assert 0 < total <= 1024 * 1024
+        # A single quarter (two rows) leaves the file 3 KiB over; further
+        # passes drop the least recently used rows until it fits, and the
+        # newest entry stays.
+        assert await _keys(store) == {"small5", "small6", "big"}
+
 
 class TestNotOpened:
     @pytest.mark.asyncio
@@ -167,3 +245,8 @@ class TestCloseIsTerminal:
         await s.invalidate_prefix("k")
         await s.clear()
         await s.prune()
+
+
+async def _keys(store: CacheStore) -> set[str]:
+    cursor = await store._db.execute("SELECT key FROM cache")
+    return {row[0] for row in await cursor.fetchall()}

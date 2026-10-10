@@ -704,13 +704,18 @@ class DesktopSidecarServer:
         ``next_cursor`` when the forge has another page; passing it back as
         ``cursor`` reads that page. An All Open read without a repository is
         rejected: it could neither be paged nor stay inside the frame budget.
+        An optional boolean ``fresh`` marks an explicit refresh, which reads
+        past the service's list cache.
         """
         _require_params(
             params,
-            allowed=frozenset({"scope", "repository", "state", "per_page", "cursor"}),
+            allowed=frozenset(
+                {"scope", "repository", "state", "per_page", "cursor", "fresh"}
+            ),
             required=frozenset({"scope"}),
         )
         scope, state, repository, per_page = self._review_query_params(params)
+        fresh = _optional_bool(params, "fresh", False)
         if scope is ReviewScope.ALL_OPEN and repository is None:
             raise ProtocolError(
                 ProtocolErrorCode.INVALID_PARAMS,
@@ -736,6 +741,7 @@ class DesktopSidecarServer:
                 per_page=per_page,
                 paged=True,
                 cursor=cursor,
+                fresh=fresh,
             )
         )
         return {
@@ -1671,6 +1677,16 @@ def _optional_text(
     if key not in params:
         return default
     return _text(params, key, max_length=max_length)
+
+
+def _optional_bool(params: JsonObject, key: str, default: bool) -> bool:
+    value = params.get(key, default)
+    if not isinstance(value, bool):
+        raise ProtocolError(
+            ProtocolErrorCode.INVALID_PARAMS,
+            f"The {key} parameter is invalid.",
+        )
+    return value
 
 
 def _optional_int(

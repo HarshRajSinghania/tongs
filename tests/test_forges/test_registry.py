@@ -196,3 +196,50 @@ async def test_bounded_registry_installs_its_host_limiter() -> None:
 def test_max_parallel_is_keyword_only() -> None:
     with pytest.raises(TypeError):
         ForgeRegistry(frozenset(), frozenset(), 30.0, None, 60, 300, 4)  # type: ignore[misc]
+
+
+@pytest.mark.asyncio
+async def test_refresh_forget_keeps_running_lookup_and_recent_failure() -> None:
+    now = [0.0]
+    started = threading.Event()
+    release = threading.Event()
+
+    def resolve(_hostname: str, _forge_type: ForgeType) -> str:
+        started.set()
+        assert release.wait(10)
+        raise AuthError("No credentials found for github.com")
+
+    registry = ForgeRegistry(clock=lambda: now[0], auth_retry_grace=5.0)
+    with patch("tongs.forges.registry.resolve_token", side_effect=resolve) as resolved:
+        # A refresh while a lookup runs joins it instead of starting another.
+        pending = [asyncio.create_task(registry.get_client("github.com"))]
+        assert await asyncio.to_thread(started.wait, 10)
+        for _ in range(3):
+            registry.forget_auth_failures("github.com", refresh=True)
+            pending.append(asyncio.create_task(registry.get_client("github.com")))
+        await asyncio.sleep(0.05)
+        release.set()
+        for task in pending:
+            with pytest.raises(AuthError):
+                await asyncio.wait_for(task, 10)
+        assert resolved.call_count == 1
+        assert set(registry._auth_failures) == {"github.com"}
+
+        # A failure younger than the grace period survives a refresh.
+        now[0] = 4.9
+        registry.forget_auth_failures("github.com", refresh=True)
+        registry.forget_auth_failures(refresh=True)
+        with pytest.raises(AuthError):
+            await registry.get_client("github.com")
+        assert resolved.call_count == 1
+
+        # An older one is dropped, for that host or for every host.
+        now[0] = 5.0
+        registry.forget_auth_failures("github.com", refresh=True)
+        assert registry._auth_failures == {}
+        with pytest.raises(AuthError):
+            await registry.get_client("github.com")
+        assert resolved.call_count == 2
+        now[0] = 20.0
+        registry.forget_auth_failures(refresh=True)
+        assert registry._auth_failures == {}
