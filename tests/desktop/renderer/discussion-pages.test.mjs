@@ -124,6 +124,32 @@ test("an old-side thread on a renamed file renders on its row and in the count",
   );
 });
 
+test("old-side threads on one renamed line stored under both paths are numbered together", async () => {
+  const review = "renamed-shared-line";
+  const threads = [
+    oldSideThread("d-new-path", { path: "src/calc.py", line: 11 }),
+    oldSideThread("d-old-path", { path: "src/old_calc.py", line: 11 }),
+  ];
+  const pages = pagedDiscussions(review, threads, PAGE_SIZE);
+  const view = renderDiff(
+    diffBridge(review, {
+      openDiff: () => read(renamedDiffPage(review)),
+      listDiscussions: pages.list,
+      pageDiscussions: pages.page,
+    }),
+    review,
+  );
+
+  await waitFor(() => assert.equal(fileThreadText(view), "2 threads, 2 unresolved"));
+  // The old path's threads come first, then the new path's, as one line.
+  await waitFor(() =>
+    assert.deepEqual(threadLabels(view), [
+      "Discussion thread 1 of 2 on old line 11",
+      "Discussion thread 2 of 2 on old line 11",
+    ]),
+  );
+});
+
 test("a single-page answer still reads as the whole list", async () => {
   const review = "one-page";
   const threads = [thread("d-1", { line: 1000 }), thread("d-2", { line: 1001 })];

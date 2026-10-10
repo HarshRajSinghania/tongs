@@ -326,8 +326,12 @@ class GitHubClient(ForgeClient):
         if response.status_code >= 400:
             raise map_http_error(response)
         data = response.json()
-        if "errors" in data:
-            msg = data["errors"][0].get("message", "GraphQL error")
+        errors = data.get("errors") if isinstance(data, dict) else None
+        if errors:
+            first = errors[0] if isinstance(errors, list) else None
+            msg = first.get("message") if isinstance(first, dict) else None
+            if not isinstance(msg, str) or not msg:
+                msg = "GraphQL error"
             raise ForgeError(redact_credentials(msg))
         return data.get("data", {})
 
@@ -641,7 +645,7 @@ class GitHubClient(ForgeClient):
                 cursor = page.get("endCursor")
                 if page.get("hasNextPage") is not True or not cursor:
                     break
-        except (ForgeError, ValueError, KeyError, TypeError, AttributeError):
+        except (ForgeError, ValueError, LookupError, TypeError, AttributeError):
             return {}
         return resolution
 

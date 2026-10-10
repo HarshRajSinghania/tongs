@@ -532,6 +532,9 @@ class SplitDiffView(Widget):
         self._discussion_index = _discussion_index(discussions)
         self._highlight_map = highlight_map
         self._draft_markers = draft_markers
+        # Like the unified view, redrawing the file drops an armed resolve.
+        for column in self._columns():
+            column._resolve_confirm.reset()
         self._populate()
         if selection is not None:
             self.restore_selection(selection)

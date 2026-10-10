@@ -1989,6 +1989,44 @@ class TestExplicitRefresh:
         await store.close()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("paged", [False, True])
+    async def test_fresh_all_open_keeps_cached_diffs(
+        self, tmp_path: Path, paged: bool
+    ) -> None:
+        session, inner, store, ref = await self._cached_session(tmp_path)
+        query = ReviewQuery(ReviewScope.ALL_OPEN, repository=ref, paged=paged)
+        await session.list_reviews(query)
+        diff_key = "github.com:acme/widgets:mr:7:diff"
+        await store.put_json(diff_key, [{"filename": "cached.py"}], 300)
+
+        await session.list_reviews(replace(query, fresh=True))
+
+        # The refresh reread the list but left the review's diff cached.
+        assert inner.list_mrs_calls == 2
+        assert await store.get_json(diff_key) == [{"filename": "cached.py"}]
+        await session.close()
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_ci_action_invalidation_drops_lists_and_keeps_diffs(
+        self, tmp_path: Path
+    ) -> None:
+        session, inner, store, ref = await self._cached_session(tmp_path)
+        query = ReviewQuery(ReviewScope.ALL_OPEN, repository=ref)
+        await session.list_reviews(query)
+        diff_key = "github.com:acme/widgets:mr:7:diff"
+        await store.put_json(diff_key, [{"filename": "cached.py"}], 300)
+
+        await session._invalidate_pipeline_reads(PipelineRef(ref, 11))
+
+        assert await store.get_json("github.com:acme/widgets:mrs:open") is None
+        assert await store.get_json(diff_key) == [{"filename": "cached.py"}]
+        await session.list_reviews(query)
+        assert inner.list_mrs_calls == 2
+        await session.close()
+        await store.close()
+
+    @pytest.mark.asyncio
     async def test_fresh_read_forgets_failed_sign_ins_only_for_hosts_it_reads(
         self,
     ) -> None:

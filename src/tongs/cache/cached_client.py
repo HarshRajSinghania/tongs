@@ -137,7 +137,10 @@ class CachedForgeClient:
         self._dirty_generation = 0
         # The latest generation that marked each prefix dirty, kept after the
         # invalidation finishes so a read can tell whether one covered it.
+        # Only marks newer than the oldest read in flight are kept.
         self._marked_generations: dict[str, int] = {}
+        # How many uncached forge reads are in flight for each generation.
+        self._read_generations: dict[int, int] = {}
         self._invalidation_tasks: dict[tuple[str, ...], asyncio.Task[bool]] = {}
         self._closed = False
 
@@ -165,6 +168,39 @@ class CachedForgeClient:
             for prefix, marked in self._marked_generations.items()
         )
 
+    def _begin_read(self) -> int:
+        """Record a forge read starting now and return its generation."""
+        generation = self._dirty_generation
+        self._read_generations[generation] = (
+            self._read_generations.get(generation, 0) + 1
+        )
+        return generation
+
+    def _end_read(self, generation: int) -> None:
+        """Record a forge read finishing and drop marks no read still needs."""
+        remaining = self._read_generations[generation] - 1
+        if remaining:
+            self._read_generations[generation] = remaining
+        else:
+            del self._read_generations[generation]
+        self._prune_marked_generations()
+
+    def _prune_marked_generations(self) -> None:
+        """Forget marks that no read in flight or started later can be older than.
+
+        ``_may_store`` only consults a mark newer than the read's generation. A
+        read starting later takes the current generation, which no mark exceeds,
+        so only the oldest read in flight bounds which marks still matter.
+        """
+        floor = min(self._read_generations, default=self._dirty_generation)
+        stale = [
+            prefix
+            for prefix, marked in self._marked_generations.items()
+            if marked <= floor
+        ]
+        for prefix in stale:
+            del self._marked_generations[prefix]
+
     # -- Cached reads --
 
     async def list_mrs(
@@ -176,12 +212,15 @@ class CachedForgeClient:
         cached = await self._cache.get_json(key)
         if cached is not None:
             return [_dict_to_mr_summary(d) for d in cached]
-        generation = self._dirty_generation
-        result = await self._inner.list_mrs(repo_path, state, per_page)
-        if self._may_store(key, generation):
-            await self._cache.put_json(
-                key, [_mr_summary_to_dict(mr) for mr in result], self._mr_list_ttl
-            )
+        generation = self._begin_read()
+        try:
+            result = await self._inner.list_mrs(repo_path, state, per_page)
+            if self._may_store(key, generation):
+                await self._cache.put_json(
+                    key, [_mr_summary_to_dict(mr) for mr in result], self._mr_list_ttl
+                )
+        finally:
+            self._end_read(generation)
         return result
 
     async def list_mrs_page(
@@ -211,17 +250,20 @@ class CachedForgeClient:
                 tuple(_dict_to_mr_summary(d) for d in cached["items"]),
                 has_next=bool(cached.get("has_next")),
             )
-        generation = self._dirty_generation
-        result = await read_mr_page(self._inner, repo_path, state, page, per_page)
-        if self._may_store(key, generation):
-            await self._cache.put_json(
-                key,
-                {
-                    "items": [_mr_summary_to_dict(mr) for mr in result.items],
-                    "has_next": result.has_next,
-                },
-                self._mr_list_ttl,
-            )
+        generation = self._begin_read()
+        try:
+            result = await read_mr_page(self._inner, repo_path, state, page, per_page)
+            if self._may_store(key, generation):
+                await self._cache.put_json(
+                    key,
+                    {
+                        "items": [_mr_summary_to_dict(mr) for mr in result.items],
+                        "has_next": result.has_next,
+                    },
+                    self._mr_list_ttl,
+                )
+        finally:
+            self._end_read(generation)
         return result
 
     async def get_mr_diff(self, repo_path: str, number: int) -> list[dict]:
@@ -231,10 +273,13 @@ class CachedForgeClient:
         cached = await self._cache.get_json(key)
         if cached is not None:
             return cached
-        generation = self._dirty_generation
-        result = await self._inner.get_mr_diff(repo_path, number)
-        if self._may_store(key, generation):
-            await self._cache.put_json(key, result, self._diff_ttl)
+        generation = self._begin_read()
+        try:
+            result = await self._inner.get_mr_diff(repo_path, number)
+            if self._may_store(key, generation):
+                await self._cache.put_json(key, result, self._diff_ttl)
+        finally:
+            self._end_read(generation)
         return result
 
     async def get_mr_fresh(self, repo_path: str, number: int) -> MRDetail:
@@ -411,6 +456,17 @@ class CachedForgeClient:
         generation = self._mark_review_dirty(prefixes)
         return await self._invalidate_marked(prefixes, generation)
 
+    async def invalidate_review_list_reads(self, repo_path: str) -> bool:
+        """Drop the cached review lists and first pages of one repository.
+
+        Cached diffs and other per-review reads stay. Returns whether the
+        stored entries are gone, with the same in-process guarantees as
+        ``invalidate_repository_reads`` until they are.
+        """
+        prefixes = (self._key(repo_path, "mrs"),)
+        generation = self._mark_review_dirty(prefixes)
+        return await self._invalidate_marked(prefixes, generation)
+
     async def _invalidate_marked(
         self, prefixes: tuple[str, ...], generation: int
     ) -> bool:
@@ -467,6 +523,7 @@ class CachedForgeClient:
         for prefix in prefixes:
             self._dirty_review_prefixes[prefix] = self._dirty_generation
             self._marked_generations[prefix] = self._dirty_generation
+        self._prune_marked_generations()
         return self._dirty_generation
 
     def _review_prefixes(self, repo_path: str, number: int) -> tuple[str, str]:
