@@ -45,6 +45,66 @@ def test_job_handles_retain_exact_parent_without_breaking_value_resolution() -> 
     )
 
 
+def test_full_registry_replaces_least_recently_used_job_handle() -> None:
+    repository = RepositoryRef("git.example.com", "team/project")
+    handles = HandleRegistry()
+    pipeline_handle = handles.issue(HandleKind.PIPELINE, PipelineRef(repository, 1))
+    issued: list[tuple[str, JobRef, PipelineRef]] = []
+    for index in range(9_000):
+        pipeline = PipelineRef(repository, 100 + index // 50)
+        job = JobRef(repository, 10_000 + index)
+        issued.append(
+            (handles.issue(HandleKind.JOB, job, parent=pipeline), job, pipeline)
+        )
+        if index % 1_000 == 1:
+            # Handles the client keeps using stay valid.
+            handles.resolve(pipeline_handle, HandleKind.PIPELINE, PipelineRef)
+            handles.resolve(issued[1][0], HandleKind.JOB, JobRef)
+
+    oldest_token, oldest_job, oldest_pipeline = issued[0]
+    with pytest.raises(ProtocolError) as evicted:
+        handles.resolve(oldest_token, HandleKind.JOB, JobRef)
+    assert evicted.value.code is ProtocolErrorCode.INVALID_HANDLE
+    assert evicted.value.retryable is False
+    assert handles.find(HandleKind.JOB, oldest_job, parent=oldest_pipeline) is None
+
+    recent_token, recent_job, recent_pipeline = issued[1]
+    assert handles.resolve_with_parent(
+        recent_token, HandleKind.JOB, JobRef, PipelineRef
+    ) == (recent_job, recent_pipeline)
+    assert handles.resolve(
+        pipeline_handle, HandleKind.PIPELINE, PipelineRef
+    ) == PipelineRef(repository, 1)
+    newest_token, newest_job, _newest_pipeline = issued[-1]
+    assert handles.resolve(newest_token, HandleKind.JOB, JobRef) == newest_job
+
+    reissued = handles.issue(HandleKind.JOB, oldest_job, parent=oldest_pipeline)
+    assert reissued != oldest_token
+    assert handles.resolve(reissued, HandleKind.JOB, JobRef) == oldest_job
+
+
+def test_registry_eviction_keeps_reverse_lookup_in_step() -> None:
+    repository = RepositoryRef("git.example.com", "team/project")
+    first = ReviewRef(repository, 1)
+    second = ReviewRef(repository, 2)
+    third = ReviewRef(repository, 3)
+    handles = HandleRegistry(max_handles=2)
+
+    first_handle = handles.issue(HandleKind.REVIEW, first)
+    second_handle = handles.issue(HandleKind.REVIEW, second)
+    assert handles.find(HandleKind.REVIEW, first) == first_handle
+    third_handle = handles.issue(HandleKind.REVIEW, third)
+
+    assert handles.find(HandleKind.REVIEW, second) is None
+    with pytest.raises(ProtocolError) as evicted:
+        handles.resolve(second_handle, HandleKind.REVIEW, ReviewRef)
+    assert evicted.value.code is ProtocolErrorCode.INVALID_HANDLE
+    assert evicted.value.retryable is False
+    assert handles.issue(HandleKind.REVIEW, first) == first_handle
+    assert handles.resolve(third_handle, HandleKind.REVIEW, ReviewRef) == third
+    assert len(handles._records) == len(handles._reverse) == 2
+
+
 def test_snapshot_owns_nested_input_and_returns_copy_safe_pages() -> None:
     store = SnapshotStore()
     revision = {"head": {"sha": "original"}}

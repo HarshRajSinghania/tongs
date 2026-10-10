@@ -25,6 +25,7 @@ from tongs.services.models import (
     RepositoryRef,
     ServiceEventKind,
 )
+from tongs.services.operation_ledger import OperationEntry, OperationLedger
 
 _OPERATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _KNOWN_DISPATCH_ERRORS = (
@@ -171,12 +172,7 @@ type InvalidatePipeline = Callable[[PipelineRef], Awaitable[None]]
 type EmitChange = Callable[[ServiceEventKind, PipelineRef | None], None]
 
 
-@dataclass(slots=True)
-class _OperationRecord:
-    fingerprint: tuple[CIMutationAction, PipelineRef, JobRef | None]
-    done: asyncio.Event
-    receipt: CIMutationReceipt | None = None
-    error: ServiceError | None = None
+type _Entry = OperationEntry[CIMutationCommand, CIMutationReceipt]
 
 
 class CIMutationService:
@@ -211,10 +207,11 @@ class CIMutationService:
         self._get_pipeline_jobs = get_pipeline_jobs
         self._emit_change = emit_change
         self._invalidate_pipeline = invalidate_pipeline
-        self._max_operations = max_operations
         self._hint_timeout = hint_timeout
         self._close_timeout = close_timeout
-        self._operations: dict[str, _OperationRecord] = {}
+        self._operations: OperationLedger[CIMutationCommand, CIMutationReceipt] = (
+            OperationLedger(max_operations)
+        )
         self._operation_lock = asyncio.Lock()
         self._coordinator_tasks: set[asyncio.Task[CIMutationReceipt]] = set()
         self._invalidation_tasks: set[asyncio.Task[None]] = set()
@@ -246,11 +243,9 @@ class CIMutationService:
         """Execute once per operation ID and retain its known or unknown result."""
         action, pipeline, job = self._command_parts(command)
         self._validate_operation_id(command.operation_id)
-        fingerprint = (action, pipeline, job)
-        record, owner = await self._reserve(command.operation_id, fingerprint)
+        record, owner = await self._reserve(command)
         if not owner:
-            await record.done.wait()
-            return self._record_result(record)
+            return await self._operations.wait(record)
 
         owner_task = asyncio.current_task()
         if owner_task is None:
@@ -263,7 +258,7 @@ class CIMutationService:
     async def _execute_owner(
         self,
         command: CIMutationCommand,
-        record: _OperationRecord,
+        record: _Entry,
         action: CIMutationAction,
         pipeline: PipelineRef,
         job: JobRef | None,
@@ -291,11 +286,11 @@ class CIMutationService:
                 receipt = self._unknown_receipt(
                     command.operation_id, action, pipeline, job
                 )
-                self._retain_receipt_now(record, receipt)
+                self._operations.retain(record, receipt)
                 self._release_current_owner()
                 await self._finish_hints(record, pipeline, suppress_cancellation=True)
             else:
-                self._complete_error_now(
+                self._operations.release(
                     record,
                     ServiceError(
                         ServiceErrorCode.INTERNAL,
@@ -310,13 +305,13 @@ class CIMutationService:
                     receipt = self._unknown_receipt(
                         command.operation_id, action, pipeline, job
                     )
-                    self._retain_receipt_now(record, receipt)
+                    self._operations.retain(record, receipt)
                     self._release_current_owner()
                     await self._finish_hints(
                         record, pipeline, suppress_cancellation=True
                     )
                 else:
-                    self._complete_error_now(
+                    self._operations.release(
                         record,
                         ServiceError(
                             ServiceErrorCode.INTERNAL,
@@ -324,9 +319,13 @@ class CIMutationService:
                         ),
                     )
                 raise
-            if not dispatch_started or self._is_known_rejection(error):
+            if not dispatch_started:
                 safe = self._safe_error(error, action, pipeline.repository)
-                self._complete_error_now(record, safe)
+                self._operations.release(record, safe)
+                raise safe from None
+            if self._is_known_rejection(error):
+                safe = self._safe_error(error, action, pipeline.repository)
+                self._operations.fail(record, safe)
                 raise safe from None
 
             receipt = self._unknown_receipt(
@@ -336,7 +335,7 @@ class CIMutationService:
                 job,
                 self._safe_error(error, action, pipeline.repository),
             )
-            self._retain_receipt_now(record, receipt)
+            self._operations.retain(record, receipt)
             self._release_current_owner()
             return await self._finish_hints(record, pipeline)
 
@@ -347,7 +346,7 @@ class CIMutationService:
             job=job,
             outcome=CIMutationOutcome.KNOWN,
         )
-        self._retain_receipt_now(record, receipt)
+        self._operations.retain(record, receipt)
         self._release_current_owner()
         return await self._finish_hints(record, pipeline)
 
@@ -359,59 +358,20 @@ class CIMutationService:
             record = self._operations.get(operation_id)
             return None if record is None else record.receipt
 
-    async def _reserve(
-        self,
-        operation_id: str,
-        fingerprint: tuple[CIMutationAction, PipelineRef, JobRef | None],
-    ) -> tuple[_OperationRecord, bool]:
+    async def _reserve(self, command: CIMutationCommand) -> tuple[_Entry, bool]:
+        owner_task = asyncio.current_task()
+        if owner_task is None:
+            raise RuntimeError("CI mutation execution requires an asyncio task")
         async with self._operation_lock:
             if self._closed:
                 raise ServiceError(
                     ServiceErrorCode.CLOSED,
                     "The CI mutation service is closed.",
                 )
-            existing = self._operations.get(operation_id)
-            if existing is not None:
-                if existing.fingerprint != fingerprint:
-                    raise ServiceError(
-                        ServiceErrorCode.CONFLICT,
-                        "The operation ID is already bound to another CI action.",
-                    )
-                return existing, False
-            if len(self._operations) >= self._max_operations:
-                raise ServiceError(
-                    ServiceErrorCode.CONFLICT,
-                    "The CI operation ledger is full.",
-                    retryable=True,
-                )
-            record = _OperationRecord(fingerprint, asyncio.Event())
-            self._operations[operation_id] = record
-            owner_task = asyncio.current_task()
-            if owner_task is None:
-                raise RuntimeError("CI mutation execution requires an asyncio task")
-            self._owner_tasks.add(owner_task)
-            return record, True
-
-    @staticmethod
-    def _retain_receipt_now(
-        record: _OperationRecord, receipt: CIMutationReceipt
-    ) -> None:
-        if not record.done.is_set():
-            record.receipt = receipt
-
-    @staticmethod
-    def _complete_error_now(record: _OperationRecord, error: ServiceError) -> None:
-        if not record.done.is_set():
-            record.error = error
-            record.done.set()
-
-    @staticmethod
-    def _record_result(record: _OperationRecord) -> CIMutationReceipt:
-        if record.error is not None:
-            raise record.error
-        if record.receipt is None:
-            raise RuntimeError("completed operation has no result")
-        return record.receipt
+            record, owner = self._operations.reserve(command.operation_id, command)
+            if owner:
+                self._owner_tasks.add(owner_task)
+            return record, owner
 
     async def _resolve_client(
         self, repository: RepositoryRef, operation: str
@@ -505,7 +465,7 @@ class CIMutationService:
 
     async def _finish_hints(
         self,
-        record: _OperationRecord,
+        record: _Entry,
         pipeline: PipelineRef,
         *,
         suppress_cancellation: bool = False,
@@ -535,7 +495,7 @@ class CIMutationService:
         return receipt
 
     async def _coordinate_hints(
-        self, record: _OperationRecord, pipeline: PipelineRef
+        self, record: _Entry, pipeline: PipelineRef
     ) -> CIMutationReceipt:
         try:
             hints_succeeded = await self._run_hints(pipeline)
@@ -546,14 +506,13 @@ class CIMutationService:
 
     @staticmethod
     def _finalize_receipt_now(
-        record: _OperationRecord, *, resync_required: bool
+        record: _Entry, *, resync_required: bool
     ) -> CIMutationReceipt:
         if record.receipt is None:
             raise RuntimeError("operation outcome was not retained")
-        if not record.done.is_set():
-            record.receipt = replace(record.receipt, resync_required=resync_required)
-            record.done.set()
-        return record.receipt
+        return OperationLedger.complete(
+            record, replace(record.receipt, resync_required=resync_required)
+        )
 
     async def _run_hints(self, pipeline: PipelineRef) -> bool:
         failed = not await self._run_invalidation_hint(pipeline)

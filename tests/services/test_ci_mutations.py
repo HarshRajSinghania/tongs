@@ -458,10 +458,46 @@ async def test_full_ledger_rejects_new_operation_without_eviction() -> None:
     with pytest.raises(ServiceError) as raised:
         await service.execute(CancelPipelineCommand("second", PIPELINE_TARGET))
 
-    assert raised.value.code == ServiceErrorCode.CONFLICT
-    assert raised.value.retryable is True
+    assert raised.value.code == ServiceErrorCode.CAPACITY_EXHAUSTED
+    assert raised.value.retryable is False
+    assert raised.value.message == (
+        "Too many write actions in this session. Restart tongs to continue."
+    )
     assert await service.execute(first) == await service.receipt("first")
     assert len(harness.client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_actions_rejected_before_dispatch_do_not_fill_the_ledger() -> None:
+    harness = Harness(jobs=[Harness._job(999)])
+    service = harness.service(max_operations=3)
+
+    for index in range(3):
+        with pytest.raises(ServiceError) as raised:
+            await service.execute(RetryJobCommand(f"stale-{index}", JOB_TARGET))
+        assert raised.value.code == ServiceErrorCode.RESOURCE_NOT_ISSUED
+        assert await service.receipt(f"stale-{index}") is None
+    assert len(service._operations) == 0
+
+    harness.jobs = [Harness._job(JOB.job_id)]
+    receipt = await service.execute(RetryJobCommand("stale-0", JOB_TARGET))
+    assert receipt.outcome == CIMutationOutcome.KNOWN
+    assert harness.client.calls == [("retry_job", "acme/widgets", 202)]
+
+
+@pytest.mark.asyncio
+async def test_known_forge_rejection_after_dispatch_is_kept() -> None:
+    harness = Harness()
+    harness.client.error = AuthError("secret")
+    service = harness.service(max_operations=1)
+    command = CancelPipelineCommand("refused", PIPELINE_TARGET)
+
+    for _attempt in range(2):
+        with pytest.raises(ServiceError) as raised:
+            await service.execute(command)
+        assert raised.value.code == ServiceErrorCode.AUTHENTICATION_FAILED
+    assert len(service._operations) == 1
+    assert harness.client.calls == [("cancel_pipeline", "acme/widgets", 101)]
 
 
 @pytest.mark.asyncio
