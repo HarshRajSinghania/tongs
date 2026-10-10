@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import math
 import os
 import secrets
 import sys
@@ -12,6 +13,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Protocol, cast
@@ -109,9 +111,11 @@ from tongs.services import (
     ReviewScope,
     ReviewSnapshot,
     ServiceError,
+    ServiceErrorCode,
     ServiceEvent,
 )
 from tongs.services.models import review_cursor_page
+from tongs.services.session import RATE_LIMIT_UNKNOWN_WAIT
 from tongs.state.drafts.models import RecoveryWarning
 
 _DIFF_SNAPSHOT = "diff"
@@ -156,11 +160,17 @@ SUPPORTED_METHODS = (
     "review_pipelines.list",
     *UTILITY_METHODS,
     *REVIEW_METHODS,
+    "reviews.ci_status",
     "reviews.get",
     "reviews.list",
 )
 
 _MAX_PROTOCOL_ERRORS = 8
+# Head commits remembered for ``reviews.ci_status``, one per listed review. No
+# more reviews than review handles can be listed, so this only bounds the map.
+_MAX_REVIEW_HEADS = 8192
+# The longest rate-limit wait ``reviews.ci_status`` names, in seconds.
+_MAX_RATE_LIMIT_WAIT_SECONDS = 86_400
 _DEFAULT_SHUTDOWN_TIMEOUT = 5.0
 
 
@@ -358,6 +368,9 @@ class DesktopSidecarServer:
         )
         self._handles = HandleRegistry()
         self._review_cursors = _ReviewCursors()
+        # The head commit each listed review had when its list was last read,
+        # so a CI lookup never takes a commit from the renderer.
+        self._review_heads: dict[ReviewRef, str] = {}
         self._snapshots = SnapshotStore()
         self._assets = AssetCatalog()
         self._operations: dict[str, _Operation] = {}
@@ -470,6 +483,7 @@ class DesktopSidecarServer:
             "repositories.discover": self._repositories_discover,
             "repositories.open": self._repositories_open,
             "review_pipelines.list": self._review_pipelines_list,
+            "reviews.ci_status": self._reviews_ci_status,
             "reviews.get": self._reviews_get,
             "reviews.list": self._reviews_list,
         }
@@ -706,6 +720,10 @@ class DesktopSidecarServer:
         rejected: it could neither be paged nor stay inside the frame budget.
         An optional boolean ``fresh`` marks an explicit refresh, which reads
         past the service's list cache.
+
+        Rows come without per-review CI requests where the forge allows it:
+        their CI status is then ``unknown`` and ``reviews.ci_status`` fills it
+        in for the rows the renderer shows.
         """
         _require_params(
             params,
@@ -742,6 +760,7 @@ class DesktopSidecarServer:
                 paged=True,
                 cursor=cursor,
                 fresh=fresh,
+                with_ci=False,
             )
         )
         return {
@@ -807,6 +826,58 @@ class DesktopSidecarServer:
                 for failure in page.failures
             ],
         }
+
+    async def _reviews_ci_status(
+        self, params: JsonObject, _context: RequestContext
+    ) -> object:
+        """Read the CI status of one listed review.
+
+        The lookup uses the head commit the review's last list read named, so
+        it costs the forge's CI requests only. An optional boolean ``fresh``
+        reads past the service's CI cache, as after an explicit refresh.
+
+        ``retry_after_seconds`` is null unless the review's forge host is rate
+        limited. A lookup on a host that already answered with a rate limit
+        sends no request, and a lookup that meets one is not an error: both
+        answer ``unknown`` with the seconds until the limit resets, so the
+        renderer can tell a rate limit from a failure and wait it out.
+        """
+        _require_params(
+            params,
+            allowed=frozenset({"review", "fresh"}),
+            required=frozenset({"review"}),
+        )
+        review = self._handles.resolve(params["review"], HandleKind.REVIEW, ReviewRef)
+        fresh = _optional_bool(params, "fresh", False)
+        hostname = review.repository.hostname
+        wait = self._rate_limit_wait(hostname)
+        if wait is not None:
+            return {"ci_status": "unknown", "retry_after_seconds": wait}
+        try:
+            status = await self._session.get_review_ci_status(
+                review, head_sha=self._review_heads.get(review, ""), fresh=fresh
+            )
+        except ServiceError as error:
+            if error.code is not ServiceErrorCode.RATE_LIMITED:
+                raise
+            wait = self._rate_limit_wait(hostname)
+            if wait is None:
+                wait = _bounded_wait(
+                    dict(error.details).get("retry_after_seconds"),
+                    RATE_LIMIT_UNKNOWN_WAIT.total_seconds(),
+                )
+            return {"ci_status": "unknown", "retry_after_seconds": wait}
+        return {"ci_status": status.value, "retry_after_seconds": None}
+
+    def _rate_limit_wait(self, hostname: str) -> int | None:
+        """Seconds until a rate-limited host takes reads again, or None."""
+        limit = self._session.host_rate_limit(hostname)
+        if limit is None:
+            return None
+        return _bounded_wait(
+            (limit.until - datetime.now(UTC)).total_seconds(),
+            RATE_LIMIT_UNKNOWN_WAIT.total_seconds(),
+        )
 
     async def _reviews_get(
         self, params: JsonObject, _context: RequestContext
@@ -1166,11 +1237,21 @@ class DesktopSidecarServer:
             HandleKind.REPOSITORY, item.ref.repository
         )
         review_handle = self._handles.issue(HandleKind.REVIEW, item.ref)
+        self._remember_head(item.ref, item.summary.head_commit_sha)
         return {
             "handle": review_handle,
             "repository": repository_handle,
             "summary": cast(JsonValue, _summary_wire(item.summary)),
         }
+
+    def _remember_head(self, review: ReviewRef, head_sha: str) -> None:
+        """Keep the head commit a list read named, replacing an older one."""
+        self._review_heads.pop(review, None)
+        if not head_sha:
+            return
+        if len(self._review_heads) >= _MAX_REVIEW_HEADS:
+            self._review_heads.pop(next(iter(self._review_heads)))
+        self._review_heads[review] = head_sha
 
     def _review_snapshot_wire(self, snapshot: ReviewSnapshot) -> JsonObject:
         repository_handle = self._handles.issue(
@@ -1873,6 +1954,23 @@ def _plugin_record_wire(
         "assets_available": assets_available,
     }
     return result
+
+
+def _bounded_wait(value: object, default: float) -> int:
+    """Whole seconds of a rate-limit wait, from 1 up to a day.
+
+    ``value`` is a number of seconds or the text of one, as a service error
+    detail carries it; anything else takes ``default``.
+    """
+    seconds = default
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        seconds = float(value)
+    elif isinstance(value, str):
+        with suppress(ValueError):
+            seconds = float(value)
+    if not math.isfinite(seconds):
+        seconds = default
+    return min(_MAX_RATE_LIMIT_WAIT_SECONDS, max(1, math.ceil(seconds)))
 
 
 def _service_protocol_error(error: ServiceError) -> ProtocolError:

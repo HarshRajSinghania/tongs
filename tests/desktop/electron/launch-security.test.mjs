@@ -50,6 +50,40 @@ test("reviews.list accepts only a boolean fresh flag for an explicit refresh", (
   assert.throws(() => assertParams("pipelines.list", { repository: "r", fresh: true }), /Invalid desktop parameter fields/);
 });
 
+test("reviews.ci_status takes one review handle and an optional fresh flag", () => {
+  assertParams("reviews.ci_status", { review: "r" });
+  assertParams("reviews.ci_status", { review: "r", fresh: true });
+  assertParams("reviews.ci_status", { review: "r", fresh: false });
+  assert.throws(() => assertParams("reviews.ci_status", {}), /Invalid desktop parameter fields/);
+  for (const extra of [{ head_sha: "abc" }, { repository: "r" }, { scope: "all_open" }]) {
+    assert.throws(() => assertParams("reviews.ci_status", { review: "r", ...extra }), /Invalid desktop parameter fields/, JSON.stringify(extra));
+  }
+  for (const fresh of ["true", "", 1, 0, null, [], {}]) {
+    assert.throws(() => assertParams("reviews.ci_status", { review: "r", fresh }), /Invalid desktop boolean parameter/, String(fresh));
+  }
+  for (const review of ["", 7, true, [], {}, "x".repeat(2049)]) {
+    assert.throws(() => assertParams("reviews.ci_status", { review }), /Invalid desktop/, JSON.stringify(review));
+  }
+  for (const status of ["pending", "running", "success", "failed", "canceled", "skipped", "unknown"]) {
+    assertResult("reviews.ci_status", { ci_status: status, retry_after_seconds: null });
+  }
+  // A rate-limited lookup knows no status and names a bounded wait.
+  for (const wait of [1, 120, 86_400]) {
+    assertResult("reviews.ci_status", { ci_status: "unknown", retry_after_seconds: wait });
+  }
+  for (const value of [
+    {}, { ci_status: "success" }, { ci_status: "", retry_after_seconds: null }, { ci_status: "green", retry_after_seconds: null },
+    { ci_status: null, retry_after_seconds: null }, { ci_status: 1, retry_after_seconds: null },
+    { ci_status: "success", retry_after_seconds: null, head_sha: "abc" },
+    { ci_status: "unknown", retry_after_seconds: 0 }, { ci_status: "unknown", retry_after_seconds: -1 },
+    { ci_status: "unknown", retry_after_seconds: 1.5 }, { ci_status: "unknown", retry_after_seconds: 86_401 },
+    { ci_status: "unknown", retry_after_seconds: "60" }, { ci_status: "unknown", retry_after_seconds: true },
+    { ci_status: "success", retry_after_seconds: 60 },
+  ]) {
+    assert.throws(() => assertResult("reviews.ci_status", value), /Invalid reviews.ci_status result/, JSON.stringify(value));
+  }
+});
+
 test("runtime result boundary validates operation-specific DTOs", () => {
   assertResult("reviews.list", { next_cursor: null, items: [], failures: [] });
   assertResult("reviews.list", { next_cursor: "rc1.2.0123456789abcdef0123456789abcdef", items: [], failures: [] });

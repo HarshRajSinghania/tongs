@@ -90,10 +90,12 @@ control afterwards leaves focus on that control. A fresh launch starts on
 disk.
 
 Each review card shows its CI state, number, title, author, source and target
-branches, and last update time. Select a card to open the review. When
-**All reviews** spans several repositories, a failed repository read is shown
-above the cards, and reviews from the repositories that responded stay
-available.
+branches, and last update time. The CI state fills in for each card as it
+scrolls into view, with a loading marker (**…**) until it arrives, and reads
+**N/A** when the lookup failed or the forge rate limit was reached. Select a
+card to open the review. When **All reviews** spans several repositories, a
+failed repository read is shown above the cards, and reviews from the
+repositories that responded stay available.
 
 **All Open** loads reviews a page at a time, most recently updated first, so
 a repository with thousands of open reviews still shows its newest ones

@@ -885,7 +885,7 @@ const REQUIRED_METHODS = Object.freeze([
   "discussions.list", "discussions.page", "host.set_location", "jobs.list", "logs.open", "logs.page",
   "jobs.cancel", "jobs.retry", "pipelines.cancel", "pipelines.list", "pipelines.retry",
   "plugins.invoke", "plugins.list", "repositories.discover",
-  "repositories.open", "review_pipelines.list", "reviews.get", "reviews.list", "shutdown",
+  "repositories.open", "review_pipelines.list", "reviews.ci_status", "reviews.get", "reviews.list", "shutdown",
   ...UTILITY_PROTOCOL_METHODS,
   ...REVIEW_OPERATIONS.map((operation) => operation.method),
 ].sort());

@@ -136,7 +136,7 @@ screen does not wait on the network.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `max_parallel` | integer | `8` | The most requests tongs sends to each forge host at once, counting list, CI, GraphQL and job log requests. Each host has its own limit. It must be greater than zero. |
+| `max_parallel` | integer | `8` | The most requests tongs sends to each forge host at once, counting list, CI, GraphQL and job log requests. Each host has its own limit. The terminal inbox also runs at most this many per-row CI lookups per host at once, except while GitHub combines them into GraphQL queries, when one query's worth (about 50) may run together as one request. It must be greater than zero. |
 | `request_timeout` | integer | `30` | The HTTP request timeout, in seconds. |
 
 ## `[drafts]`

@@ -8,6 +8,13 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
+from tests.test_forges.github_ci_batch import (
+    answer_ci_batch,
+    batch_pulls,
+    check_run,
+    is_ci_batch,
+    pull_node,
+)
 from tongs.forges.base import ForgeClient, read_mr_page
 from tongs.forges.github import GitHubClient
 from tongs.forges.gitlab import GitLabClient
@@ -108,7 +115,7 @@ class TestGitHubPage:
     @pytest.mark.asyncio
     async def test_one_request_sorted_by_update_and_ci_for_page_only(self) -> None:
         list_params: list[dict[str, str]] = []
-        ci_paths: list[str] = []
+        ci_batches: list[list[tuple[str, str, int]]] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/repos/acme/repo/pulls":
@@ -118,13 +125,14 @@ class TestGitHubPage:
                     json=[_github_pull(7), _github_pull(8)],
                     headers={"Link": '<https://api.github.com/x?page=4>; rel="next"'},
                 )
-            if request.url.path.endswith("/check-runs"):
-                ci_paths.append(request.url.path)
-                return httpx.Response(
-                    200,
-                    json={
-                        "check_runs": [{"status": "completed", "conclusion": "failure"}]
-                    },
+            if is_ci_batch(request):
+                # The page's CI is one GraphQL query, not two reads per row.
+                ci_batches.append(batch_pulls(request))
+                return answer_ci_batch(
+                    request,
+                    lambda _owner, _repo, number: pull_node(
+                        f"sha-{number}", [check_run("failure")]
+                    ),
                 )
             raise AssertionError(str(request.url))
 
@@ -146,10 +154,7 @@ class TestGitHubPage:
         ]
         assert [item.number for item in page.items] == [7, 8]
         assert page.has_next is True
-        assert sorted(ci_paths) == [
-            "/repos/acme/repo/commits/sha-7/check-runs",
-            "/repos/acme/repo/commits/sha-8/check-runs",
-        ]
+        assert ci_batches == [[("acme", "repo", 7), ("acme", "repo", 8)]]
         assert {item.ci_status for item in page.items} == {CIStatus.FAILED}
 
     @pytest.mark.asyncio

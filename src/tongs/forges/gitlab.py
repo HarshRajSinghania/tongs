@@ -165,6 +165,18 @@ def _discussion_resolution(discussion: dict, notes: list) -> tuple[bool, bool]:
     return True, all(note.get("resolved") is True for note in resolvable)
 
 
+def _mr_head_sha(data: dict) -> str:
+    """Return a merge request's head commit SHA, or an empty string.
+
+    List and detail responses name it as ``sha``; ``diff_refs`` names it too.
+    """
+    sha = data.get("sha")
+    if not isinstance(sha, str) or not sha:
+        diff_refs = data.get("diff_refs")
+        sha = diff_refs.get("head_sha") if isinstance(diff_refs, dict) else None
+    return sha if isinstance(sha, str) else ""
+
+
 def _parse_user(data: dict | None) -> User:
     if not data:
         return User(username="unknown")
@@ -203,10 +215,15 @@ class GitLabClient(ForgeClient):
         state: str = "opened",
         page: int = 1,
         per_page: int = 100,
+        *,
+        with_ci: bool = True,
     ) -> MRPage:
         """Read one page of merge requests, most recently updated first.
 
-        Pipeline status is fetched only for the merge requests on this page.
+        Pipeline status is fetched only for the merge requests on this page,
+        and not at all when ``with_ci`` is false: a row then keeps the
+        pipeline the list response carries, if any, and its head commit for
+        ``get_mr_ci_status``.
         """
         project = _encode_project(repo_path)
         gitlab_state = "opened" if state == "open" else state
@@ -221,8 +238,37 @@ class GitLabClient(ForgeClient):
                 "sort": "desc",
             },
         )
+        if not with_ci:
+            return MRPage(
+                tuple(self._parse_mr_summary(mr, repo_path) for mr in data),
+                has_next=has_next,
+            )
         summaries = await self._enrich_ci_status(data, repo_path)
         return MRPage(tuple(summaries), has_next=has_next)
+
+    async def get_mr_ci_status(
+        self, repo_path: str, number: int, head_sha: str = ""
+    ) -> CIStatus:
+        """Read the status of one merge request's newest pipeline.
+
+        This is the same pipeline a list read with CI shows. A failed request
+        raises, so a caller never caches a failure as a status.
+        """
+        return await self._read_mr_pipeline_status(_encode_project(repo_path), number)
+
+    async def _read_mr_pipeline_status(self, project: str, iid: int) -> CIStatus:
+        try:
+            pipelines = await request(
+                self._http,
+                "GET",
+                f"/projects/{project}/merge_requests/{iid}/pipelines",
+                params={"per_page": 1},
+            )
+            if pipelines and isinstance(pipelines, list) and pipelines[0]:
+                return _parse_ci_status(pipelines[0].get("status"))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return CIStatus.UNKNOWN
+        return CIStatus.UNKNOWN
 
     async def list_my_reviews(self) -> list[MRSummary]:
         user_data = await request(self._http, "GET", "/user")
@@ -271,17 +317,9 @@ class GitLabClient(ForgeClient):
 
         async def fetch_ci(iid: int) -> CIStatus:
             try:
-                pipelines = await request(
-                    self._http,
-                    "GET",
-                    f"/projects/{project}/merge_requests/{iid}/pipelines",
-                    params={"per_page": 1},
-                )
-                if pipelines and isinstance(pipelines, list) and pipelines[0]:
-                    return _parse_ci_status(pipelines[0].get("status"))
-            except (ForgeError, ValueError, KeyError, TypeError, AttributeError):
+                return await self._read_mr_pipeline_status(project, iid)
+            except ForgeError:
                 return CIStatus.UNKNOWN
-            return CIStatus.UNKNOWN
 
         ci_tasks = [fetch_ci(mr.get("iid")) for _, mr in needs_ci]
         ci_results = await asyncio.gather(*ci_tasks)
@@ -775,6 +813,10 @@ class GitLabClient(ForgeClient):
         return True
 
     @property
+    def supports_lazy_ci(self) -> bool:
+        return True
+
+    @property
     def supports_thread_resolution(self) -> bool:
         return True
 
@@ -801,6 +843,7 @@ class GitLabClient(ForgeClient):
             comment_count=data.get("user_notes_count", 0),
             has_conflicts=data.get("has_conflicts", False),
             labels=tuple(data.get("labels", [])),
+            head_commit_sha=_mr_head_sha(data),
         )
 
     def _parse_mr_detail(self, data: dict, repo_path: str) -> MRDetail:

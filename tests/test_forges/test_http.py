@@ -129,6 +129,24 @@ class TestMapHttpError:
         assert isinstance(err, ForgePermissionError)
         assert not isinstance(err, RateLimitError)
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "You have exceeded a secondary rate limit. Please wait a few minutes.",
+            "You have triggered an abuse detection mechanism.",
+        ],
+    )
+    def test_403_secondary_limit_named_only_in_the_body_is_a_rate_limit(
+        self, message: str
+    ) -> None:
+        """GitHub may send a secondary limit without Retry-After (#396)."""
+        resp = httpx.Response(
+            403, json={"message": message}, headers={"x-ratelimit-remaining": "4000"}
+        )
+        err = map_http_error(resp)
+        assert isinstance(err, RateLimitError)
+        assert err.retry_after is None
+
     def test_429_with_http_date_retry_after(self):
         resp = httpx.Response(
             429,

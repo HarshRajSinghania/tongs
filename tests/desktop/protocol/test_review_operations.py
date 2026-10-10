@@ -1464,6 +1464,10 @@ async def test_production_ndjson_roundtrip_uses_real_session_and_mock_transport(
     requests: list[tuple[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/graphql":
+            # Without GraphQL (as on some GitHub Enterprise hosts) CI is read
+            # over REST below.
+            return httpx.Response(404, json={"message": "Not Found"})
         requests.append((request.method, request.url.path))
         if request.url.path == "/repos/acme/widgets/pulls":
             page = int(request.url.params.get("page", "1"))
@@ -1474,6 +1478,8 @@ async def test_production_ndjson_roundtrip_uses_real_session_and_mock_transport(
             return httpx.Response(200, json=[])
         if request.url.path == "/repos/acme/widgets/commits/head-42/check-runs":
             return httpx.Response(200, json={"check_runs": []})
+        if request.url.path == "/repos/acme/widgets/commits/head-42/status":
+            return httpx.Response(200, json={"total_count": 0, "statuses": []})
         if request.url.path == "/repos/acme/widgets/issues/42/comments":
             assert request.method == "POST"
             assert json.loads(request.content) == {"body": "NDJSON comment"}

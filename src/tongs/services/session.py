@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import replace
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType, TracebackType
@@ -15,9 +16,10 @@ from typing import Protocol, Self, TypeVar, cast
 
 from tongs.cache.store import CacheStore
 from tongs.config import Config, load_config
-from tongs.errors import PartialResultsError
-from tongs.forges.base import ForgeClient, read_mr_page
+from tongs.errors import PartialResultsError, RateLimitError
+from tongs.forges.base import ForgeClient, read_mr_ci_status, read_mr_page
 from tongs.forges.models import (
+    CIStatus,
     Commit,
     Discussion,
     ForgeHost,
@@ -60,6 +62,31 @@ from tongs.state.drafts.models import RecoveryWarning
 from tongs.state.drafts.store import SUBMITTED_RETENTION, DraftStore
 
 log = logging.getLogger(__name__)
+
+# A listed head commit: empty, or a short token such as a hex SHA. Anything
+# else never reaches a forge request path.
+_HEAD_COMMIT = re.compile(r"[A-Za-z0-9_-]{0,128}")
+
+# How long a rate limit that names no reset time is waited out.
+RATE_LIMIT_UNKNOWN_WAIT = timedelta(minutes=3)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+@dataclass(frozen=True, slots=True)
+class HostRateLimit:
+    """A forge host that answered a read with a rate limit.
+
+    ``resets_at`` is when the forge said the limit resets (UTC), or None when
+    it did not say; ``until`` is when reads should start again, which is
+    ``resets_at`` when known and a short wait otherwise.
+    """
+
+    hostname: str
+    resets_at: datetime | None
+    until: datetime
 
 
 class CacheResource(Protocol):
@@ -149,6 +176,8 @@ class ApplicationSession:
         self._repositories: dict[RepositoryRef, RepositorySnapshot] = {}
         self._local_repositories: tuple[Repo, ...] = ()
         self._discovery_generation = 0
+        # The latest rate limit each host answered with, until it resets.
+        self._rate_limits: dict[str, HostRateLimit] = {}
         self._subscribers: set[asyncio.Queue[ServiceEvent | object]] = set()
         self._sequence = 0
         self._state = _SessionState.NEW
@@ -701,6 +730,7 @@ class ApplicationSession:
                             query.state.value,
                             page_number,
                             query.per_page,
+                            with_ci=query.with_ci,
                         )
                         summaries = _page_items(page)
                         if page.has_next and page_number < MAX_REVIEW_PAGE:
@@ -722,6 +752,7 @@ class ApplicationSession:
                             # Keep what the search read and report the rest.
                             summaries = list(error.items)
                             partial = _partial_failure(error, hostname, repository)
+                            self._note_rate_limit(error.cause, hostname)
                     self._require_started()
                     items = self._accept_summaries(
                         summaries,
@@ -740,6 +771,7 @@ class ApplicationSession:
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:  # noqa: BLE001 - Preserve partial results.
+                    self._note_rate_limit(error, hostname)
                     safe = translate_error(
                         error, operation="list_reviews", hostname=hostname
                     )
@@ -770,6 +802,69 @@ class ApplicationSession:
             next_cursors.get(query.repository) if query.repository is not None else None
         )
         return ReviewPage(tuple(items), tuple(failures), next_cursor)
+
+    async def get_review_ci_status(
+        self, ref: ReviewRef, *, head_sha: str = "", fresh: bool = False
+    ) -> CIStatus:
+        """Read the CI status of one issued review's head commit.
+
+        This completes a list read made without CI. ``head_sha`` is the head
+        commit the list named, if any. The read uses the response cache with
+        the review list lifetime; ``fresh`` reads past it. Requests go through
+        the same per-host request limit as every other read.
+        """
+        if not isinstance(head_sha, str) or not _HEAD_COMMIT.fullmatch(head_sha):
+            raise ServiceError(
+                ServiceErrorCode.INVALID_INPUT,
+                "The head commit is invalid.",
+            )
+        if not isinstance(fresh, bool):
+            raise ServiceError(
+                ServiceErrorCode.INVALID_INPUT,
+                "The refresh flag is invalid.",
+            )
+        client = await self._client_for_review(ref, "get_review_ci_status")
+        status = await self._call(
+            read_mr_ci_status(
+                client,
+                ref.repository.project_path,
+                ref.number,
+                head_sha,
+                fresh=fresh,
+            ),
+            operation="get_review_ci_status",
+            hostname=ref.repository.hostname,
+        )
+        if not isinstance(status, CIStatus):
+            raise ServiceError(
+                ServiceErrorCode.INVALID_RESPONSE,
+                "The forge returned an invalid CI status.",
+            )
+        return status
+
+    def host_rate_limit(self, hostname: str) -> HostRateLimit | None:
+        """Return the rate limit a host answered with, while it lasts.
+
+        A read that met a primary or secondary rate limit records it, with
+        the reset time the forge named. Callers use it to say when reads work
+        again and to hold back reads that can wait, such as per-review CI.
+        """
+        limit = self._rate_limits.get(hostname)
+        if limit is None:
+            return None
+        if limit.until <= _utcnow():
+            del self._rate_limits[hostname]
+            return None
+        return limit
+
+    def _note_rate_limit(self, error: BaseException | None, hostname: str) -> None:
+        if not isinstance(error, RateLimitError):
+            return
+        now = _utcnow()
+        wait = error.retry_after
+        resets_at = now + timedelta(seconds=wait) if wait is not None else None
+        until = resets_at if resets_at is not None else now + RATE_LIMIT_UNKNOWN_WAIT
+        self._rate_limits[hostname] = HostRateLimit(hostname, resets_at, until)
 
     async def get_review(self, ref: ReviewRef) -> ReviewSnapshot:
         """Read review detail and bind it to complete revision metadata."""
@@ -1022,8 +1117,9 @@ class ApplicationSession:
         """Drop a repository's cached review lists after a CI retry or cancel.
 
         The cached review list carries each review's CI status, so it would
-        otherwise show the state before the action until it expires. No other
-        cached read holds CI status, so cached diffs stay.
+        otherwise show the state before the action until it expires. Cached
+        per-review CI statuses sit below the same prefix and go with it. No
+        other cached read holds CI status, so cached diffs stay.
         """
         repository = pipeline.repository
         client = await self._client_for_repository(repository, "invalidate_pipeline")
@@ -1072,6 +1168,7 @@ class ApplicationSession:
         except Exception as error:  # noqa: BLE001 - Sanitize forge boundary.
             if self._close_requested:
                 self._require_started()
+            self._note_rate_limit(error, hostname)
             raise translate_error(
                 error, operation=operation, hostname=hostname
             ) from None
@@ -1316,6 +1413,7 @@ __all__ = [
     "ApplicationSession",
     "CacheResource",
     "ForgeRegistryResource",
+    "HostRateLimit",
 ]
 
 
