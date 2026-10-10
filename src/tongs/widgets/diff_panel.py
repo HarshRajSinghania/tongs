@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import re
+from collections import OrderedDict
 from enum import Enum
 from typing import ClassVar
 
@@ -503,6 +504,8 @@ class DiffContent(Widget):
     """Container coordinating unified, split, and Markdown diff views."""
 
     MIN_SPLIT_WIDTH = 88
+    HIGHLIGHT_CACHE_FILES = 16
+    """Highlighted files kept for revisits; the least recently shown goes."""
 
     DEFAULT_CSS = """
     DiffContent {
@@ -523,8 +526,11 @@ class DiffContent(Widget):
         self._effective_mode = DiffViewMode.UNIFIED
         self._preview_selection: DiffSelection | None = None
         self._draft_markers: tuple[DraftMarker, ...] = ()
-        # Highlight maps by id(file), holding the file so a reused id misses.
-        self._highlight_cache: dict[int, tuple[DiffFile, HighlightMap]] = {}
+        # Highlight maps by id(file), holding the file so a reused id misses,
+        # least recently shown first.
+        self._highlight_cache: OrderedDict[int, tuple[DiffFile, HighlightMap]] = (
+            OrderedDict()
+        )
 
     def compose(self) -> ComposeResult:
         yield DiffOptionList(id="diff-option-list")
@@ -643,9 +649,13 @@ class DiffContent(Widget):
         """Return the file's highlight map, running Pygments only once per file."""
         cached = self._highlight_cache.get(id(file))
         if cached is not None and cached[0] is file:
+            self._highlight_cache.move_to_end(id(file))
             return cached[1]
         highlight_map = _build_highlight_map(file)
         self._highlight_cache[id(file)] = (file, highlight_map)
+        self._highlight_cache.move_to_end(id(file))
+        while len(self._highlight_cache) > self.HIGHLIGHT_CACHE_FILES:
+            self._highlight_cache.popitem(last=False)
         return highlight_map
 
     def _render_current_file(self, selection: DiffSelection | None = None) -> None:

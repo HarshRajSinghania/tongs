@@ -508,6 +508,29 @@ async def test_highlight_cache_is_per_file_and_cleared_by_new_files(
         assert len(lexer_calls) > before_placeholder
 
 
+def test_highlight_cache_keeps_the_most_recently_shown_files(
+    lexer_calls: list[str],
+) -> None:
+    content = DiffContent()
+    limit = DiffContent.HIGHLIGHT_CACHE_FILES
+    files = [_python_file(f"f{index}.py") for index in range(limit + 1)]
+    for file in files[:limit]:
+        content._highlight_map(file)
+    # Revisit the oldest so the second file becomes the least recent one.
+    content._highlight_map(files[0])
+    content._highlight_map(files[limit])
+    assert len(content._highlight_cache) == limit
+
+    before = len(lexer_calls)
+    content._highlight_map(files[0])
+    content._highlight_map(files[limit])
+    assert len(lexer_calls) == before
+
+    content._highlight_map(files[1])
+    assert len(lexer_calls) > before
+    assert len(content._highlight_cache) == limit
+
+
 @pytest.mark.asyncio
 async def test_showing_a_file_renders_it_once_with_its_markers(
     monkeypatch: pytest.MonkeyPatch,
