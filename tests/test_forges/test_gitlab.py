@@ -63,6 +63,8 @@ class TestParseDatetime:
         ("cancelled", CIStatus.CANCELED),
         ("created", CIStatus.PENDING),
         ("manual", CIStatus.PENDING),
+        ("canceling", CIStatus.RUNNING),
+        ("waiting_for_callback", CIStatus.PENDING),
         ("something_new", CIStatus.UNKNOWN),
         (None, CIStatus.UNKNOWN),
     ],
@@ -234,14 +236,59 @@ class TestParseMRDetail:
         assert len(detail.approvals) == 1
 
     @pytest.mark.parametrize(
-        ("raw", "expected"),
-        [("1000+", 1000), (7, 7), (None, 0), ("", 0), ("n/a", 0)],
+        ("raw", "expected", "overflow"),
+        [
+            ("1000+", 1000, True),
+            (" 1000+ ", 1000, True),
+            ("5", 5, False),
+            (5, 5, False),
+            (7, 7, False),
+            (None, 0, False),
+            ("", 0, False),
+            ("n/a", 0, False),
+            ("+", 0, False),
+            ("1000++", 0, False),
+            (True, 0, False),
+            (False, 0, False),
+        ],
     )
-    def test_parse_mr_detail_changes_count_shapes(self, raw: object, expected: int):
+    def test_parse_mr_detail_changes_count_shapes(
+        self, raw: object, expected: int, overflow: bool
+    ):
         client = self._client()
         data = _mr_api_json({"changes_count": raw})
         detail = client._parse_mr_detail(data, "acme/widgets")
         assert detail.changes_count == expected
+        assert detail.changes_overflow is overflow
+
+    def test_parse_mr_detail_without_changes_count(self):
+        client = self._client()
+        data = _mr_api_json()
+        del data["changes_count"]
+        detail = client._parse_mr_detail(data, "acme/widgets")
+        assert detail.changes_count == 0
+        assert detail.changes_overflow is False
+
+    def test_parse_mr_detail_complete_list_does_not_overflow(self):
+        detail = self._client()._parse_mr_detail(_mr_api_json(), "acme/widgets")
+        assert detail.changes_count == 5
+        assert detail.changes_overflow is False
+
+    @pytest.mark.asyncio
+    async def test_get_mr_keeps_overflow_when_approvals_are_merged(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/approvals"):
+                return httpx.Response(
+                    200,
+                    json={"approved_by": [{"user": {"username": "carol"}}]},
+                )
+            return httpx.Response(200, json=_mr_api_json({"changes_count": "1000+"}))
+
+        client, _ = _make_gitlab_client(handler)
+        detail = await client.get_mr("acme/widgets", 42)
+        assert [user.username for user in detail.approvals] == ["carol"]
+        assert detail.changes_count == 1000
+        assert detail.changes_overflow is True
 
 
 class TestParseNote:

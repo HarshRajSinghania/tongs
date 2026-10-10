@@ -35,6 +35,7 @@ def _get_registry() -> ForgeRegistry:
             extra_gitlab_hosts=config.extra_gitlab_hosts,
             extra_github_hosts=config.extra_github_hosts,
             request_timeout=config.request_timeout,
+            max_parallel=config.max_parallel,
         )
     return _registry
 

@@ -1,9 +1,12 @@
 """Tests for MCP server helpers."""
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
+from tongs.config import Config
 from tongs.errors import AuthError, NetworkError
 from tongs.forges.models import CIStatus, Pipeline
 from tongs.forges.registry import ForgeRegistry
@@ -226,3 +229,66 @@ async def test_list_pipelines_shortens_sha(monkeypatch) -> None:
     )
     result = await server.list_pipelines("github.com/org/repo", 1)
     assert result[0]["sha"] == "1234567"
+
+
+def _pull(number: int) -> dict[str, object]:
+    return {
+        "number": number,
+        "title": f"PR {number}",
+        "state": "open",
+        "user": {"login": "alice"},
+        "head": {"ref": "feature", "sha": f"sha-{number}"},
+        "base": {"ref": "main"},
+        "created_at": "2026-09-01T00:00:00Z",
+        "updated_at": "2026-09-02T00:00:00Z",
+        "html_url": f"https://github.com/acme/repo/pull/{number}",
+        "labels": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_mcp_registry_bounds_requests_per_host(monkeypatch) -> None:
+    """tongs-mcp builds its registry with max_parallel from config.toml."""
+    active = 0
+    peak = 0
+    paths: list[str] = []
+
+    async def handle_async_request(
+        _transport: httpx.AsyncHTTPTransport, request: httpx.Request
+    ) -> httpx.Response:
+        nonlocal active, peak
+        paths.append(request.url.path)
+        active += 1
+        peak = max(peak, active)
+        try:
+            for _ in range(3):
+                await asyncio.sleep(0)
+            await asyncio.sleep(0.002)
+            if request.url.path == "/repos/acme/repo/pulls":
+                return httpx.Response(200, json=[_pull(n) for n in range(1, 51)])
+            return httpx.Response(200, json={"check_runs": []})
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(
+        httpx.AsyncHTTPTransport, "handle_async_request", handle_async_request
+    )
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+    monkeypatch.setattr(server, "_registry", None)
+    monkeypatch.setattr(server, "load_config", lambda: Config(max_parallel=4))
+
+    with patch("tongs.forges.registry.resolve_token", return_value="tok"):
+        results = await asyncio.gather(
+            server.list_mrs("github.com/acme/repo"),
+            server.list_mrs("github.com/acme/repo"),
+        )
+    registry = server._registry
+    assert registry is not None
+    assert registry.max_parallel == 4
+    await registry.close_all()
+
+    assert [len(result) for result in results] == [50, 50]
+    assert sum(path.endswith("/check-runs") for path in paths) == 100
+    assert peak == 4

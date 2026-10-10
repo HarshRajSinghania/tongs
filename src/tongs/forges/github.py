@@ -13,6 +13,7 @@ from tongs.errors import (
     ConflictError,
     ForgeError,
     NetworkError,
+    PartialResultsError,
     ValidationError,
     redact_credentials,
 )
@@ -36,6 +37,27 @@ from tongs.forges.models import (
     SourceCleanupStatus,
     User,
 )
+
+# The pull request files API lists at most this many files.
+_PR_FILES_CAP = 3000
+
+# The search API returns at most this many results for one query, in pages of
+# at most 100.
+_SEARCH_PAGE_SIZE = 100
+_SEARCH_RESULT_CAP = 1000
+
+# Check runs are read in pages of 100, up to this many pages per commit.
+_CHECK_RUNS_PAGE_SIZE = 100
+_CHECK_RUNS_MAX_PAGES = 10
+
+
+def _files_overflowed(changed_files: object) -> bool:
+    """Return whether a pull request has more files than the files API lists."""
+    return (
+        isinstance(changed_files, int)
+        and not isinstance(changed_files, bool)
+        and changed_files > _PR_FILES_CAP
+    )
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -65,6 +87,54 @@ def _parse_ci_status(status: str | None, conclusion: str | None) -> CIStatus:
         "requested": CIStatus.PENDING,
         "pending": CIStatus.PENDING,
     }.get(status, CIStatus.UNKNOWN)
+
+
+def _check_run_state(run: dict) -> CIStatus:
+    """Classify one check run for the commit-level aggregate.
+
+    This differs from ``_parse_ci_status``, which also maps pipeline and job
+    rows: a neutral check counts as passing, and the check-run-only
+    conclusions ``startup_failure`` and ``stale`` get explicit states.
+    """
+    status = str(run.get("status") or "").lower()
+    if status != "completed":
+        return _parse_ci_status(status, None)
+    return {
+        "success": CIStatus.SUCCESS,
+        "neutral": CIStatus.SUCCESS,
+        "skipped": CIStatus.SKIPPED,
+        "failure": CIStatus.FAILED,
+        "timed_out": CIStatus.FAILED,
+        "startup_failure": CIStatus.FAILED,
+        "cancelled": CIStatus.CANCELED,
+        "action_required": CIStatus.PENDING,
+        # GitHub marks a check stale when it waited too long; it needs a rerun.
+        "stale": CIStatus.PENDING,
+    }.get(str(run.get("conclusion") or "").lower(), CIStatus.UNKNOWN)
+
+
+def _aggregate_check_runs(runs: list[dict]) -> CIStatus:
+    """Combine a commit's check runs into one status.
+
+    Any failure wins, then running, then pending work. Skipped and neutral
+    checks do not block success; a commit whose checks were all skipped is
+    SKIPPED.
+    """
+    statuses = [_check_run_state(run) for run in runs]
+    if not statuses:
+        return CIStatus.UNKNOWN
+    for blocking in (
+        CIStatus.FAILED,
+        CIStatus.RUNNING,
+        CIStatus.PENDING,
+        CIStatus.UNKNOWN,
+        CIStatus.CANCELED,
+    ):
+        if blocking in statuses:
+            return blocking
+    if all(status == CIStatus.SKIPPED for status in statuses):
+        return CIStatus.SKIPPED
+    return CIStatus.SUCCESS
 
 
 def _parse_mr_state(value: str) -> MRState:
@@ -289,32 +359,108 @@ class GitHubClient(ForgeClient):
         return await self._search_prs("is:pr is:open author:@me")
 
     async def _search_prs(self, query: str) -> list[MRSummary]:
-        data = await request(
-            self._http,
-            "GET",
-            "/search/issues",
-            params={"q": query, "per_page": 100},
-        )
-        results = []
-        for item in data.get("items", []):
-            repo_url = item.get("repository_url", "")
-            number = item.get("number")
-            if not repo_url or not number:
-                continue
-            repo_path = self._repo_path_from_api_url(repo_url)
-            if not repo_path:
-                continue
+        """List the pull requests a search matches.
+
+        Search pages are followed up to GitHub's 1000-result cap. Raises
+        PartialResultsError, carrying the pull requests that were read, when a
+        later search page or an individual pull request cannot be read, or
+        when the cap or a search timeout truncates the results.
+        """
+        hits: list[tuple[str, int]] = []
+        seen: set[tuple[str, int]] = set()
+        truncation: ForgeError | None = None
+        max_pages = _SEARCH_RESULT_CAP // _SEARCH_PAGE_SIZE
+        for page in range(1, max_pages + 1):
             try:
-                owner, repo = _split_repo_path(repo_path)
-                pr_data = await request(
+                data = await request(
                     self._http,
                     "GET",
-                    f"/repos/{owner}/{repo}/pulls/{number}",
+                    "/search/issues",
+                    params={"q": query, "per_page": _SEARCH_PAGE_SIZE, "page": page},
                 )
-                results.append(self._parse_pr_summary(pr_data, repo_path))
-            except (ForgeError, ValueError, KeyError, TypeError, AttributeError):
-                continue
+            except ForgeError as error:
+                if page == 1:
+                    raise
+                truncation = error
+                break
+            if not isinstance(data, dict):
+                error = ForgeError("GitHub returned an invalid search response")
+                if page == 1:
+                    raise error
+                truncation = error
+                break
+            items = data.get("items", [])
+            if not isinstance(items, list):
+                items = []
+            for item in items:
+                hit = self._search_hit(item)
+                if hit is not None and hit not in seen:
+                    seen.add(hit)
+                    hits.append(hit)
+            total_count = data.get("total_count")
+            if data.get("incomplete_results") is True:
+                truncation = ForgeError("GitHub search timed out before it finished")
+                break
+            if type(total_count) is int and total_count > _SEARCH_RESULT_CAP:
+                truncation = ForgeError(
+                    f"GitHub search matched {total_count} results; "
+                    f"only the first {_SEARCH_RESULT_CAP} are listed"
+                )
+            if len(items) < _SEARCH_PAGE_SIZE or (
+                type(total_count) is int
+                and page * _SEARCH_PAGE_SIZE >= min(total_count, _SEARCH_RESULT_CAP)
+            ):
+                break
+
+        fetched = await asyncio.gather(
+            *(self._fetch_search_hit(repo_path, number) for repo_path, number in hits)
+        )
+        results = [item for item in fetched if isinstance(item, MRSummary)]
+        failures = [item for item in fetched if isinstance(item, ForgeError)]
+        if failures:
+            raise PartialResultsError(
+                results,
+                failures[0],
+                f"{len(failures)} of {len(hits)} pull requests from the GitHub "
+                "search could not be read",
+            )
+        if truncation is not None:
+            raise PartialResultsError(results, truncation)
         return results
+
+    def _search_hit(self, item: object) -> tuple[str, int] | None:
+        """Return the repository path and number of one search result."""
+        if not isinstance(item, dict):
+            return None
+        repo_url = item.get("repository_url", "")
+        number = item.get("number")
+        if not repo_url or not isinstance(repo_url, str):
+            return None
+        if type(number) is not int or number <= 0:
+            return None
+        repo_path = self._repo_path_from_api_url(repo_url)
+        if not repo_path:
+            return None
+        return repo_path, number
+
+    async def _fetch_search_hit(
+        self, repo_path: str, number: int
+    ) -> MRSummary | ForgeError:
+        """Read one search result's pull request, returning a failure as a value."""
+        owner, repo = _split_repo_path(repo_path)
+        try:
+            pr_data = await request(
+                self._http,
+                "GET",
+                f"/repos/{owner}/{repo}/pulls/{number}",
+            )
+            if not isinstance(pr_data, dict):
+                raise TypeError("expected a pull request object")
+            return self._parse_pr_summary(pr_data, repo_path)
+        except ForgeError as error:
+            return error
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return ForgeError("GitHub returned an unreadable pull request")
 
     def _repo_path_from_api_url(self, api_url: str) -> str:
         """Extract 'owner/repo' from a GitHub API URL like https://api.github.com/repos/owner/repo."""
@@ -894,29 +1040,40 @@ class GitHubClient(ForgeClient):
         )
 
     async def _fetch_ci_status(self, owner: str, repo: str, sha: str) -> CIStatus:
-        """Fetch combined CI status from check-runs API."""
+        """Fetch combined CI status from the check-runs API.
+
+        Check runs are paged up to the reported ``total_count``. When a commit
+        has more runs than the page limit reads, a failure among the runs read
+        is still reported, but no other aggregate is claimed.
+        """
         try:
-            data = await request(
-                self._http,
-                "GET",
-                f"/repos/{owner}/{repo}/commits/{sha}/check-runs",
-                params={"per_page": 100},
-            )
-            runs = data.get("check_runs", [])
-            if not runs:
-                return CIStatus.UNKNOWN
-            statuses = [
-                _parse_ci_status(r.get("status"), r.get("conclusion")) for r in runs
-            ]
-            if any(s == CIStatus.FAILED for s in statuses):
-                return CIStatus.FAILED
-            if any(s == CIStatus.RUNNING for s in statuses):
-                return CIStatus.RUNNING
-            if any(s == CIStatus.PENDING for s in statuses):
-                return CIStatus.PENDING
-            if all(s == CIStatus.SUCCESS for s in statuses):
-                return CIStatus.SUCCESS
-            return CIStatus.UNKNOWN
+            runs: list[dict] = []
+            total_count: int | None = None
+            for page in range(1, _CHECK_RUNS_MAX_PAGES + 1):
+                data = await request(
+                    self._http,
+                    "GET",
+                    f"/repos/{owner}/{repo}/commits/{sha}/check-runs",
+                    params={"per_page": _CHECK_RUNS_PAGE_SIZE, "page": page},
+                )
+                if not isinstance(data, dict):
+                    return CIStatus.UNKNOWN
+                page_runs = data.get("check_runs", [])
+                if not isinstance(page_runs, list):
+                    return CIStatus.UNKNOWN
+                runs.extend(page_runs)
+                if total_count is None:
+                    reported = data.get("total_count", len(page_runs))
+                    if type(reported) is not int or reported < 0:
+                        return CIStatus.UNKNOWN
+                    total_count = reported
+                if len(runs) >= total_count or len(page_runs) < _CHECK_RUNS_PAGE_SIZE:
+                    break
+            status = _aggregate_check_runs(runs)
+            if total_count is not None and len(runs) < total_count:
+                # Some runs were never read, so only a failure is certain.
+                return status if status == CIStatus.FAILED else CIStatus.UNKNOWN
+            return status
         except (ForgeError, ValueError, KeyError, TypeError, AttributeError):
             return CIStatus.UNKNOWN
 
@@ -956,6 +1113,7 @@ class GitHubClient(ForgeClient):
             changes_count=data.get("changed_files", 0),
             head_sha=data.get("head", {}).get("sha", ""),
             base_sha=data.get("base", {}).get("sha", ""),
+            changes_overflow=_files_overflowed(data.get("changed_files")),
         )
 
     def _parse_review_comment(self, data: dict) -> InlineComment:

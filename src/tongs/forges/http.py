@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+import math
+import time
+from collections.abc import AsyncIterator, Callable
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -21,6 +24,121 @@ from tongs.errors import (
 )
 
 log = logging.getLogger(__name__)
+
+#: The longest rate-limit wait a request sleeps through before its one retry.
+#: A forge that asks for a longer wait gets a RateLimitError straight away.
+MAX_RETRY_AFTER_SECONDS = 60
+
+#: The wait before the one retry when a rate limit names no reset time.
+DEFAULT_RETRY_AFTER_SECONDS = 5
+
+_MAX_HEADER_DIGITS = 12
+
+# Retry sleeps go through this name so tests can observe them without waiting.
+_sleep = asyncio.sleep
+#: Methods safe to send twice. A rate-limited write fails at once instead of
+#: sleeping and resending, so callers with their own deadline (review
+#: submission) report the rate limit rather than an unknown outcome.
+_RETRYABLE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+class HostRequestLimiter:
+    """Bound the forge requests in flight to one host.
+
+    Every transport wrapped by one limiter shares its slots. A slot is taken
+    when a request is sent and given back when its response stream closes, so
+    a streamed download keeps its slot until it is read or closed. The wait
+    for a slot has no timeout of its own; the request timeout starts once the
+    slot is held.
+    """
+
+    def __init__(self, max_parallel: int) -> None:
+        if max_parallel < 1:
+            raise ValueError("max_parallel must be positive")
+        self._max_parallel = max_parallel
+        self._semaphore = asyncio.Semaphore(max_parallel)
+
+    @property
+    def max_parallel(self) -> int:
+        """The most requests this limiter lets run at once."""
+        return self._max_parallel
+
+    def wrap(self, transport: httpx.AsyncBaseTransport) -> httpx.AsyncBaseTransport:
+        """Return ``transport`` bounded by this limiter's slots."""
+        return _LimitedTransport(transport, self._semaphore)
+
+    def install(self, client: httpx.AsyncClient) -> None:
+        """Bound every transport ``client`` can send through.
+
+        Passing ``transport=`` to the client constructor would turn off the
+        proxies httpx reads from the environment, so the client is built as
+        usual and its transport and proxy mounts are wrapped afterwards.
+        """
+        client._transport = self.wrap(client._transport)
+        client._mounts = {
+            pattern: None if transport is None else self.wrap(transport)
+            for pattern, transport in client._mounts.items()
+        }
+
+
+class _LimitedTransport(httpx.AsyncBaseTransport):
+    """Hold one limiter slot from send until the response stream closes."""
+
+    def __init__(
+        self, transport: httpx.AsyncBaseTransport, semaphore: asyncio.Semaphore
+    ) -> None:
+        self._transport = transport
+        self._semaphore = semaphore
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        await self._semaphore.acquire()
+        slot = _Slot(self._semaphore)
+        try:
+            response = await self._transport.handle_async_request(request)
+        except BaseException:
+            slot.release()
+            raise
+        stream = response.stream
+        if not isinstance(stream, httpx.AsyncByteStream):
+            slot.release()
+            raise TypeError("The forge transport returned a synchronous stream")
+        return httpx.Response(
+            status_code=response.status_code,
+            headers=response.headers,
+            stream=_SlotStream(stream, slot),
+            extensions=response.extensions,
+        )
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
+
+
+class _Slot:
+    """Release a limiter slot exactly once."""
+
+    def __init__(self, semaphore: asyncio.Semaphore) -> None:
+        self._semaphore: asyncio.Semaphore | None = semaphore
+
+    def release(self) -> None:
+        semaphore, self._semaphore = self._semaphore, None
+        if semaphore is not None:
+            semaphore.release()
+
+
+class _SlotStream(httpx.AsyncByteStream):
+    def __init__(self, stream: httpx.AsyncByteStream, slot: _Slot) -> None:
+        self._stream = stream
+        self._slot = slot
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        try:
+            await self._stream.aclose()
+        finally:
+            self._slot.release()
 
 
 class RefreshingTokenAuth(httpx.Auth):
@@ -46,6 +164,9 @@ class RefreshingTokenAuth(httpx.Auth):
         if response.status_code != 401:
             return
 
+        # Read and close the rejected response first, so it gives back its
+        # host request slot before the refresh runs.
+        await response.aread()
         async with self._lock:
             # Another request may already have refreshed the token.
             if self._token == sent_token:
@@ -68,10 +189,14 @@ def create_client(
     token: str,
     timeout: float = 30.0,
     refresh: Callable[[], str | None] | None = None,
+    *,
+    limiter: HostRequestLimiter | None = None,
 ) -> httpx.AsyncClient:
     """Create an authenticated async HTTP client for a forge API.
 
     When ``refresh`` is given, a 401 triggers one token refresh and retry.
+    When ``limiter`` is given, every request the client sends, including
+    redirects and the retry after a refresh, takes one of its slots.
     """
     headers = {"Accept": "application/json"}
     auth = None
@@ -79,22 +204,38 @@ def create_client(
         headers["Authorization"] = f"Bearer {token}"
     else:
         auth = RefreshingTokenAuth(token, refresh)
-    return httpx.AsyncClient(
+    client = httpx.AsyncClient(
         base_url=base_url,
         auth=auth,
         headers=headers,
         timeout=timeout,
         follow_redirects=True,
     )
+    if limiter is not None:
+        limiter.install(client)
+    return client
 
 
-def map_http_error(response: httpx.Response) -> ForgeError:
-    """Map an HTTP error response to the appropriate ForgeError subclass."""
+def map_http_error(
+    response: httpx.Response, *, now: Callable[[], float] = time.time
+) -> ForgeError:
+    """Map an HTTP error response to the appropriate ForgeError subclass.
+
+    A 429, and a 403 that carries ``Retry-After`` or ``x-ratelimit-remaining:
+    0``, map to RateLimitError. ``now`` returns the current Unix time and
+    turns an HTTP-date ``Retry-After`` or an ``x-ratelimit-reset`` epoch into
+    a wait in seconds.
+    """
     status = response.status_code
     body = _safe_body(response)
+    headers = httpx.Headers(response.headers)
 
     if status == 401:
         return AuthError(f"Authentication failed: {body}")
+    if status == 403 and _is_rate_limited_403(headers):
+        return RateLimitError(
+            f"Rate limited: {body}", retry_after=_retry_after(headers, now)
+        )
     if status == 403:
         return ForgePermissionError(f"Insufficient permissions: {body}")
     if status == 404:
@@ -121,13 +262,63 @@ def map_http_error(response: httpx.Response) -> ForgeError:
     if status in {400, 422}:
         return ValidationError(f"Validation failed: {body}")
     if status == 429:
-        retry_after = response.headers.get("Retry-After")
-        retry_seconds = (
-            int(retry_after) if retry_after and retry_after.isdigit() else None
+        return RateLimitError(
+            f"Rate limited: {body}", retry_after=_retry_after(headers, now)
         )
-        return RateLimitError(f"Rate limited: {body}", retry_after=retry_seconds)
 
     return ForgeError(f"HTTP {status}: {body}")
+
+
+def _is_rate_limited_403(headers: httpx.Headers) -> bool:
+    """Tell a rate-limit 403 from a permission 403.
+
+    GitHub answers both an exhausted primary rate limit and a secondary rate
+    limit with 403; the first sets ``x-ratelimit-remaining: 0`` and the second
+    sets ``Retry-After``.
+    """
+    if headers.get("Retry-After") is not None:
+        return True
+    remaining = headers.get("x-ratelimit-remaining")
+    return remaining is not None and remaining.strip() == "0"
+
+
+def _retry_after(headers: httpx.Headers, now: Callable[[], float]) -> int | None:
+    """Return the wait the forge asked for in whole seconds, or ``None``.
+
+    ``Retry-After`` is read as delta-seconds or as an HTTP-date. Without it, a
+    GitHub ``x-ratelimit-reset`` epoch is used.
+    """
+    retry_after = headers.get("Retry-After")
+    if retry_after is not None:
+        value = retry_after.strip()
+        if _is_bounded_digits(value):
+            return int(value)
+        return _seconds_until_date(value, now)
+    reset = headers.get("x-ratelimit-reset")
+    if reset is not None and _is_bounded_digits(reset.strip()):
+        return max(0, math.ceil(int(reset.strip()) - now()))
+    return None
+
+
+def _seconds_until_date(value: str, now: Callable[[], float]) -> int | None:
+    if not value or not value.isascii() or len(value) > 64:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return max(0, math.ceil(parsed.timestamp() - now()))
+
+
+def _is_bounded_digits(value: str) -> bool:
+    return (
+        bool(value)
+        and value.isascii()
+        and value.isdigit()
+        and len(value) <= _MAX_HEADER_DIGITS
+    )
 
 
 async def request(
@@ -142,7 +333,10 @@ async def request(
 
     Returns parsed JSON response body.
     Raises appropriate ForgeError subclass on failure.
-    On 429 (rate limit), waits ``retry_after`` seconds and retries once.
+    On a rate limit, a GET, HEAD or OPTIONS request waits ``retry_after``
+    seconds and retries once, unless the wait is longer than
+    ``MAX_RETRY_AFTER_SECONDS``. A rate-limited write raises at once. A timeout
+    is not retried.
     """
     response = await _send(client, method, path, _retried=_retried, **kwargs)
     if response.status_code == 204:
@@ -205,10 +399,25 @@ async def _send(
 
     if response.status_code >= 400:
         err = map_http_error(response)
-        if isinstance(err, RateLimitError) and not _retried:
-            delay = err.retry_after if err.retry_after is not None else 5
+        if (
+            isinstance(err, RateLimitError)
+            and not _retried
+            and method.upper() in _RETRYABLE_METHODS
+        ):
+            delay = (
+                err.retry_after
+                if err.retry_after is not None
+                else DEFAULT_RETRY_AFTER_SECONDS
+            )
+            if delay > MAX_RETRY_AFTER_SECONDS:
+                log.warning(
+                    "Rate limited on %s %s for %ds; not retrying", method, path, delay
+                )
+                raise err
             log.warning("Rate limited on %s %s, retrying in %ds", method, path, delay)
-            await asyncio.sleep(delay)
+            # The response is already read and closed, so no host request slot
+            # is held while sleeping.
+            await _sleep(delay)
             return await _send(client, method, path, _retried=True, **kwargs)
         raise err
 
@@ -218,7 +427,7 @@ async def _send(
 async def paginate(
     client: httpx.AsyncClient,
     path: str,
-    per_page: int = 20,
+    per_page: int = 100,
     max_pages: int | None = None,
     **kwargs,
 ) -> list[dict]:
