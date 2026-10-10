@@ -56,6 +56,7 @@ Only `name` is abstract. All other methods have safe defaults (empty lists/dicts
 Defined in `src/tongs/plugins/registry.py`. Manages plugin discovery and lifecycle.
 
 **Discovery:** `discover(plugin_config)` reads `importlib.metadata.entry_points(group="tongs.plugins")`. For each entry point:
+
 1. Checks `plugin_config[ep.name].get("enabled", True)`. Disabled plugins are skipped (logged at INFO).
 2. Calls `ep.load()` to import the class, then instantiates it.
 3. Validates `isinstance(plugin, TongsPlugin)`. Non-conforming plugins are skipped (logged at WARNING).
@@ -129,10 +130,12 @@ Defined in `src/tongs/mcp/server.py`. Runs as a separate process (not inside the
 1. Create a Python package with a class extending `TongsPlugin`.
 2. Implement `name` (required) and any optional methods.
 3. Register as an entry point in your package's `pyproject.toml`:
+
    ```toml
    [project.entry-points."tongs.plugins"]
    your_plugin = "your_package.module:YourPlugin"
    ```
+
 4. Install the package in the same environment as tongs.
 5. The plugin will be discovered on next app launch.
 
@@ -144,12 +147,14 @@ interface. This narrows normal access, but is not a security boundary against
 trusted in-process Python code.
 
 **Exposed properties (read-only):**
+
 - `forge_registry`: access to authenticated forge clients
 - `cache`: access to the SQLite cache store
 - `config`: application configuration
 - `repos`: list of discovered repositories
 
 **Exposed methods:**
+
 - `notify(message, severity)`: send a user-visible notification
 - `push_screen(screen)`: push a screen onto the TUI stack
 - `pop_screen()`: pop the current screen
