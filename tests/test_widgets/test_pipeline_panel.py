@@ -19,6 +19,7 @@ from tongs.widgets.pipeline_panel import (
     RetryJobRequested,
     RetryPipelineRequested,
 )
+from tongs.widgets.two_press import TwoPressConfirm
 
 
 class PipelinePanelApp(App[None]):
@@ -157,6 +158,109 @@ async def test_job_mutation_posts_only_after_the_confirm_press(
         await pilot.pause()
 
     assert _ids(app.posted) == [(expected, 7, 31)]
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.mark.asyncio
+async def test_late_confirm_press_rearms_instead_of_cancelling() -> None:
+    app = PipelinePanelApp()
+    clock = _Clock()
+    async with app.run_test() as pilot:
+        panel = app.query_one(PipelinePanel)
+        panel._two_press = TwoPressConfirm(clock=clock)
+        panel.set_pipelines([_pipeline(CIStatus.RUNNING)])
+        await pilot.pause()
+        await pilot.press("C")
+        clock.now += 6.0
+        await pilot.press("C")
+        await pilot.pause()
+        assert app.posted == []
+        clock.now += 1.0
+        await pilot.press("C")
+        await pilot.pause()
+
+    assert _ids(app.posted) == [("CancelPipelineRequested", 7, None)]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_and_job_with_the_same_id_do_not_cross_confirm() -> None:
+    app = PipelinePanelApp()
+    pipeline = _pipeline(CIStatus.RUNNING)
+    job = PipelineJob(id=7, name="build", stage="build", status=CIStatus.RUNNING)
+    async with app.run_test() as pilot:
+        panel = app.query_one(PipelinePanel)
+        panel.set_pipelines([pipeline])
+        await pilot.pause()
+        await pilot.press("C")
+        panel.set_jobs([job], pipeline)
+        await pilot.pause()
+        await pilot.press("C")
+        await pilot.pause()
+        assert app.posted == []
+        await pilot.press("C")
+        await pilot.pause()
+
+    assert _ids(app.posted) == [("CancelJobRequested", 7, 7)]
+
+
+@pytest.mark.asyncio
+async def test_cancel_then_retry_on_one_target_does_not_cross_confirm() -> None:
+    app = PipelinePanelApp()
+    async with app.run_test() as pilot:
+        panel = app.query_one(PipelinePanel)
+        panel.set_pipelines([_pipeline(CIStatus.RUNNING)])
+        await pilot.pause()
+        await pilot.press("C")
+        panel._pipelines = [_pipeline(CIStatus.FAILED)]
+        await pilot.press("R")
+        await pilot.pause()
+
+    assert app.posted == []
+
+
+@pytest.mark.asyncio
+async def test_drill_out_clears_an_armed_cancel() -> None:
+    app = PipelinePanelApp()
+    pipeline = _pipeline(CIStatus.RUNNING)
+    async with app.run_test() as pilot:
+        panel = app.query_one(PipelinePanel)
+        panel.set_jobs([_job(CIStatus.RUNNING)], pipeline)
+        await pilot.pause()
+        await pilot.press("C")
+        assert panel._two_press.armed
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not panel._two_press.armed
+        panel.set_jobs([_job(CIStatus.RUNNING)], pipeline)
+        await pilot.pause()
+        await pilot.press("C")
+        await pilot.pause()
+
+    assert app.posted == []
+
+
+@pytest.mark.asyncio
+async def test_new_pipeline_list_clears_an_armed_cancel() -> None:
+    app = PipelinePanelApp()
+    async with app.run_test() as pilot:
+        panel = app.query_one(PipelinePanel)
+        panel.set_pipelines([_pipeline(CIStatus.RUNNING)])
+        await pilot.pause()
+        await pilot.press("C")
+        panel.set_pipelines([_pipeline(CIStatus.RUNNING)])
+        await pilot.pause()
+        assert not panel._two_press.armed
+        await pilot.press("C")
+        await pilot.pause()
+
+    assert app.posted == []
 
 
 @pytest.mark.asyncio

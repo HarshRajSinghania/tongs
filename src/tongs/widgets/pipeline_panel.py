@@ -24,6 +24,7 @@ from textual.widgets import Input, RichLog, Static
 
 from tongs.forges.models import CIStatus, Pipeline, PipelineJob
 from tongs.helpers import ci_icon_markup, ci_icon_text, format_duration, relative_time
+from tongs.widgets.two_press import TwoPressConfirm
 
 LOG_MAX_LINES = 50000
 """Job log lines kept in the widget; older lines are dropped past this."""
@@ -217,8 +218,9 @@ class PipelinePanel(Widget, can_focus=True):
         self._current_pipeline: Pipeline | None = None
         self._current_job: PipelineJob | None = None
         self._job_log_text: str = ""
-        self._pending_cancel: int | None = None
-        self._pending_retry: int | None = None
+        # One confirm for cancel and retry, keyed by (action, level, id), so a
+        # pipeline and a job with the same number never confirm each other.
+        self._two_press = TwoPressConfirm()
         self._search_matches: list[int] = []
         self._search_index: int = 0
         self._search_active: bool = False
@@ -247,6 +249,7 @@ class PipelinePanel(Widget, can_focus=True):
 
     def set_pipelines(self, pipelines: list[Pipeline]) -> None:
         self._pipelines = pipelines
+        self._two_press.reset()
         self._view_level = 0
         self._focused_index = 0
         self._render_pipeline_list()
@@ -448,6 +451,7 @@ class PipelinePanel(Widget, can_focus=True):
         return True
 
     def action_drill_out(self) -> None:
+        self._two_press.reset()
         if self._search_active:
             self._close_search(restore_scroll=True)
             return
@@ -469,23 +473,19 @@ class PipelinePanel(Widget, can_focus=True):
             if not p or p.status not in (CIStatus.RUNNING, CIStatus.PENDING):
                 self.app.notify("Can only cancel running or pending pipelines")
                 return
-            if self._pending_cancel == p.id:
-                self._pending_cancel = None
+            if self._two_press.arm(("cancel", "pipeline", p.id)):
                 self.post_message(CancelPipelineRequested(p.id))
             else:
-                self._pending_cancel = p.id
                 self.app.notify(f"Cancel pipeline #{p.id}? Press C again.")
         elif self._view_level == 1:
             j = self._get_focused_job()
             if not j or j.status not in (CIStatus.RUNNING, CIStatus.PENDING):
                 self.app.notify("Can only cancel running or pending jobs")
                 return
-            if self._pending_cancel == j.id:
-                self._pending_cancel = None
+            if self._two_press.arm(("cancel", "job", j.id)):
                 assert self._current_pipeline is not None
                 self.post_message(CancelJobRequested(self._current_pipeline.id, j.id))
             else:
-                self._pending_cancel = j.id
                 self.app.notify(f"Cancel job {j.name}? Press C again.", markup=False)
 
     def action_retry(self) -> None:
@@ -494,23 +494,19 @@ class PipelinePanel(Widget, can_focus=True):
             if not p or p.status not in (CIStatus.FAILED, CIStatus.CANCELED):
                 self.app.notify("Can only retry failed or canceled pipelines")
                 return
-            if self._pending_retry == p.id:
-                self._pending_retry = None
+            if self._two_press.arm(("retry", "pipeline", p.id)):
                 self.post_message(RetryPipelineRequested(p.id))
             else:
-                self._pending_retry = p.id
                 self.app.notify(f"Retry pipeline #{p.id}? Press R again.")
         elif self._view_level == 1:
             j = self._get_focused_job()
             if not j or j.status not in (CIStatus.FAILED, CIStatus.CANCELED):
                 self.app.notify("Can only retry failed or canceled jobs")
                 return
-            if self._pending_retry == j.id:
-                self._pending_retry = None
+            if self._two_press.arm(("retry", "job", j.id)):
                 assert self._current_pipeline is not None
                 self.post_message(RetryJobRequested(self._current_pipeline.id, j.id))
             else:
-                self._pending_retry = j.id
                 self.app.notify(f"Retry job {j.name}? Press R again.", markup=False)
 
     def action_open_browser(self) -> None:

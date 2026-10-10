@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import pyperclip
 import pytest
+from textual.pilot import Pilot
 from textual.widgets import Static, TextArea
 
 from tongs.app import TongsApp
@@ -56,6 +57,7 @@ from tongs.widgets.diff_panel import (
 )
 from tongs.widgets.pipeline_panel import PipelinePanel, RetryJobRequested
 from tongs.widgets.split_diff import DiffViewMode, SplitDiffColumn, SplitDiffView
+from tongs.widgets.two_press import TwoPressConfirm
 
 NOW = datetime(2026, 9, 7, tzinfo=UTC)
 
@@ -707,6 +709,108 @@ async def test_known_comment_releases_identity_for_a_deliberate_later_repeat(
         assert screen._mutation_intents == {}
 
 
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+async def _open_detail_with_clock(
+    app: TongsApp, pilot: Pilot, clock: _Clock
+) -> MRDetailScreen:
+    await _settle(app)
+    table = app.screen.query_one("#reviews-table")
+    table.focus()
+    await pilot.press("enter")
+    await _settle(app)
+    screen = cast(MRDetailScreen, app.screen)
+    screen._two_press = TwoPressConfirm(clock=clock)
+    return screen
+
+
+def _calls(forge: _Forge, name: str) -> list[tuple]:
+    return [call for call in forge.calls if call[0] == name]
+
+
+@pytest.mark.asyncio
+async def test_mr_action_confirm_pressed_late_rearms_instead_of_merging(
+    tmp_path: Path,
+) -> None:
+    app, forge = _app(tmp_path)
+    clock = _Clock()
+
+    async with app.run_test(notifications=True) as pilot:
+        screen = await _open_detail_with_clock(app, pilot, clock)
+
+        screen.action_merge()
+        clock.now += 6.0
+        screen.action_merge()
+        await _settle(app)
+        assert _calls(forge, "merge") == []
+
+        clock.now += 1.0
+        screen.action_merge()
+        await _settle(app)
+        assert len(_calls(forge, "merge")) == 1
+
+
+@pytest.mark.asyncio
+async def test_mr_action_confirm_is_bound_to_action_and_head(tmp_path: Path) -> None:
+    app, forge = _app(tmp_path)
+    clock = _Clock()
+
+    async with app.run_test(notifications=True) as pilot:
+        screen = await _open_detail_with_clock(app, pilot, clock)
+        assert screen.mr_detail is not None
+
+        # A different action never confirms the armed one.
+        screen.action_close_mr()
+        screen.action_merge()
+        await _settle(app)
+        assert _calls(forge, "close") == []
+        assert _calls(forge, "merge") == []
+
+        # A new head between the presses re-arms instead of merging.
+        screen.mr_detail = replace(screen.mr_detail, head_sha="head-8")
+        screen.action_merge()
+        await _settle(app)
+        assert _calls(forge, "merge") == []
+
+        screen.action_merge()
+        await _settle(app)
+        assert len(_calls(forge, "merge")) == 1
+
+
+@pytest.mark.asyncio
+async def test_tab_switch_and_refresh_clear_an_armed_mr_action(tmp_path: Path) -> None:
+    app, forge = _app(tmp_path)
+    clock = _Clock()
+
+    async with app.run_test(notifications=True) as pilot:
+        screen = await _open_detail_with_clock(app, pilot, clock)
+
+        screen.action_close_mr()
+        screen.action_focus_tab("commits")
+        await _settle(app)
+        assert not screen._two_press.armed
+        screen.action_close_mr()
+        await _settle(app)
+        assert _calls(forge, "close") == []
+
+        screen.action_refresh()
+        await _settle(app)
+        assert not screen._two_press.armed
+        screen.action_close_mr()
+        await _settle(app)
+        assert _calls(forge, "close") == []
+
+        screen.action_close_mr()
+        await _settle(app)
+        assert len(_calls(forge, "close")) == 1
+
+
 @pytest.mark.asyncio
 async def test_adapter_keeps_quick_writes_revision_bound_and_immediate(
     tmp_path: Path,
@@ -845,7 +949,7 @@ async def test_ctrl_y_uses_osc52_and_falls_back_gracefully(
 async def _open_diff_tab(app: TongsApp, pilot: object) -> MRDetailScreen:
     await _settle(app)
     app.screen.query_one("#reviews-table").focus()
-    await pilot.press("enter")  # type: ignore[attr-defined]
+    await pilot.press("enter")
     await _settle(app)
     screen = cast(MRDetailScreen, app.screen)
     assert isinstance(screen, MRDetailScreen)
