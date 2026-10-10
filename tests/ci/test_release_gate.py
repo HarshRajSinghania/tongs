@@ -168,6 +168,31 @@ def test_release_notes_with_front_matter_and_a_body_pass(notes: Path) -> None:
     assert _evaluate(notes) == []
 
 
+@pytest.mark.parametrize(
+    "content", ["---\ntitle: v1.0.4\n---\n---\nBody\n", "---\ntitle\n---\n---\n"]
+)
+def test_notes_whose_body_opens_with_a_delimiter_fail(
+    notes: Path, content: str
+) -> None:
+    notes.write_text(content)
+    (failure,) = _evaluate(notes)
+    assert failure.startswith(f"docs/releases/{TAG}.md ")
+
+
+@pytest.mark.parametrize(
+    "head_repository", [None, "andre-motta/tongs", {}, {"id": "1305350434"}]
+)
+def test_a_run_without_a_usable_head_repository_is_ignored(
+    head_repository: Any,
+) -> None:
+    (run,) = _fixture("runs-success.json")["workflow_runs"]
+    assert not gate._is_main_ci_push_run(
+        {**run, "head_repository": head_repository}, SHA, REPOSITORY_ID
+    )
+    missing = {key: value for key, value in run.items() if key != "head_repository"}
+    assert not gate._is_main_ci_push_run(missing, SHA, REPOSITORY_ID)
+
+
 def test_a_green_main_run_from_a_fork_head_is_ignored() -> None:
     (run,) = _fixture("runs-success.json")["workflow_runs"]
     forked = {**run, "head_repository": {**run["head_repository"], "id": 1399999999}}

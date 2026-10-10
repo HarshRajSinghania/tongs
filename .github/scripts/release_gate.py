@@ -112,15 +112,21 @@ def _check_notes(tag: str, notes_path: Path) -> list[str]:
         text = notes_path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as error:
         return [f"{expected} cannot be read as UTF-8 text: {error}"]
-    if not _without_front_matter(text).strip():
+    body = _without_front_matter(text)
+    if not body.strip():
         return [f"{expected} is empty in the tagged tree"]
+    if body.split("\n", 1)[0] == "---":
+        return [f"{expected} starts with '---' after its front matter"]
     return []
 
 
 def _without_front_matter(text: str) -> str:
-    """Drop a leading ``---`` block, as the desktop release's notes step does."""
-    lines = text.splitlines()
-    if not lines or lines[0] != "---":
+    """Drop a leading ``---`` block, as the desktop release's notes step does.
+
+    Lines split on ``\\n`` only, so each one matches awk's ``$0`` exactly.
+    """
+    lines = text.split("\n")
+    if lines[0] != "---":
         return text
     for index, line in enumerate(lines[1:], start=1):
         if line == "---":
