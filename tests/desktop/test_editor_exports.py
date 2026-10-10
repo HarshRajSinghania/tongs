@@ -141,9 +141,61 @@ async def test_close_only_live_expiry_is_reclaimed_after_stale_lease(
 
 
 @pytest.mark.asyncio
-async def test_fresh_legacy_or_orphan_export_blocks_new_slots(
+async def test_one_stale_row_that_cannot_be_reclaimed_does_not_block_a_free_slot(
     tmp_path: Path,
 ) -> None:
+    root = tmp_path / "exports"
+    ledger = EditorExportLedger(root)
+    try:
+        stuck = await ledger.reserve(1, _token(1), now=0)
+        assert stuck is not None
+        # The editor saved the export recently, so it is still in use.
+        stuck_path = _write_export(
+            root, stuck.export_name, modified_at=STALE_EDITOR_EXPORT_SECONDS
+        )
+        blocked = await ledger.reserve(2, _token(2), now=0)
+        assert blocked is not None
+        (root / blocked.export_name).mkdir()
+
+        later = STALE_EDITOR_EXPORT_SECONDS + 1
+        second = await ledger.reserve(3, _token(3), now=later)
+
+        assert second is not None
+        assert second.slot not in {stuck.slot, blocked.slot}
+        assert stuck_path.read_text() == "bounded log\n"
+        assert (root / blocked.export_name).is_dir()
+    finally:
+        await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_slots_are_reclaimed_one_by_one(tmp_path: Path) -> None:
+    root = tmp_path / "exports"
+    ledger = EditorExportLedger(root)
+    try:
+        held = []
+        for value in range(1, MAX_EDITOR_EXPORTS + 1):
+            reservation = await ledger.reserve(value, _token(value), now=0)
+            assert reservation is not None
+            held.append(_write_export(root, reservation.export_name, modified_at=0))
+        # Every slot but the last is still being edited.
+        for path in held[:-1]:
+            os.utime(path, (STALE_EDITOR_EXPORT_SECONDS, STALE_EDITOR_EXPORT_SECONDS))
+
+        later = STALE_EDITOR_EXPORT_SECONDS + 1
+        replacement = await ledger.reserve(90, _token(90), now=later)
+
+        assert replacement is not None
+        assert replacement.slot == MAX_EDITOR_EXPORTS
+        assert not held[-1].exists()
+        assert all(path.exists() for path in held[:-1])
+        assert await ledger.reserve(91, _token(91), now=later) is None
+    finally:
+        await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_legacy_export_counts_against_the_bound(tmp_path: Path) -> None:
     root = tmp_path / "exports"
     ledger = EditorExportLedger(root)
     try:
@@ -156,10 +208,15 @@ async def test_fresh_legacy_or_orphan_export_blocks_new_slots(
             modified_at=10,
         )
 
-        assert await ledger.reserve(2, _token(2), now=10) is None
+        for value in range(2, MAX_EDITOR_EXPORTS + 1):
+            assert await ledger.reserve(value, _token(value), now=10) is not None
+        assert await ledger.reserve(20, _token(20), now=10) is None
+        assert legacy.exists()
 
         os.utime(legacy, (0, 0))
-        result = await ledger.reserve(3, _token(3), now=STALE_EDITOR_EXPORT_SECONDS + 1)
+        result = await ledger.reserve(
+            21, _token(21), now=STALE_EDITOR_EXPORT_SECONDS + 1
+        )
         assert result is not None
         assert not legacy.exists()
     finally:
@@ -167,7 +224,9 @@ async def test_fresh_legacy_or_orphan_export_blocks_new_slots(
 
 
 @pytest.mark.asyncio
-async def test_malformed_row_and_fresh_orphan_fail_closed(tmp_path: Path) -> None:
+async def test_malformed_row_and_fresh_orphan_hold_only_their_share(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "exports"
     ledger = EditorExportLedger(root)
     seed = await ledger.reserve(1, _token(1), now=10)
@@ -182,24 +241,37 @@ async def test_malformed_row_and_fresh_orphan_fail_closed(tmp_path: Path) -> Non
             "VALUES (?, ?, ?, ?)",
             (9, _token(9), "outside-policy.log", 0),
         )
+        connection.execute(
+            "INSERT INTO editor_exports(slot, token, export_name, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (2, _token(2), "outside-policy-2.log", 0),
+        )
     malformed = EditorExportLedger(root)
     try:
-        assert (
-            await malformed.reserve(2, _token(2), now=STALE_EDITOR_EXPORT_SECONDS + 1)
-            is None
-        )
+        later = STALE_EDITOR_EXPORT_SECONDS + 1
+        admitted = [
+            await malformed.reserve(value, _token(value), now=later)
+            for value in range(10, 10 + MAX_EDITOR_EXPORTS)
+        ]
+        slots = [result.slot for result in admitted if result is not None]
+        # The out-of-range row takes one unit of capacity and the in-range row
+        # keeps its own slot, so six of the eight slots stay usable.
+        assert slots == [1, 3, 4, 5, 6, 7]
+        for result in admitted:
+            if result is not None:
+                assert await malformed.release(result.slot, result.token) is True
     finally:
         await malformed.close()
 
     with sqlite3.connect(database) as connection:
-        connection.execute("DELETE FROM editor_exports WHERE slot = 9")
+        connection.execute("DELETE FROM editor_exports WHERE slot IN (2, 9)")
     malformed_name = "tongs-slot-1-job-invalid.log"
     malformed_file = _write_export(root, malformed_name, modified_at=20)
     permissive = EditorExportLedger(root)
     try:
-        admitted = await permissive.reserve(3, _token(3), now=20)
-        assert admitted is not None
-        assert await permissive.release(admitted.slot, admitted.token) is True
+        admitted_one = await permissive.reserve(3, _token(3), now=20)
+        assert admitted_one is not None
+        assert await permissive.release(admitted_one.slot, admitted_one.token) is True
         assert malformed_file.exists()
     finally:
         await permissive.close()
@@ -208,7 +280,9 @@ async def test_malformed_row_and_fresh_orphan_fail_closed(tmp_path: Path) -> Non
     orphan = _write_export(root, orphan_name, modified_at=20)
     recovered = EditorExportLedger(root)
     try:
-        assert await recovered.reserve(4, _token(4), now=20) is None
+        result = await recovered.reserve(4, _token(5), now=20)
+        assert result is not None
+        assert result.slot == 2
         assert orphan.exists()
     finally:
         await recovered.close()

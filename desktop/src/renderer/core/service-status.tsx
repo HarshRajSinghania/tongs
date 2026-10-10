@@ -9,6 +9,8 @@ export const SERVICE_STATUS_TEXT = Object.freeze({
   connecting: "Connecting to the local service…",
   connected: "Local service connected",
   stopped: "Local service not running. Quit and reopen Tongs.",
+  restarting: "Local service stopped. Restarting it…",
+  failed: "Local service keeps stopping. Quit and reopen Tongs.",
   unavailable: "Local service unavailable",
   updates: "Updates are available. Refresh the current view.",
 } as const);
@@ -27,9 +29,15 @@ const BASE_CLASS = "service-status";
  * service is running; the renderer adds its own probe result and the
  * updates-available notice. A stopped service outranks everything else, so the
  * header never says connected while reads fail because the service is gone.
+ * While the main process restarts a lost service the line says so, and once
+ * it gives up the line names the fix.
  */
+/** What the main process reports about restarting a lost service. */
+type ServiceRecovery = "restarting" | "failed" | null;
+
 export class ServiceStatusModel {
   #state: ServiceState | null = null;
+  #recovery: ServiceRecovery = null;
   #revision = -1;
   #probeOk = false;
   #probeFailed = false;
@@ -64,6 +72,7 @@ export class ServiceStatusModel {
     this.#revision = status.revision;
     const reconnected = status.state === "connected" && this.#state === "stopped";
     this.#state = status.state;
+    this.#recovery = statusRecovery(status);
     if (reconnected) {
       this.#probeFailed = false;
       this.#updates = false;
@@ -138,6 +147,12 @@ export class ServiceStatusModel {
 
   #compute(): ServiceStatusView {
     if (this.#state === "stopped") {
+      if (this.#recovery === "restarting") {
+        return view(SERVICE_STATUS_TEXT.restarting, `${BASE_CLASS} service-status-warning`);
+      }
+      if (this.#recovery === "failed") {
+        return view(SERVICE_STATUS_TEXT.failed, `${BASE_CLASS} service-status-error`);
+      }
       return view(SERVICE_STATUS_TEXT.stopped, `${BASE_CLASS} service-status-error`);
     }
     if (this.#probeFailed) {
@@ -223,6 +238,15 @@ function statusNotices(status: ServiceStatusDto): readonly string[] {
   return notices.filter(
     (notice): notice is string => typeof notice === "string" && notice.length > 0,
   );
+}
+
+/**
+ * Reads the optional recovery report. The main process adds it only while it
+ * restarts a lost service or after it gave up; anything else means none.
+ */
+function statusRecovery(status: ServiceStatusDto): ServiceRecovery {
+  const recovery: unknown = (status as { recovery?: unknown }).recovery;
+  return recovery === "restarting" || recovery === "failed" ? recovery : null;
 }
 
 function view(text: string, className: string): ServiceStatusView {

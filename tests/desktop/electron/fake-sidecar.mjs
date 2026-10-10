@@ -79,6 +79,9 @@ export function harness({
   extraCapabilities = [],
   limitOverrides = {},
   handshakeExtras = {},
+  // Each child writes these chunks to its stderr once it starts, like the
+  // service's diagnostics; a function receives the child's index.
+  stderr = [],
 } = {}) {
   const children = [];
   const respond = (child, frame) => {
@@ -118,6 +121,11 @@ export function harness({
     child.signalCode = null;
     child.frames = [];
     child.spawnOptions = options;
+    const diagnostics =
+      typeof stderr === "function" ? stderr(children.length - 1) : stderr;
+    queueMicrotask(() => {
+      for (const chunk of diagnostics) child.stderr.write(chunk);
+    });
     child.finish = (code = 0, signal = null) => {
       child.exitCode = code;
       child.signalCode = signal;
@@ -163,12 +171,13 @@ export const launch = {
   safeCwd: process.cwd(),
 };
 
-export function transportFor(fake, shutdownTimeout = 1_000) {
+export function transportFor(fake, shutdownTimeout = 1_000, diagnostics) {
   return new SidecarTransport(
     launch,
     1_000,
     1_000,
     shutdownTimeout,
     fake.spawn,
+    diagnostics,
   );
 }

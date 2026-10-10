@@ -163,6 +163,67 @@ test("the stopped header tells the user how to recover", () => {
   assert.equal(model.view.text.includes("Quit and reopen Tongs"), true);
 });
 
+test("the header says the service is restarting, then names the fix if it gives up", () => {
+  const model = new ServiceStatusModel();
+  model.applyStatus({ state: "connected", revision: 1, notices: [] });
+  model.applyStatus({ state: "stopped", revision: 2, notices: [], recovery: "restarting" });
+  assert.equal(model.view.text, SERVICE_STATUS_TEXT.restarting);
+  assert.equal(model.view.text, "Local service stopped. Restarting it…");
+  assert.equal(model.view.className, "service-status service-status-warning");
+  model.applyStatus({ state: "stopped", revision: 3, notices: [], recovery: "failed" });
+  assert.equal(model.view.text, SERVICE_STATUS_TEXT.failed);
+  assert.equal(model.view.text.includes("Quit and reopen Tongs"), true);
+  assert.equal(model.view.className, "service-status service-status-error");
+  for (const text of Object.values(SERVICE_STATUS_TEXT)) {
+    assert.equal(text.includes("\u2014"), false);
+  }
+});
+
+test("a connected service ignores the recovery report and an unknown one reads as stopped", () => {
+  const model = new ServiceStatusModel();
+  model.applyStatus({ state: "connected", revision: 1, notices: [], recovery: "restarting" });
+  assert.equal(model.view.text, SERVICE_STATUS_TEXT.connected);
+  model.applyStatus({ state: "stopped", revision: 2, notices: [], recovery: "rebooting" });
+  assert.equal(model.view.text, SERVICE_STATUS_TEXT.stopped);
+  model.applyStatus({ state: "stopped", revision: 3, notices: [], recovery: 7 });
+  assert.equal(model.view.text, SERVICE_STATUS_TEXT.stopped);
+});
+
+test("the header follows the main-process recovery through a restart", async () => {
+  const fake = harness();
+  const transport = transportFor(fake);
+  await transport.start();
+  const { bridge, publisher } = wire(transport);
+  render(React.createElement(ServiceStatusLine, { model: new ServiceStatusModel(), bridge }));
+  await settle();
+  assert.equal(headerText(), SERVICE_STATUS_TEXT.connected);
+  await act(async () => {
+    fake.children[0].finish(1, null);
+    transport.setRecovery("restarting");
+  });
+  assert.equal(headerText(), SERVICE_STATUS_TEXT.restarting);
+  await act(async () => {
+    await transport.restart();
+    transport.setRecovery("idle");
+  });
+  assert.equal(headerText(), SERVICE_STATUS_TEXT.connected);
+  await act(async () => {
+    await transport.restart();
+  });
+  // A header mounted after the recovery gave up starts at the fix.
+  await act(async () => {
+    fake.children[2].finish(1, null);
+    transport.setRecovery("failed");
+  });
+  cleanup();
+  render(React.createElement(ServiceStatusLine, { model: new ServiceStatusModel(), bridge }));
+  await settle();
+  assert.equal(headerText(), SERVICE_STATUS_TEXT.failed);
+  assert.equal(headerClass(), "service-status service-status-error");
+  publisher.dispose();
+  await transport.stop();
+});
+
 test("only a resync warns that updates are available", () => {
   assert.equal(isResyncEvent("protocol.resync_required", {}), true);
   assert.equal(

@@ -155,7 +155,7 @@ async def test_operation_id_cannot_be_rebound_to_different_payload() -> None:
     service, *_ = _service(_client())
     await service.execute(GeneralComment("same-id", REF, "first"))
 
-    with pytest.raises(ServiceError, match="different mutation") as raised:
+    with pytest.raises(ServiceError, match="different action") as raised:
         await service.execute(GeneralComment("same-id", REF, "second"))
     assert raised.value.code == ServiceErrorCode.CONFLICT
 
@@ -592,8 +592,13 @@ async def test_ledger_never_evicts_an_unresolved_operation() -> None:
         service.execute(GeneralComment("pending-1", REF, "one"))
     )
     await entered.wait()
-    with pytest.raises(ServiceError, match="ledger is full"):
+    with pytest.raises(ServiceError) as raised:
         await service.execute(GeneralComment("pending-2", REF, "two"))
+    assert raised.value.code is ServiceErrorCode.CAPACITY_EXHAUSTED
+    assert raised.value.retryable is False
+    assert raised.value.message == (
+        "Too many write actions in this session. Restart tongs to continue."
+    )
     release.set()
     await first
 
@@ -605,11 +610,82 @@ async def test_full_ledger_retains_terminal_binding_and_never_redispatches() -> 
     first = GeneralComment("retained-1", REF, "one")
     expected = await service.execute(first)
 
-    with pytest.raises(ServiceError, match="ledger is full"):
+    with pytest.raises(ServiceError) as raised:
         await service.execute(GeneralComment("rejected-2", REF, "two"))
+    assert raised.value.code is ServiceErrorCode.CAPACITY_EXHAUSTED
+    assert raised.value.retryable is False
     repeated = await service.execute(first)
 
     assert repeated == expected
+    client.add_comment.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_commands_rejected_before_sending_keep_no_ledger_entry() -> None:
+    client = _client()
+    service, get_review, *_ = _service(client, ledger_size=3)
+    get_review.return_value = _snapshot(revision=ReviewRevision("new", "base", "start"))
+
+    for index in range(3):
+        with pytest.raises(ServiceError) as raised:
+            await service.execute(
+                Reply(f"stale-{index}", REF, REVISION, "thread-9", "reply")
+            )
+        assert raised.value.code is ServiceErrorCode.REVISION_CHANGED
+    get_review.return_value = _snapshot()
+    with pytest.raises(ServiceError) as invalid:
+        await service.execute(Resolve("foreign-thread", REF, REVISION, "foreign"))
+    assert invalid.value.code is ServiceErrorCode.INVALID_INPUT
+
+    assert len(service._ledger) == 0
+    for index in range(3):
+        await service.execute(GeneralComment(f"sent-{index}", REF, "body"))
+    assert client.add_comment.await_count == 3
+    client.reply_to_discussion.assert_not_awaited()
+    client.resolve_discussion.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rejected_operation_id_is_validated_again_on_retry() -> None:
+    client = _client()
+    service, get_review, *_ = _service(client, ledger_size=1)
+    stale = _snapshot(revision=ReviewRevision("new", "base", "start"))
+    get_review.return_value = stale
+    command = Reply("retry-after-refresh", REF, REVISION, "thread-9", "reply")
+
+    with pytest.raises(ServiceError) as raised:
+        await service.execute(command)
+    assert raised.value.code is ServiceErrorCode.REVISION_CHANGED
+
+    get_review.return_value = _snapshot()
+    outcome = await service.execute(command)
+
+    assert outcome.status is MutationStatus.KNOWN
+    client.reply_to_discussion.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_in_flight_duplicate_waits_for_the_first_attempt() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def block(*_args):
+        entered.set()
+        await release.wait()
+        return ForgeMutationResult("note-1", "note-1")
+
+    client = _client(add_comment=AsyncMock(side_effect=block))
+    service, *_ = _service(client)
+    command = GeneralComment("in-flight", REF, "body")
+    first = asyncio.create_task(service.execute(command))
+    await entered.wait()
+    second = asyncio.create_task(service.execute(command))
+    await asyncio.sleep(0)
+    assert not second.done()
+
+    release.set()
+
+    assert await first == await second
     client.add_comment.assert_awaited_once()
 
 
@@ -665,7 +741,7 @@ async def test_close_cancels_blocked_dispatch_and_retains_unknown() -> None:
 
     outcome = await owner
     assert outcome.status is MutationStatus.UNKNOWN
-    assert service._ledger[command.operation_id].outcome is outcome
+    assert service._ledger[command.operation_id].receipt is outcome
     assert service._owner_tasks == set()
     client.add_comment.assert_awaited_once()
 
@@ -713,6 +789,6 @@ async def test_repeated_cancellation_settles_review_owner_as_unknown() -> None:
     outcome = await owner
     await close_task
     assert outcome.status is MutationStatus.UNKNOWN
-    assert service._ledger[command.operation_id].outcome is outcome
+    assert service._ledger[command.operation_id].receipt is outcome
     assert service._owner_tasks == set()
     client.add_comment.assert_awaited_once()
