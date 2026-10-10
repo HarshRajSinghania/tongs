@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from unittest.mock import AsyncMock
 
 import httpx
@@ -48,14 +49,28 @@ _TEST_HOST = ForgeHost(
 )
 
 
-def _make_github_client(handler) -> tuple[GitHubClient, httpx.AsyncClient]:
+def _make_github_client(
+    handler, *, clock: Callable[[], float] | None = None
+) -> tuple[GitHubClient, httpx.AsyncClient]:
     """Create a GitHubClient backed by a MockTransport."""
     transport = httpx.MockTransport(handler)
     http = httpx.AsyncClient(
         transport=transport,
         base_url=_TEST_HOST.api_base,
     )
-    return GitHubClient(_TEST_HOST, http), http
+    if clock is None:
+        return GitHubClient(_TEST_HOST, http), http
+    return GitHubClient(_TEST_HOST, http, clock=clock), http
+
+
+class _Clock:
+    """A monotonic clock a test moves by hand."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
 
 
 def _pr_api_json(overrides: dict | None = None) -> dict:
@@ -940,6 +955,9 @@ _MERGE_RULE_CASES = [
     ([_run("cancelled")], [], CIStatus.CANCELED),
     # Nothing at all stays unknown, despite the combined "pending".
     ([], [], CIStatus.UNKNOWN),
+    # A required status that has not reported yet (GraphQL's EXPECTED).
+    ([], [_commit_status("expected")], CIStatus.PENDING),
+    ([_run("success")], [_commit_status("expected")], CIStatus.PENDING),
     # A state GitHub may add later is not read as success.
     ([], [_commit_status("something_new")], CIStatus.UNKNOWN),
 ]
@@ -1836,29 +1854,135 @@ class TestBatchedCI:
         assert paths.count("/graphql") == 1
         assert not any("/def/" in path for path in paths)
 
-    @pytest.mark.parametrize("status_code", [404, 403])
     @pytest.mark.asyncio
-    async def test_a_host_without_graphql_reads_rest_from_then_on(
-        self, status_code: int
-    ) -> None:
+    async def test_a_host_without_graphql_reads_rest_from_then_on(self) -> None:
         paths: list[str] = []
         rest = _ci_sources_handler([_run("success")], [], paths)
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/graphql":
                 paths.append("/graphql")
-                return httpx.Response(status_code, json={"message": "Not available"})
+                return httpx.Response(404, json={"message": "Not Found"})
             return rest(request)
 
-        client, http = _make_github_client(handler)
+        clock = _Clock()
+        client, http = _make_github_client(handler, clock=clock)
         async with http:
             first = await client.get_mr_ci_status("acme/repo", 10, "abc")
+            clock.now += 24 * 3600
             second = await client.get_mr_ci_status("acme/repo", 10, "abc")
 
         assert first is second is CIStatus.SUCCESS
         # GraphQL is tried once; every later read goes straight to REST.
         assert paths.count("/graphql") == 1
         assert paths.count("/repos/acme/repo/commits/abc/check-runs") == 2
+        assert client.batched_ci_lookups == 1
+
+    @pytest.mark.asyncio
+    async def test_one_refusal_reads_that_batch_over_rest_only(self) -> None:
+        paths: list[str] = []
+        rest = _ci_sources_handler([_run("failure")], [], paths)
+        refusals = iter([True])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/graphql":
+                paths.append("/graphql")
+                if next(refusals, False):
+                    return httpx.Response(403, json={"message": "Forbidden"})
+                return answer_ci_batch(
+                    request,
+                    lambda _o, _r, _n: pull_node("abc", [check_run("success")]),
+                )
+            return rest(request)
+
+        client, http = _make_github_client(handler)
+        async with http:
+            first = await client.get_mr_ci_status("acme/repo", 10, "abc")
+            assert client.batched_ci_lookups == 50
+            second = await client.get_mr_ci_status("acme/repo", 10, "abc")
+
+        # The refused batch read REST; the next read used GraphQL again.
+        assert first is CIStatus.FAILED
+        assert second is CIStatus.SUCCESS
+        assert paths.count("/graphql") == 2
+        assert paths.count("/repos/acme/repo/commits/abc/check-runs") == 1
+
+    @pytest.mark.asyncio
+    async def test_repeated_refusals_pause_batching_for_ten_minutes(self) -> None:
+        paths: list[str] = []
+        rest = _ci_sources_handler([_run("success")], [], paths)
+        refuse = [True]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/graphql":
+                paths.append("/graphql")
+                if refuse[0]:
+                    return httpx.Response(403, json={"message": "Forbidden"})
+                return answer_ci_batch(
+                    request,
+                    lambda _o, _r, _n: pull_node("abc", [check_run("failure")]),
+                )
+            return rest(request)
+
+        clock = _Clock()
+        client, http = _make_github_client(handler, clock=clock)
+        async with http:
+            for _ in range(2):
+                status = await client.get_mr_ci_status("acme/repo", 10, "abc")
+                assert status is CIStatus.SUCCESS
+            assert paths.count("/graphql") == 2
+            assert client.batched_ci_lookups == 1
+
+            # Paused: reads go straight to REST without asking GraphQL.
+            clock.now += 599
+            assert await client.get_mr_ci_status("acme/repo", 10, "abc") is (
+                CIStatus.SUCCESS
+            )
+            assert paths.count("/graphql") == 2
+
+            # After ten minutes GraphQL is tried again.
+            clock.now += 1
+            refuse[0] = False
+            assert client.batched_ci_lookups == 50
+            assert await client.get_mr_ci_status("acme/repo", 10, "abc") is (
+                CIStatus.FAILED
+            )
+        assert paths.count("/graphql") == 3
+        assert paths.count("/repos/acme/repo/commits/abc/check-runs") == 3
+
+    @pytest.mark.asyncio
+    async def test_an_answered_batch_resets_the_refusal_count(self) -> None:
+        paths: list[str] = []
+        rest = _ci_sources_handler([_run("failure")], [], paths)
+        answers = iter([403, 200, 403, 200])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/graphql":
+                paths.append("/graphql")
+                if next(answers) == 403:
+                    return httpx.Response(403, json={"message": "Forbidden"})
+                return answer_ci_batch(
+                    request,
+                    lambda _o, _r, _n: pull_node("abc", [check_run("success")]),
+                )
+            return rest(request)
+
+        client, http = _make_github_client(handler, clock=_Clock())
+        async with http:
+            statuses = [
+                await client.get_mr_ci_status("acme/repo", 10, "abc") for _ in range(4)
+            ]
+
+        # Refusals with an answer between them are not repeated ones, so
+        # batching never pauses.
+        assert statuses == [
+            CIStatus.FAILED,
+            CIStatus.SUCCESS,
+            CIStatus.FAILED,
+            CIStatus.SUCCESS,
+        ]
+        assert paths.count("/graphql") == 4
+        assert client.batched_ci_lookups == 50
 
     @pytest.mark.asyncio
     async def test_a_server_error_falls_back_for_that_batch_only(self) -> None:
