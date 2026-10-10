@@ -256,7 +256,14 @@ class MRActionService:
             ) from None
 
     async def execute(self, command: MRActionCommand) -> MRActionReceipt:
-        """Execute once per operation ID and retain every terminal disposition."""
+        """Execute once per operation ID.
+
+        Every outcome once dispatch starts (a result, a known forge rejection
+        or an uncertain outcome) is retained under the operation ID, so a retry
+        returns it instead of running the action twice. A rejection or
+        cancellation before dispatch releases the ID, so the same operation can
+        be tried again.
+        """
         action, target = self._command_parts(command)
         self._validate_operation_id(command.operation_id)
         record, owner = await self._reserve(command)
