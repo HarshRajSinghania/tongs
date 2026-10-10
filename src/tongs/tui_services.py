@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from dataclasses import dataclass, replace
 from uuid import UUID, uuid4
 
@@ -93,6 +94,20 @@ class TUIDiffResult:
 
     files: tuple[DiffFile, ...]
     revision: ReviewRevision
+
+
+@dataclass(frozen=True, slots=True)
+class TUIRepositoryProgress:
+    """One step of an All Open read that reports repositories as they finish.
+
+    The first step has no repository and an empty page, and reports the total
+    before any read completes. Each later step carries one repository's page.
+    """
+
+    repository: RepositoryRef | None
+    page: ReviewPage
+    completed: int
+    total: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -658,13 +673,22 @@ class TUIServiceAdapter:
             ReviewQuery(scope, hostnames=hostnames, fresh=fresh)
         )
 
-    async def _list_all_open(self, *, fresh: bool = False) -> ReviewPage:
-        # Each repository is its own read, so one failing repository never
-        # hides the others on its host. The unscoped session read is not used
-        # because it covers every repository the session ever issued.
+    async def stream_all_open(
+        self, *, fresh: bool = False
+    ) -> AsyncIterator[TUIRepositoryProgress]:
+        """Read every discovered repository and yield each as it finishes.
+
+        Each repository is its own read, so one failing repository never hides
+        the others on its host, and reads overlap up to ``max_parallel``. The
+        unscoped session read is not used because it covers every repository
+        the session ever issued. Closing the iterator early, or cancelling the
+        task that drives it, cancels the reads still in flight.
+        """
         refs = tuple(dict.fromkeys(self._repository_refs.values()))
+        total = len(refs)
+        yield TUIRepositoryProgress(None, ReviewPage(()), 0, total)
         if not refs:
-            return ReviewPage((), ())
+            return
         semaphore = asyncio.Semaphore(self.session.config.max_parallel)
 
         async def fetch_repository(ref: RepositoryRef) -> ReviewPage:
@@ -673,11 +697,36 @@ class TUIServiceAdapter:
                     ReviewQuery(ReviewScope.ALL_OPEN, repository=ref, fresh=fresh)
                 )
 
-        pages = await asyncio.gather(*(fetch_repository(ref) for ref in refs))
-        items = [item for page in pages for item in page.items]
-        failures = [failure for page in pages for failure in page.failures]
+        tasks = {
+            asyncio.create_task(fetch_repository(ref)): (index, ref)
+            for index, ref in enumerate(refs)
+        }
+        pending = set(tasks)
+        completed = 0
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in sorted(done, key=lambda task: tasks[task][0]):
+                    page = task.result()
+                    self._remember_review_refs(page.items)
+                    completed += 1
+                    yield TUIRepositoryProgress(tasks[task][1], page, completed, total)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _list_all_open(self, *, fresh: bool = False) -> ReviewPage:
+        items: list[ReviewListItem] = []
+        failures: list[HostFailure] = []
+        async with aclosing(self.stream_all_open(fresh=fresh)) as steps:
+            async for step in steps:
+                items.extend(step.page.items)
+                failures.extend(step.page.failures)
         items.sort(key=lambda item: item.summary.updated_at, reverse=True)
-        return ReviewPage(tuple(items), self._deduplicate_failures(failures))
+        return ReviewPage(tuple(items), self.deduplicate_failures(failures))
 
     def _remember_review_refs(self, items: tuple[ReviewListItem, ...]) -> None:
         for item in items:
@@ -689,7 +738,8 @@ class TUIServiceAdapter:
             self._review_refs[key] = item.ref
 
     @staticmethod
-    def _deduplicate_failures(failures: list[HostFailure]) -> tuple[HostFailure, ...]:
+    def deduplicate_failures(failures: list[HostFailure]) -> tuple[HostFailure, ...]:
+        """Keep one failure per host, repository and error code."""
         unique: dict[
             tuple[str, RepositoryRef | None, ServiceErrorCode], HostFailure
         ] = {}
@@ -704,5 +754,6 @@ __all__ = [
     "TUIDiscoveryResult",
     "TUIDraftRecovery",
     "TUIDraftTarget",
+    "TUIRepositoryProgress",
     "TUIServiceAdapter",
 ]

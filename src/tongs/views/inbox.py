@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
+from collections.abc import Sequence
+from contextlib import aclosing, suppress
 from typing import ClassVar
 
 from textual import work
@@ -11,11 +12,11 @@ from textual.binding import Binding
 from textual.dom import NoScreen
 from textual.reactive import reactive
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, TabbedContent, TabPane
+from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, TabPane
 
 from tongs.scanner.repo import Repo
 from tongs.services.errors import ServiceError, ServiceErrorCode
-from tongs.services.models import HostFailure, ReviewScope
+from tongs.services.models import HostFailure, ReviewListItem, ReviewScope
 from tongs.widgets.mr_table import MRTable
 
 
@@ -23,6 +24,14 @@ class InboxScreen(Screen):
     """MR inbox dashboard with tabs for My Reviews / My MRs / All Open.
 
     When `repo` is provided, the inbox is scoped to that single repo.
+    """
+
+    DEFAULT_CSS = """
+    InboxScreen #all-open-status {
+        height: 1;
+        background: $accent 15%;
+        padding: 0 1;
+    }
     """
 
     BINDINGS: ClassVar[list] = [
@@ -45,6 +54,10 @@ class InboxScreen(Screen):
         self.scoped_repo = repo
         self._loaded_tabs: set[str] = set()
         self._repository_generation = 0
+        # Each All Open load takes the next number; a load whose number is no
+        # longer current has been replaced or stopped and must not touch the tab.
+        self._all_open_load = 0
+        self._all_open_pending = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -54,6 +67,7 @@ class InboxScreen(Screen):
             with TabPane("My MRs", id="my-mrs"):
                 yield MRTable(id="my-mrs-table")
             with TabPane("All Open", id="all-open"):
+                yield Static("", id="all-open-status")
                 yield MRTable(id="all-open-table")
         yield Footer()
 
@@ -75,6 +89,7 @@ class InboxScreen(Screen):
     def on_repositories_refreshed(self, generation: int) -> None:
         """Reconcile inbox tabs with one successful repository refresh."""
         self._repository_generation = generation
+        self._stop_all_open()
         self._loaded_tabs.clear()
         scoped_repo_removed = False
         if self.scoped_repo is not None:
@@ -115,6 +130,9 @@ class InboxScreen(Screen):
         self, event: TabbedContent.TabActivated
     ) -> None:
         tab_id = event.pane.id
+        if self.query_one(TabbedContent).active != "all-open":
+            # Leaving All Open mid-load stops it; coming back loads it again.
+            self._stop_all_open()
         if tab_id and tab_id not in self._loaded_tabs:
             self._loaded_tabs.add(tab_id)
             self._load_tab(tab_id)
@@ -133,7 +151,9 @@ class InboxScreen(Screen):
         elif tab_id == "my-mrs":
             self.load_my_mrs(fresh=fresh)
         elif tab_id == "all-open":
-            self.load_all_open(fresh=fresh)
+            self._all_open_load += 1
+            self._all_open_pending = True
+            self.load_all_open(fresh=fresh, load=self._all_open_load)
 
     def action_open_in_browser(self) -> None:
         table = self._active_table()
@@ -184,19 +204,99 @@ class InboxScreen(Screen):
                 table.loading = False
 
     @work(exclusive=True, group="all-open")
-    async def load_all_open(self, fresh: bool = False) -> None:
+    async def load_all_open(self, fresh: bool = False, load: int | None = None) -> None:
+        if load is None:
+            self._all_open_load += 1
+            load = self._all_open_load
+            self._all_open_pending = True
+        elif load != self._all_open_load:
+            return
         self.loading_all_open = True
         table = self.query_one("#all-open-table", MRTable)
+        status = self.query_one("#all-open-status", Static)
         table.loading = True
+        status.update("")
         try:
             if not self.scoped_repo and not self.app.repos:
                 table.clear()
                 return
-            await self._load_page(table, ReviewScope.ALL_OPEN, "All Open", fresh=fresh)
+            if self.scoped_repo:
+                await self._load_page(
+                    table, ReviewScope.ALL_OPEN, "All Open", fresh=fresh
+                )
+                if load == self._all_open_load:
+                    status.update(f"[dim]{_open_count(table.row_count)}[/]")
+            else:
+                await self._stream_all_open(table, status, load, fresh=fresh)
         finally:
-            self.loading_all_open = False
-            with suppress(NoScreen):
-                table.loading = False
+            if load == self._all_open_load:
+                self._all_open_pending = False
+                self.loading_all_open = False
+                with suppress(NoScreen):
+                    table.loading = False
+
+    async def _stream_all_open(
+        self, table: MRTable, status: Static, load: int, *, fresh: bool
+    ) -> None:
+        """Show each repository's rows as soon as that repository finishes."""
+        ascii_mode = self.app.config.ascii_mode
+        items: list[ReviewListItem] = []
+        failures: list[HostFailure] = []
+        total = 0
+        try:
+            async with aclosing(
+                self.app.services.stream_all_open(fresh=fresh)
+            ) as steps:
+                async for step in steps:
+                    if load != self._all_open_load:
+                        return
+                    total = step.total
+                    if step.page.items:
+                        # The previous rows stay until the first new ones arrive.
+                        table.merge_mrs(
+                            (item.summary for item in step.page.items),
+                            ascii_mode,
+                            replace=not items,
+                        )
+                        table.loading = False
+                        items.extend(step.page.items)
+                    failures.extend(step.page.failures)
+                    if step.completed < step.total:
+                        status.update(
+                            f"[dim]Loading {step.completed} of {step.total} "
+                            f"{_repositories(step.total)}[/]"
+                        )
+        except ServiceError as error:
+            if load == self._all_open_load:
+                status.update("")
+                self.notify(
+                    f"All Open: {error.message}", severity="warning", markup=False
+                )
+            return
+        if load != self._all_open_load:
+            return
+        if not items and not failures:
+            table.clear()
+        status.update(
+            f"[dim]{_open_count(table.row_count)} across {total} "
+            f"{_repositories(total)}[/]"
+        )
+        self._notify_failures(
+            "All Open", items, self.app.services.deduplicate_failures(failures)
+        )
+
+    def _stop_all_open(self) -> None:
+        """Cancel an All Open load in flight so the tab loads again on return."""
+        if not self._all_open_pending:
+            return
+        self._all_open_load += 1
+        self._all_open_pending = False
+        self.workers.cancel_group(self, "all-open")
+        self._loaded_tabs.discard("all-open")
+        self.loading_all_open = False
+        with suppress(NoScreen):
+            self.query_one("#all-open-table", MRTable).loading = False
+            self.query_one("#all-open-status", Static).update("")
 
     async def _load_page(
         self, table: MRTable, scope: ReviewScope, label: str, *, fresh: bool = False
@@ -213,14 +313,22 @@ class InboxScreen(Screen):
             table.clear()
             for item in page.items:
                 table.add_mr_row(item.summary, self.app.config.ascii_mode)
-        if page.failures:
+        self._notify_failures(label, page.items, page.failures)
+
+    def _notify_failures(
+        self,
+        label: str,
+        items: Sequence[ReviewListItem],
+        failures: Sequence[HostFailure],
+    ) -> None:
+        if failures:
             # A host or repository that still contributed rows returned a
             # partial page rather than being skipped, so it is reported apart.
-            shown = {item.ref.repository for item in page.items}
+            shown = {item.ref.repository for item in items}
             shown_hosts = {repository.hostname for repository in shown}
             partial: list[HostFailure] = []
             skipped: list[HostFailure] = []
-            for failure in page.failures:
+            for failure in failures:
                 contributed = (
                     failure.repository in shown
                     if failure.repository is not None
@@ -253,6 +361,14 @@ class InboxScreen(Screen):
         }
         table_id = tab_map.get(tabbed.active, "#reviews-table")
         return self.query_one(table_id, MRTable)
+
+
+def _open_count(count: int) -> str:
+    return f"{count} open MR{'' if count == 1 else 's'}"
+
+
+def _repositories(count: int) -> str:
+    return "repository" if count == 1 else "repositories"
 
 
 # Codes that describe the whole host rather than one repository, so every

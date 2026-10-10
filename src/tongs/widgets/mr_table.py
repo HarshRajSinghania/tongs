@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import ClassVar
 
 from rich.text import Text
@@ -37,6 +38,10 @@ def sort_mrs(mrs: list[MRSummary], key: str) -> list[MRSummary]:
     return sorted(
         mrs, key=lambda m: m.updated_at or m.created_at or m.updated_at, reverse=True
     )
+
+
+def _row_key(mr: MRSummary) -> str:
+    return f"{mr.forge_host.hostname}:{mr.repo_path}:{mr.number}"
 
 
 class MRTable(DataTable):
@@ -75,7 +80,7 @@ class MRTable(DataTable):
         else:
             title.append("  ")
         title.append(mr.title)
-        row_key = f"{mr.forge_host.hostname}:{mr.repo_path}:{mr.number}"
+        row_key = _row_key(mr)
         self._mr_data[row_key] = mr
         row: list[Text] = [
             Text.from_markup(forge_label(mr.forge_host.forge_type)),
@@ -88,6 +93,47 @@ class MRTable(DataTable):
             row.append(Text(mr.repo_path))
         row.append(Text(relative_time(mr.updated_at)))
         self.add_row(*row, key=row_key)
+
+    def merge_mrs(
+        self,
+        mrs: Iterable[MRSummary],
+        ascii_mode: bool = False,
+        *,
+        replace: bool = False,
+    ) -> None:
+        """Add rows in the active sort order, keeping the cursor on its MR.
+
+        ``replace`` drops the current rows first. The highlighted MR keeps the
+        cursor when it is still listed, wherever the new rows land. Rows that
+        all sort after the current ones are appended without a redraw.
+        """
+        selected = self._selected_row_key()
+        current = [] if replace else [row.key.value for row in self.ordered_rows]
+        merged = {} if replace else dict(self._mr_data)
+        incoming = {_row_key(mr): mr for mr in mrs}
+        replaced = any(key in merged for key in incoming)
+        merged.update(incoming)
+        ordered = sort_mrs(list(merged.values()), self._sort_key)
+        if not replace and not replaced:
+            keys = [_row_key(mr) for mr in ordered]
+            if keys[: len(current)] == current:
+                for mr in ordered[len(current) :]:
+                    self.add_mr_row(mr, ascii_mode)
+                return
+        self.clear()
+        for mr in ordered:
+            self.add_mr_row(mr, ascii_mode)
+        if selected is not None and selected in self._mr_data:
+            self.move_cursor(row=self.get_row_index(selected))
+
+    def _selected_row_key(self) -> str | None:
+        if self.row_count == 0:
+            return None
+        try:
+            row_key, _ = self.coordinate_to_cell_key(self.cursor_coordinate)
+        except CellDoesNotExist:
+            return None
+        return row_key.value
 
     def get_selected_mr(self) -> MRSummary | None:
         if self.cursor_row is None or self.row_count == 0:
