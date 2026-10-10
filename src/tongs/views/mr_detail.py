@@ -158,6 +158,9 @@ def _merge_readiness(mr: MRDetail) -> Content:
     )
 
 
+_SUBMIT_WORKER_GROUP = "review-draft-submit"
+
+
 class MROverview(Static):
     """MR overview panel showing metadata and description."""
 
@@ -756,7 +759,7 @@ class MRDetailScreen(Screen):
             content,
         )
 
-    @work(group="review-draft-submit")
+    @work(group=_SUBMIT_WORKER_GROUP)
     async def _do_submit_review_draft(
         self,
         target: TUIDraftTarget,
@@ -820,7 +823,7 @@ class MRDetailScreen(Screen):
             TUIDraftTarget(draft.review, draft.revision), attempt_id, resolution
         )
 
-    @work(group="review-draft-submit")
+    @work(group=_SUBMIT_WORKER_GROUP)
     async def _do_continue_review_submission(
         self,
         target: TUIDraftTarget,
@@ -845,6 +848,9 @@ class MRDetailScreen(Screen):
             )
             raise
         except Exception as exc:  # noqa: BLE001 - Service errors are safe for the terminal surface.
+            await self._recover_submission_state(
+                target, self._review_draft.id if self._review_draft else None
+            )
             self.notify(
                 f"Review recovery stopped. ({exc})", severity="error", markup=False
             )
@@ -926,7 +932,31 @@ class MRDetailScreen(Screen):
             in ("add_comment", "approve", "unapprove", "merge", "close_mr", "yank_url")
         )
 
+    def _submission_in_flight(self) -> bool:
+        """Is a submission worker of this screen still pending or running?"""
+        return any(
+            worker.node is self
+            and worker.group == _SUBMIT_WORKER_GROUP
+            and not worker.is_finished
+            for worker in self.app.workers
+        )
+
     def action_go_back(self) -> None:
+        # Leaving cancels this screen's workers, and a cancelled submission
+        # records an unknown outcome for a write the forge may still finish.
+        if self._submission_in_flight():
+            self.notify(
+                "Submission in progress. Wait for it to finish before leaving.",
+                severity="warning",
+            )
+            return
+        if self._draft_busy:
+            self.notify(
+                "A review draft change is in progress. Wait for it to finish "
+                "before leaving.",
+                severity="warning",
+            )
+            return
         editor = self.query_one("#comment-editor", CommentEditor)
         if editor.display and editor._defer_close:
             text = editor.query_one("#comment-input", TextArea).text.strip()

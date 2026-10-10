@@ -5,12 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import UUID
 
-from rich.markup import escape
+from textual.content import Content
 from textual.widgets import Static
 
 from tongs.diff.models import DiffFile, DiffLine
 from tongs.services.models import ReviewRevision
-from tongs.services.review_submission import SubmissionProgress
+from tongs.services.review_submission import SubmissionOutcome, SubmissionProgress
 from tongs.state.drafts import (
     DiffSide,
     DraftSnapshot,
@@ -126,7 +126,11 @@ def inline_markers(draft: DraftSnapshot | None) -> tuple[DraftMarker, ...]:
 
 
 class ReviewDraftBar(Static):
-    """Persistent review-mode status, count, staleness, and progress indicator."""
+    """Persistent review-mode status, count, staleness, and progress indicator.
+
+    A paused submission also shows why it paused. Every variable part is passed
+    to ``Content.from_markup`` as a template variable, so it renders literally.
+    """
 
     DEFAULT_CSS = """
     ReviewDraftBar {
@@ -162,11 +166,25 @@ class ReviewDraftBar(Static):
             flags.append("version conflict")
         if busy:
             flags.append("saving")
-        suffix = f" | [yellow]{escape(', '.join(flags))}[/]" if flags else ""
+        failure = (
+            progress.failure
+            if progress is not None and progress.outcome is SubmissionOutcome.PAUSED
+            else None
+        )
+        flag_markup = " | [yellow]$flags[/]" if flags else ""
+        reason_markup = " | [yellow]reason: $reason[/]" if failure is not None else ""
         self.update(
-            f"[bold yellow]REVIEW DRAFT[/] | {count} comment"
-            f"{'s' if count != 1 else ''} | v{draft.version} | {escape(state)}"
-            f"{suffix} | [bold]Ctrl+G[/] review"
+            Content.from_markup(
+                "[bold yellow]REVIEW DRAFT[/] | $count comment$plural | v$version"
+                f" | $state{flag_markup} | [bold]Ctrl+G[/] review{reason_markup}",
+                count=count,
+                plural="s" if count != 1 else "",
+                version=draft.version,
+                state=state,
+                flags=", ".join(flags),
+                # The bar is one row, so a multi-line reason is folded into it.
+                reason=" ".join(failure.message.split()) if failure is not None else "",
+            )
         )
 
 

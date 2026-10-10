@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from uuid import UUID, uuid4
 
 from tongs.diff.conversion import convert_forge_changes
@@ -62,7 +62,11 @@ from tongs.services.review_mutations import (
 from tongs.services.review_mutations import (
     DiffSide as MutationDiffSide,
 )
-from tongs.services.review_submission import SubmissionProgress
+from tongs.services.review_submission import (
+    SubmissionFailure,
+    SubmissionOutcome,
+    SubmissionProgress,
+)
 from tongs.services.session import ApplicationSession
 from tongs.state.drafts import (
     DraftContent,
@@ -70,6 +74,8 @@ from tongs.state.drafts import (
     DraftSnapshot,
     ReconciliationResolution,
 )
+
+_SETTLED_OUTCOMES = frozenset({SubmissionOutcome.SUBMITTED, SubmissionOutcome.EDITABLE})
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +128,7 @@ class TUIServiceAdapter:
         self._review_snapshots: dict[ReviewRef, ReviewSnapshot] = {}
         self._review_revisions: dict[ReviewRef, ReviewRevision] = {}
         self._known_draft_attempts: dict[tuple[ReviewRef, UUID], UUID] = {}
+        self._submission_failures: dict[UUID, SubmissionFailure] = {}
 
     @property
     def discovery_generation(self) -> int:
@@ -295,15 +302,15 @@ class TUIServiceAdapter:
         progress = await self.session.review_submissions.start(
             draft_id, expected_version
         )
-        self._remember_draft_attempt(target, progress)
-        return progress
+        return self._remember_draft_attempt(target, progress)
 
     async def get_draft_submission(
         self, target: TUIDraftTarget, attempt_id: UUID
     ) -> SubmissionProgress:
         """Read progress after validating its frozen review and revision."""
         await self._require_attempt_target(target, attempt_id)
-        return await self.session.review_submissions.get(attempt_id)
+        progress = await self.session.review_submissions.get(attempt_id)
+        return self._with_last_failure(progress)
 
     async def list_draft_recoveries(
         self, target: TUIDraftTarget
@@ -333,7 +340,7 @@ class TUIServiceAdapter:
             actual_target = TUIDraftTarget(
                 attempt.snapshot.review, attempt.snapshot.revision
             )
-            self._remember_draft_attempt(actual_target, progress)
+            progress = self._remember_draft_attempt(actual_target, progress)
             recoveries.append(TUIDraftRecovery(actual_target, progress))
         return tuple(recoveries)
 
@@ -343,8 +350,7 @@ class TUIServiceAdapter:
         """Resume only the remaining work in a known durable attempt."""
         await self._require_attempt_target(target, attempt_id)
         progress = await self.session.review_submissions.resume(attempt_id)
-        self._remember_draft_attempt(target, progress)
-        return progress
+        return self._remember_draft_attempt(target, progress)
 
     async def reconcile_draft_submission(
         self,
@@ -362,8 +368,18 @@ class TUIServiceAdapter:
         progress = await self.session.review_submissions.reconcile(
             attempt_id, resolution
         )
-        self._remember_draft_attempt(target, progress)
-        return progress
+        return self._remember_draft_attempt(target, progress)
+
+    def last_submission_failure(self, attempt_id: UUID) -> SubmissionFailure | None:
+        """Return the last failure that paused an attempt in this app, if any.
+
+        Durable attempt reads do not carry the failure, so the adapter keeps it
+        in memory for the life of the app. A reopened review screen therefore
+        still explains why its submission paused. The record is forgotten once
+        the attempt is submitted, returns to editing or reaches an unknown
+        outcome.
+        """
+        return self._submission_failures.get(attempt_id)
 
     async def post_general_comment(
         self, summary: MRSummary, body: str, *, operation_id: str
@@ -565,17 +581,40 @@ class TUIServiceAdapter:
 
     def _remember_draft_attempt(
         self, target: TUIDraftTarget, progress: SubmissionProgress
-    ) -> None:
+    ) -> SubmissionProgress:
         key = (target.review, progress.draft_id)
-        if progress.outcome.value in {"submitted", "editable"}:
+        if progress.outcome in _SETTLED_OUTCOMES:
             self._known_draft_attempts.pop(key, None)
-        else:
-            self._known_draft_attempts[key] = progress.attempt_id
+            self._submission_failures.pop(progress.attempt_id, None)
+            return progress
+        self._known_draft_attempts[key] = progress.attempt_id
+        if progress.outcome is not SubmissionOutcome.PAUSED:
+            # Only a failure that paused the attempt explains a later paused
+            # read. An unknown outcome's failure (for example a mutation that
+            # stopped without a confirmed result) would otherwise be shown
+            # for a resumable pause and hide the resume action.
+            self._submission_failures.pop(progress.attempt_id, None)
+            return progress
+        if progress.failure is not None:
+            self._submission_failures[progress.attempt_id] = progress.failure
+            return progress
+        return self._with_last_failure(progress)
+
+    def _with_last_failure(self, progress: SubmissionProgress) -> SubmissionProgress:
+        """Attach the remembered pause reason to a durable read that lacks one."""
+        if (
+            progress.outcome is not SubmissionOutcome.PAUSED
+            or progress.failure is not None
+        ):
+            return progress
+        failure = self._submission_failures.get(progress.attempt_id)
+        return progress if failure is None else replace(progress, failure=failure)
 
     def _forget_draft_attempt(self, attempt_id: UUID) -> None:
         for key, known in tuple(self._known_draft_attempts.items()):
             if known == attempt_id:
                 del self._known_draft_attempts[key]
+        self._submission_failures.pop(attempt_id, None)
 
     async def _revision(self, summary: MRSummary) -> ReviewRevision:
         ref = self.review_ref(summary)
