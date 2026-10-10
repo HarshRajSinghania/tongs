@@ -19,6 +19,7 @@ from tongs.app import TongsApp
 from tongs.cache.store import CacheStore
 from tongs.config import Config
 from tongs.diff.position import position_from_diff_line
+from tongs.errors import NetworkError, PartialResultsError
 from tongs.forges.base import ForgeClient
 from tongs.forges.models import (
     CIStatus,
@@ -48,7 +49,11 @@ from tongs.widgets.comment_editor import (
     CommentEditor,
     GeneralCommentSubmitted,
 )
-from tongs.widgets.diff_panel import CommentRequested, DiffPanel
+from tongs.widgets.diff_panel import (
+    CHANGES_OVERFLOW_BANNER,
+    CommentRequested,
+    DiffPanel,
+)
 from tongs.widgets.pipeline_panel import PipelinePanel, RetryJobRequested
 from tongs.widgets.split_diff import DiffViewMode, SplitDiffColumn, SplitDiffView
 
@@ -835,3 +840,125 @@ async def test_ctrl_y_uses_osc52_and_falls_back_gracefully(
             notifications = list(app._notifications)
             assert any("OSC 52" in n.message for n in notifications)
             assert any(forge.summary.web_url in n.message for n in notifications)
+
+
+async def _open_diff_tab(app: TongsApp, pilot: object) -> MRDetailScreen:
+    await _settle(app)
+    app.screen.query_one("#reviews-table").focus()
+    await pilot.press("enter")  # type: ignore[attr-defined]
+    await _settle(app)
+    screen = cast(MRDetailScreen, app.screen)
+    assert isinstance(screen, MRDetailScreen)
+    await pilot.press("2")  # type: ignore[attr-defined]
+    await _settle(app)
+    return screen
+
+
+@pytest.mark.asyncio
+async def test_truncated_gitlab_file_list_shows_a_persistent_banner(
+    tmp_path: Path,
+) -> None:
+    app, forge = _app(tmp_path)
+    # What the GitLab parser makes of a "1000+" changes_count.
+    forge.detail = replace(forge.detail, changes_count=1000, changes_overflow=True)
+    opened: list[str] = []
+
+    async with app.run_test(notifications=True) as pilot:
+        with patch.object(app, "open_url", side_effect=opened.append):
+            screen = await _open_diff_tab(app, pilot)
+            panel = screen.query_one("#diff-panel", DiffPanel)
+            banner = panel.query_one("#diff-overflow-banner", Static)
+
+            assert panel.changes_overflow_shown is True
+            assert str(banner.render()) == CHANGES_OVERFLOW_BANNER
+            assert CHANGES_OVERFLOW_BANNER.isascii()
+            assert "only part of the changed files" in CHANGES_OVERFLOW_BANNER
+            assert "Press o to open" in CHANGES_OVERFLOW_BANNER
+
+            # The banner stays while the reader moves between files.
+            panel.action_next_file()
+            await pilot.pause()
+            assert panel.changes_overflow_shown is True
+
+            await pilot.press("o")
+            await _settle(app)
+
+    assert opened == [forge.detail.web_url]
+
+
+@pytest.mark.asyncio
+async def test_complete_file_list_shows_no_truncation_banner(tmp_path: Path) -> None:
+    app, forge = _app(tmp_path)
+    assert forge.detail.changes_overflow is False
+
+    async with app.run_test(notifications=True) as pilot:
+        screen = await _open_diff_tab(app, pilot)
+        panel = screen.query_one("#diff-panel", DiffPanel)
+
+        assert panel.changes_overflow_shown is False
+        assert len(panel._files) == 1
+
+
+@pytest.mark.asyncio
+async def test_discussion_counts_leave_out_threads_that_cannot_be_resolved(
+    tmp_path: Path,
+) -> None:
+    app, forge = _app(tmp_path)
+    root = forge.discussion.root_comment
+    resolved = replace(
+        forge.discussion,
+        id="discussion-2",
+        root_comment=replace(root, id="comment-2", is_resolved=True),
+        is_resolved=True,
+    )
+    # A GitLab individual note is a thread with no resolution state.
+    note = replace(
+        forge.discussion,
+        id="discussion-3",
+        is_inline=False,
+        root_comment=replace(root, id="comment-3", file_path=None, new_line=None),
+        resolvable=False,
+    )
+
+    async def discussions(repo_path: str, number: int) -> list[Discussion]:
+        forge.calls.append(("get_discussions", repo_path, number))
+        return [forge.discussion, resolved, note]
+
+    forge.get_mr_discussions = discussions  # type: ignore[method-assign]
+
+    async with app.run_test(notifications=True) as pilot:
+        await _settle(app)
+        app.screen.query_one("#reviews-table").focus()
+        await pilot.press("enter")
+        await _settle(app)
+        screen = cast(MRDetailScreen, app.screen)
+        await pilot.press("4")
+        await _settle(app)
+
+        status = screen.query_one("#disc-status-bar", Static)
+        assert str(status.render()) == "1 unresolved  1 resolved"
+
+
+@pytest.mark.asyncio
+async def test_partial_search_reports_an_incomplete_list_not_a_skip(
+    tmp_path: Path,
+) -> None:
+    app, forge = _app(tmp_path)
+
+    async def partial_reviews() -> list[MRSummary]:
+        raise PartialResultsError([forge.summary], NetworkError("search capped"))
+
+    forge.list_my_reviews = partial_reviews  # type: ignore[method-assign]
+
+    async with app.run_test(notifications=True):
+        await _settle(app)
+        table = app.screen.query_one("#reviews-table")
+        messages = [notification.message for notification in app._notifications]
+
+        assert table.row_count == 1  # type: ignore[attr-defined]
+        assert [message for message in messages if "skipped" in message] == []
+        expected = (
+            "Reviews: github.com: Some reviews could not be listed. "
+            "The forge could not be reached."
+        )
+        assert [m for m in messages if m.startswith("Reviews: ")] == [expected]

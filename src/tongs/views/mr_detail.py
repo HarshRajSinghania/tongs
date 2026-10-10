@@ -87,6 +87,7 @@ from tongs.widgets.discussion_list import (
     DiscussionPanel,
     DiscussionReplyRequested,
     JumpToDiffDiscussion,
+    is_unresolved,
 )
 from tongs.widgets.pipeline_panel import (
     CancelJobRequested,
@@ -290,6 +291,11 @@ class MRDetailScreen(Screen):
             overview.set_mr(self.mr_detail)
             description_widget = self.query_one("#mr-description", Markdown)
             description_widget.update(self.mr_detail.description or "")
+            # The detail and the diff load independently, so whichever lands
+            # second leaves the truncated file list banner in its final state.
+            self.query_one("#diff-panel", DiffPanel).set_changes_overflow(
+                self._changes_overflow()
+            )
             if snapshot.revision is not None:
                 self._load_review_drafts(snapshot.revision)
         except Exception as exc:  # noqa: BLE001 - Report background/action failures without terminating the TUI.
@@ -1008,6 +1014,10 @@ class MRDetailScreen(Screen):
             self._pipeline_loaded = True
             self._load_pipelines()
 
+    def _changes_overflow(self) -> bool:
+        """Whether the forge said its changed file list is truncated."""
+        return self.mr_detail is not None and self.mr_detail.changes_overflow
+
     @work(exclusive=True, group="mr-diff")
     async def _load_diff(self) -> None:
         panel = self.query_one("#diff-panel", DiffPanel)
@@ -1021,7 +1031,11 @@ class MRDetailScreen(Screen):
             if not diff.files:
                 panel.show_placeholder("No changes in this MR")
                 return
-            panel.set_files(self._cached_diff_files, list(discussions))
+            panel.set_files(
+                self._cached_diff_files,
+                list(discussions),
+                changes_overflow=self._changes_overflow(),
+            )
         except Exception as exc:  # noqa: BLE001 - Report background/action failures without terminating the TUI.
             self._displayed_diff_revision = None
             panel.show_placeholder(f"Could not load diff. Try Ctrl+R. ({exc})")
@@ -1096,7 +1110,7 @@ class MRDetailScreen(Screen):
 
             panel = self.query_one("#disc-panel", DiscussionPanel)
             panel.set_discussions(list(discussions), self._cached_diff_files)
-            unresolved = sum(1 for d in discussions if not d.is_resolved)
+            unresolved = sum(1 for d in discussions if is_unresolved(d))
             resolved = sum(1 for d in discussions if d.is_resolved)
             status.update(
                 f"[yellow]{unresolved} unresolved[/]  [dim]{resolved} resolved[/]"

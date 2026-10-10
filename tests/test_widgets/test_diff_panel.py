@@ -6,14 +6,18 @@ from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
+from textual.app import App, ComposeResult
+from textual.widgets import Static
 
 from tongs.diff.models import DiffFile, DiffHunk, DiffLine, FileStatus, LineType
 from tongs.forges.models import Discussion, InlineComment, User
 from tongs.widgets.diff_panel import (
+    CHANGES_OVERFLOW_BANNER,
     CommentMode,
     CommentRequested,
     DiffFileTree,
     DiffOptionList,
+    DiffPanel,
     DiffRenderer,
     ReplyRequested,
     _build_comment_lines,
@@ -888,3 +892,68 @@ class TestBuildHighlightMap:
         with patch("tongs.widgets.diff_panel.Syntax", side_effect=Exception("boom")):
             result = _build_highlight_map(f)
         assert result == {}
+
+
+# ===================================================================
+# DiffPanel truncated file list banner
+# ===================================================================
+
+
+class _DiffPanelApp(App[None]):
+    def compose(self) -> ComposeResult:
+        yield DiffPanel(id="diff-panel")
+
+
+def _banner_text(panel: DiffPanel) -> str:
+    return str(panel.query_one("#diff-overflow-banner", Static).render())
+
+
+class TestChangesOverflowBanner:
+    @pytest.mark.asyncio
+    async def test_overflowed_files_show_the_literal_banner(self):
+        app = _DiffPanelApp()
+        async with app.run_test() as pilot:
+            panel = app.query_one(DiffPanel)
+            panel.set_files([_make_file(new_path="a.py")], changes_overflow=True)
+            await pilot.pause()
+
+            assert panel.changes_overflow_shown is True
+            assert _banner_text(panel) == CHANGES_OVERFLOW_BANNER
+            assert CHANGES_OVERFLOW_BANNER.isascii()
+
+    @pytest.mark.asyncio
+    async def test_complete_files_show_no_banner(self):
+        app = _DiffPanelApp()
+        async with app.run_test() as pilot:
+            panel = app.query_one(DiffPanel)
+            panel.set_files([_make_file(new_path="a.py")])
+            await pilot.pause()
+
+            assert panel.changes_overflow_shown is False
+
+    @pytest.mark.asyncio
+    async def test_flag_arriving_after_the_files_still_shows_the_banner(self):
+        app = _DiffPanelApp()
+        async with app.run_test() as pilot:
+            panel = app.query_one(DiffPanel)
+            # The detail that carries the flag can land before or after the diff.
+            panel.set_changes_overflow(True)
+            await pilot.pause()
+            assert panel.changes_overflow_shown is False
+
+            panel.set_files(
+                [_make_file(new_path="a.py"), _make_file(new_path="b.py")],
+                changes_overflow=True,
+            )
+            panel.action_next_file()
+            await pilot.pause()
+            assert panel.changes_overflow_shown is True
+
+            panel.show_placeholder("Loading diff...")
+            await pilot.pause()
+            assert panel.changes_overflow_shown is False
+
+            panel.set_files([_make_file(new_path="a.py")])
+            panel.set_changes_overflow(True)
+            await pilot.pause()
+            assert panel.changes_overflow_shown is True

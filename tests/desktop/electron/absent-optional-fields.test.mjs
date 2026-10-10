@@ -198,3 +198,86 @@ test("an untyped failure becomes a non-retryable invalid response", () => {
   );
   assert.equal(decodeReadFailure(new Error(`tongs-read-failure:${forged}`)), null);
 });
+
+function reviewSnapshot(detailOverrides = {}) {
+  return {
+    handle: "review-handle",
+    repository: "repository-handle",
+    detail: {
+      number: 42,
+      title: "Vendor a large dependency",
+      author: { username: "alice", display_name: "Alice Dev" },
+      state: "open",
+      is_draft: false,
+      source_branch: "feature/vendor",
+      target_branch: "main",
+      ci_status: "success",
+      created_at: "2026-06-01T09:00:00+00:00",
+      updated_at: "2026-06-02T14:30:00+00:00",
+      web_url: "https://gitlab.example.com/acme/widgets/-/merge_requests/42",
+      comment_count: 0,
+      has_conflicts: false,
+      labels: [],
+      review_decision: null,
+      additions: null,
+      deletions: null,
+      description: "",
+      merge_status: "can_be_merged",
+      approvals: [],
+      reviewers: [],
+      assignees: [],
+      changes_count: 1000,
+      detailed_merge_status: "mergeable",
+      draft_notes_count: null,
+      status_check_rollup: null,
+      ...detailOverrides,
+    },
+    capabilities: {
+      batched_review: true,
+      thread_resolution: true,
+      draft_notes: true,
+      unapprove: true,
+      job_cancel: true,
+    },
+    revision: { head_sha: "ccc333", base_sha: "aaa111", start_sha: "bbb222" },
+    revision_error: null,
+  };
+}
+
+test("a review detail reads with or without the truncated file list flag", () => {
+  // The current core states the flag either way.
+  assertResult("reviews.get", reviewSnapshot({ changes_overflow: true }));
+  assertResult("reviews.get", reviewSnapshot({ changes_overflow: false }));
+  // A core that predates the flag omits it, and the detail still reads.
+  const older = reviewSnapshot();
+  assert.equal(Object.hasOwn(older.detail, "changes_overflow"), false);
+  assertResult("reviews.get", older);
+  assert.equal(older.detail.changes_overflow === true, false);
+});
+
+test("a review detail rejects a non-boolean flag and any unknown key", () => {
+  assert.throws(
+    () => assertResult("reviews.get", reviewSnapshot({ changes_overflow: "yes" })),
+    (error) => {
+      assert.match(error.message, /Invalid reviews\.get result/);
+      assert.match(error.message, /"changes_overflow" must be a boolean/);
+      return true;
+    },
+  );
+  assert.throws(
+    () => assertResult("reviews.get", reviewSnapshot({ changes_overflow: null })),
+    /"changes_overflow" must be a boolean/,
+  );
+  assert.throws(
+    () => assertResult("reviews.get", reviewSnapshot({ files_overflow: true })),
+    /Invalid reviews\.get result/,
+  );
+  assert.throws(
+    () =>
+      assertResult(
+        "reviews.get",
+        reviewSnapshot({ changes_overflow: true, files_overflow: true }),
+      ),
+    /Invalid reviews\.get result/,
+  );
+});

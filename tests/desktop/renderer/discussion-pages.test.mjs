@@ -69,6 +69,61 @@ test("the diff counts every thread of a review read over several pages", async (
   );
 });
 
+test("threads the forge cannot resolve are not counted as unresolved", async () => {
+  const review = "not-resolvable";
+  const threads = [
+    thread("d-open", { line: 1000 }),
+    thread("d-done", { line: 1001, resolved: true }),
+    // A GitLab individual note: a thread with no resolution state.
+    { ...thread("d-note", { line: 1002 }), resolvable: false },
+  ];
+  const pages = pagedDiscussions(review, threads, PAGE_SIZE);
+  const view = renderDiff(
+    diffBridge(review, {
+      listDiscussions: pages.list,
+      pageDiscussions: pages.page,
+    }),
+    review,
+  );
+
+  await waitFor(() => assert.equal(fileThreadText(view), "3 threads, 1 unresolved"));
+});
+
+test("an old-side thread on a renamed file renders on its row and in the count", async () => {
+  const review = "renamed";
+  // Both forges store the new path, even for a comment on a deleted line.
+  const threads = [
+    oldSideThread("d-left", { path: "src/calc.py", line: 11 }),
+    oldSideThread("d-old-path", { path: "src/old_calc.py", line: 12 }),
+  ];
+  const pages = pagedDiscussions(review, threads, PAGE_SIZE);
+  const view = renderDiff(
+    diffBridge(review, {
+      openDiff: () => read(renamedDiffPage(review)),
+      listDiscussions: pages.list,
+      pageDiscussions: pages.page,
+    }),
+    review,
+  );
+
+  await waitFor(() => assert.equal(fileThreadText(view), "2 threads, 2 unresolved"));
+  await waitFor(() =>
+    assert.deepEqual(threadLabels(view), [
+      "Discussion thread on old line 11",
+      "Discussion thread on old line 12",
+    ]),
+  );
+  assert.deepEqual(
+    [...view.container.querySelectorAll(".diff-thread-summary")].map(
+      (node) => node.textContent,
+    ),
+    [
+      "0 replies, unresolved, last by @reviewer",
+      "0 replies, unresolved, last by @reviewer",
+    ],
+  );
+});
+
 test("a single-page answer still reads as the whole list", async () => {
   const review = "one-page";
   const threads = [thread("d-1", { line: 1000 }), thread("d-2", { line: 1001 })];
@@ -478,6 +533,67 @@ function diffPage(review) {
         new_line: 10,
         content: "def divide(a, b):",
         line_type: "context",
+      },
+      {
+        kind: "line",
+        file_index: 0,
+        hunk_index: 0,
+        old_line: null,
+        new_line: 11,
+        content: "    if b == 0:",
+        line_type: "addition",
+      },
+    ],
+  };
+}
+
+function threadLabels(view) {
+  return [...view.container.querySelectorAll(".diff-thread")].map((node) =>
+    node.getAttribute("aria-label"),
+  );
+}
+
+function oldSideThread(id, { path, line }) {
+  const base = thread(id);
+  return {
+    ...base,
+    root_comment: { ...base.root_comment, file_path: path, old_line: line, new_line: null },
+  };
+}
+
+function renamedDiffPage(review) {
+  const page = diffPage(review);
+  const [file, hunk, context] = page.entries;
+  return {
+    ...page,
+    entries: [
+      {
+        ...file,
+        old_path: "src/old_calc.py",
+        new_path: "src/calc.py",
+        status: "renamed",
+        additions: 1,
+        deletions: 2,
+      },
+      { ...hunk, header: "@@ -10,3 +10,2 @@", old_count: 3 },
+      context,
+      {
+        kind: "line",
+        file_index: 0,
+        hunk_index: 0,
+        old_line: 11,
+        new_line: null,
+        content: "    return a / b",
+        line_type: "deletion",
+      },
+      {
+        kind: "line",
+        file_index: 0,
+        hunk_index: 0,
+        old_line: 12,
+        new_line: null,
+        content: "    # unchecked",
+        line_type: "deletion",
       },
       {
         kind: "line",

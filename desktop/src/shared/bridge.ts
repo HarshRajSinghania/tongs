@@ -51,6 +51,8 @@ export interface ReviewDetailDto extends ReviewSummaryDto {
   readonly assignees: readonly UserDto[]; readonly changes_count: number;
   readonly detailed_merge_status: string | null; readonly draft_notes_count: number | null;
   readonly status_check_rollup: string | null;
+  /** True when the forge capped the changed file list; absent means false. */
+  readonly changes_overflow?: boolean;
 }
 export interface ReviewListItemDto { readonly handle: OpaqueHandle; readonly repository: OpaqueHandle; readonly summary: ReviewSummaryDto; }
 export interface ReviewFailureDto extends ServiceErrorDto { readonly repository: OpaqueHandle | null; }

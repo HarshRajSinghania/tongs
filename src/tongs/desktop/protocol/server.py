@@ -1730,6 +1730,9 @@ def _detail_wire(snapshot: ReviewSnapshot) -> JsonObject:
             "detailed_merge_status": detail.detailed_merge_status,
             "draft_notes_count": detail.draft_notes_count,
             "status_check_rollup": detail.status_check_rollup,
+            # True when the forge capped the changed file list, so the diff
+            # shows only part of the review. The shell reads absence as false.
+            "changes_overflow": detail.changes_overflow,
         }
     )
     return result

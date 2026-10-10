@@ -22,6 +22,16 @@ from tongs.forges.models import Discussion
 from tongs.helpers import relative_time
 
 
+def is_unresolved(discussion: Discussion) -> bool:
+    """Whether a thread is still open: one that can be resolved and is not.
+
+    A thread the forge cannot resolve, such as a GitLab individual note, has
+    no open state, so the counts, the unresolved filter and next-unresolved
+    navigation all leave it out.
+    """
+    return discussion.resolvable and not discussion.is_resolved
+
+
 class JumpToDiffDiscussion(Message):
     """Switch to Diff tab and navigate to a discussion's file:line."""
 
@@ -240,7 +250,7 @@ class DiscussionPanel(Widget):
 
     def _apply_filter(self, discussions: list[Discussion]) -> list[Discussion]:
         if self._filter == "unresolved":
-            return [d for d in discussions if not d.is_resolved]
+            return [d for d in discussions if is_unresolved(d)]
         if self._filter == "resolved":
             return [d for d in discussions if d.is_resolved]
         return list(discussions)
@@ -297,7 +307,7 @@ class DiscussionPanel(Widget):
         start = self._focused_index + 1
         for i in range(len(sorted_discs)):
             idx = (start + i) % len(sorted_discs)
-            if not sorted_discs[idx].is_resolved:
+            if is_unresolved(sorted_discs[idx]):
                 self._focused_index = idx
                 return
         self.app.notify("No unresolved discussions")
@@ -310,7 +320,7 @@ class DiscussionPanel(Widget):
         start = self._focused_index - 1
         for i in range(len(sorted_discs)):
             idx = (start - i) % len(sorted_discs)
-            if not sorted_discs[idx].is_resolved:
+            if is_unresolved(sorted_discs[idx]):
                 self._focused_index = idx
                 return
         self.app.notify("No unresolved discussions")

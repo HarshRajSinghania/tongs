@@ -191,8 +191,13 @@ function assertReviewSummary(value: unknown): void {
   integer(value.comment_count); bool(value.has_conflicts); assertArray(value.labels, text, 256); nullableText(value.review_decision); numberOrNull(value.additions); numberOrNull(value.deletions);
 }
 function assertReviewDetail(value: unknown): void {
+  if (!isRecord(value)) throw new Error("Invalid desktop result shape");
   const extra = ["description", "merge_status", "approvals", "reviewers", "assignees", "changes_count", "detailed_merge_status", "draft_notes_count", "status_check_rollup"] as const;
-  assertKeys(value, [...SUMMARY_KEYS, ...extra]);
+  // `changes_overflow` is additive: a core that predates it omits the key,
+  // which the shell reads as a complete file list.
+  const overflow = Object.hasOwn(value, "changes_overflow");
+  assertKeys(value, overflow ? [...SUMMARY_KEYS, ...extra, "changes_overflow"] : [...SUMMARY_KEYS, ...extra]);
+  if (overflow) bool(value.changes_overflow, "changes_overflow");
   const summary = Object.fromEntries(SUMMARY_KEYS.map((key) => [key, value[key]])); assertReviewSummary(summary);
   if (typeof value.description !== "string" || value.description.length > MAX_IPC_BYTES) throw new Error("Invalid review description");
   text(value.merge_status); for (const key of ["approvals", "reviewers", "assignees"] as const) assertArray(value[key], assertUser, 1000);

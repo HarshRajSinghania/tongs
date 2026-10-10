@@ -1337,12 +1337,27 @@ def _render_draft_marker(marker: DraftMarker) -> Text:
     return text
 
 
+# Shown literally above the diff while the forge's changed file list is
+# truncated. It stays ASCII so it reads the same in ASCII mode.
+CHANGES_OVERFLOW_BANNER = (
+    "The forge returned only part of the changed files, so this list is "
+    "incomplete. Press o to open the review in the browser."
+)
+
+
 class DiffPanel(Widget):
     """Split-pane diff viewer with file tree and content."""
 
     DEFAULT_CSS = """
     DiffPanel {
         height: 1fr;
+    }
+
+    DiffPanel #diff-overflow-banner {
+        height: auto;
+        padding: 0 1;
+        color: $warning;
+        display: none;
     }
 
     DiffPanel DiffFileTree {
@@ -1378,8 +1393,10 @@ class DiffPanel(Widget):
         self._current_index: int = 0
         self._discussions_by_file: dict[str, list[Discussion]] = {}
         self._draft_markers: tuple[DraftMarker, ...] = ()
+        self._changes_overflow = False
 
     def compose(self) -> ComposeResult:
+        yield Static(CHANGES_OVERFLOW_BANNER, id="diff-overflow-banner", markup=False)
         with Horizontal():
             yield DiffFileTree("Files", id="diff-file-tree")
             with Vertical(id="diff-right-pane"):
@@ -1404,11 +1421,14 @@ class DiffPanel(Widget):
         self,
         files: list[DiffFile],
         discussions: list[Discussion] | None = None,
+        *,
+        changes_overflow: bool = False,
     ) -> None:
         if not files:
             self.show_placeholder("No changes")
             return
         self._files = files
+        self.set_changes_overflow(changes_overflow)
         self._discussions_by_file = {}
         for d in discussions or []:
             if d.is_inline and d.root_comment.file_path:
@@ -1432,11 +1452,30 @@ class DiffPanel(Widget):
         self._draft_markers = markers
         self.query_one("#diff-content", DiffContent).set_draft_markers(markers)
 
+    @property
+    def changes_overflow_shown(self) -> bool:
+        """Whether the truncated file list banner is on screen."""
+        return bool(self.query_one("#diff-overflow-banner", Static).display)
+
+    def set_changes_overflow(self, overflow: bool) -> None:
+        """Record whether the forge truncated the changed file list.
+
+        The banner stays up for as long as files are shown and the review says
+        the list is partial, whichever of the two arrives first.
+        """
+        self._changes_overflow = overflow
+        self._sync_overflow_banner()
+
+    def _sync_overflow_banner(self) -> None:
+        banner = self.query_one("#diff-overflow-banner", Static)
+        banner.display = self._changes_overflow and bool(self._files)
+
     def show_placeholder(self, message: str) -> None:
         """Replace all source-backed panel state with an authoritative message."""
         self._files = []
         self._current_index = 0
         self._discussions_by_file = {}
+        self._sync_overflow_banner()
         self.query_one("#diff-file-tree", DiffFileTree).set_files([])
         self.query_one("#diff-file-header", Static).update("")
         self.query_one("#diff-content", DiffContent).show_placeholder(message)
