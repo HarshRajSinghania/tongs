@@ -289,3 +289,41 @@ async def test_editor_command_control_characters_are_not_ready(command: str) -> 
         Calls(), config=Config(editor_command=command)
     ).prepare_editor_log(JOB)
     assert result.status is EditorPlanStatus.MALFORMED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "argv"),
+    [
+        ("code", ("code", "--wait")),
+        ("code --reuse-window", ("code", "--wait", "--reuse-window")),
+        ("code -w", ("code", "-w")),
+        ("/usr/bin/codium", ("/usr/bin/codium", "--wait")),
+        ("subl", ("subl", "--wait")),
+        ("gvim", ("gvim", "-f")),
+        ("gvim --nofork", ("gvim", "--nofork")),
+        ("kate", ("kate", "--block")),
+        ("kate -b", ("kate", "-b")),
+        ("gedit", ("gedit", "--wait")),
+        ("my-editor", ("my-editor",)),
+    ],
+)
+async def test_handoff_launchers_get_their_wait_flag_once(
+    command: str, argv: tuple[str, ...]
+) -> None:
+    result = await _service(
+        Calls(), config=Config(editor_command=command)
+    ).prepare_editor_log(JOB)
+
+    assert result.status is EditorPlanStatus.READY
+    assert result.argv == argv
+
+
+@pytest.mark.asyncio
+async def test_handoff_launcher_from_environment_gets_its_wait_flag() -> None:
+    result = await _service(
+        Calls(), config=Config(editor_command=""), environment={"VISUAL": "subl"}
+    ).prepare_editor_log(JOB)
+
+    assert result.status is EditorPlanStatus.READY
+    assert result.argv == ("subl", "--wait")
