@@ -10,9 +10,20 @@ import httpx
 import pytest
 
 import tongs.forges.github as github_module
-from tongs.errors import ConflictError, ForgeError, ValidationError
-from tongs.forges.github import GitHubClient
+from tongs.errors import (
+    ConflictError,
+    ForgeError,
+    NotFoundError,
+    PartialResultsError,
+    ValidationError,
+)
+from tongs.forges.github import (
+    GitHubClient,
+    _aggregate_check_runs,
+    _parse_ci_status,
+)
 from tongs.forges.models import (
+    CIStatus,
     ForgeHost,
     ReviewDecision,
     SourceCleanupStatus,
@@ -646,3 +657,249 @@ class TestGitHubLifecycleActions:
 
         assert closed.remote_id == "55"
         assert reopened.remote_id == "55"
+
+
+def _run(conclusion: str | None, status: str = "completed") -> dict:
+    return {"status": status, "conclusion": conclusion}
+
+
+class TestCheckRunAggregation:
+    @pytest.mark.parametrize(
+        ("runs", "expected"),
+        [
+            ([_run("success"), _run("skipped")], CIStatus.SUCCESS),
+            ([_run("neutral")], CIStatus.SUCCESS),
+            ([_run("success"), _run("neutral"), _run("skipped")], CIStatus.SUCCESS),
+            ([_run("skipped"), _run("skipped")], CIStatus.SKIPPED),
+            ([_run("startup_failure")], CIStatus.FAILED),
+            ([_run("success"), _run("timed_out")], CIStatus.FAILED),
+            ([_run("success"), _run("stale")], CIStatus.PENDING),
+            ([_run("success"), _run("action_required")], CIStatus.PENDING),
+            ([_run("success"), _run(None, "queued")], CIStatus.PENDING),
+            ([_run("success"), _run(None, "in_progress")], CIStatus.RUNNING),
+            ([_run("failure"), _run(None, "in_progress")], CIStatus.FAILED),
+            ([_run("success"), _run("cancelled")], CIStatus.CANCELED),
+            ([_run("success"), _run("something_new")], CIStatus.UNKNOWN),
+            ([], CIStatus.UNKNOWN),
+        ],
+    )
+    def test_aggregate(self, runs: list[dict], expected: CIStatus) -> None:
+        assert _aggregate_check_runs(runs) == expected
+
+    @pytest.mark.parametrize(
+        ("status", "conclusion", "expected"),
+        [
+            ("completed", "success", CIStatus.SUCCESS),
+            ("completed", "skipped", CIStatus.SKIPPED),
+            ("completed", "neutral", CIStatus.UNKNOWN),
+            ("completed", "startup_failure", CIStatus.UNKNOWN),
+            ("completed", "stale", CIStatus.UNKNOWN),
+            ("completed", "cancelled", CIStatus.CANCELED),
+            ("in_progress", None, CIStatus.RUNNING),
+            ("queued", None, CIStatus.PENDING),
+        ],
+    )
+    def test_pipeline_and_job_rows_keep_their_mapping(
+        self, status: str, conclusion: str | None, expected: CIStatus
+    ) -> None:
+        assert _parse_ci_status(status, conclusion) == expected
+        client = GitHubClient(_TEST_HOST, httpx.AsyncClient())
+        run = client._parse_workflow_run(
+            {"id": 1, "status": status, "conclusion": conclusion}
+        )
+        job = client._parse_job({"id": 2, "status": status, "conclusion": conclusion})
+        assert (run.status, job.status) == (expected, expected)
+
+    @pytest.mark.asyncio
+    async def test_pages_check_runs_up_to_total_count(self) -> None:
+        pages: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/repos/acme/repo/commits/abc/check-runs"
+            page = int(request.url.params["page"])
+            pages.append(str(page))
+            runs = [_run("success") for _ in range(100 if page == 1 else 50)]
+            if page == 2:
+                # Run 120 fails; it is only visible on the second page.
+                runs[19] = _run("failure")
+            return httpx.Response(200, json={"total_count": 150, "check_runs": runs})
+
+        client, http = _make_github_client(handler)
+        async with http:
+            status = await client._fetch_ci_status("acme", "repo", "abc")
+
+        assert pages == ["1", "2"]
+        assert status == CIStatus.FAILED
+
+    @pytest.mark.asyncio
+    async def test_success_over_every_page(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            page = int(request.url.params["page"])
+            runs = [_run("success" if page == 1 else "skipped")] * (
+                100 if page == 1 else 50
+            )
+            return httpx.Response(200, json={"total_count": 150, "check_runs": runs})
+
+        client, http = _make_github_client(handler)
+        async with http:
+            status = await client._fetch_ci_status("acme", "repo", "abc")
+
+        assert status == CIStatus.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_runs_beyond_the_page_limit_never_claim_success(self) -> None:
+        pages: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            pages.append(request.url.params["page"])
+            runs = [_run("success")] * 100
+            return httpx.Response(200, json={"total_count": 5000, "check_runs": runs})
+
+        client, http = _make_github_client(handler)
+        async with http:
+            status = await client._fetch_ci_status("acme", "repo", "abc")
+
+        assert len(pages) == github_module._CHECK_RUNS_MAX_PAGES
+        assert status == CIStatus.UNKNOWN
+
+    @pytest.mark.asyncio
+    async def test_response_without_total_count_reads_one_page(self) -> None:
+        pages: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            pages.append(request.url.params["page"])
+            return httpx.Response(200, json={"check_runs": [_run("success")]})
+
+        client, http = _make_github_client(handler)
+        async with http:
+            status = await client._fetch_ci_status("acme", "repo", "abc")
+
+        assert pages == ["1"]
+        assert status == CIStatus.SUCCESS
+
+
+def _search_item(number: int) -> dict:
+    return {
+        "number": number,
+        "repository_url": "https://api.github.com/repos/acme/repo",
+    }
+
+
+def _search_handler(
+    *,
+    total_count: int,
+    search_pages: list[str],
+    failing_pr: int | None = None,
+    failing_search_page: int | None = None,
+    incomplete: bool = False,
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/search/issues":
+            page = int(request.url.params["page"])
+            search_pages.append(str(page))
+            if page == failing_search_page:
+                return httpx.Response(502, json={"message": "bad gateway"})
+            per_page = int(request.url.params["per_page"])
+            start = (page - 1) * per_page
+            numbers = range(start + 1, min(start + per_page, total_count) + 1)
+            return httpx.Response(
+                200,
+                json={
+                    "total_count": total_count,
+                    "incomplete_results": incomplete,
+                    "items": [_search_item(number) for number in numbers],
+                },
+            )
+        number = int(request.url.path.rsplit("/", 1)[1])
+        if number == failing_pr:
+            return httpx.Response(404, json={"message": "Not Found"})
+        return httpx.Response(200, json=_pr_api_json({"number": number}))
+
+    return handler
+
+
+class TestSearchPaging:
+    @pytest.mark.asyncio
+    async def test_follows_search_pages_past_the_first_hundred(self) -> None:
+        search_pages: list[str] = []
+        client, http = _make_github_client(
+            _search_handler(total_count=150, search_pages=search_pages)
+        )
+        async with http:
+            results = await client.list_my_reviews()
+
+        assert search_pages == ["1", "2"]
+        assert [mr.number for mr in results] == list(range(1, 151))
+
+    @pytest.mark.asyncio
+    async def test_failed_pull_request_fetch_keeps_the_others(self) -> None:
+        search_pages: list[str] = []
+        client, http = _make_github_client(
+            _search_handler(total_count=3, search_pages=search_pages, failing_pr=2)
+        )
+        async with http:
+            with pytest.raises(PartialResultsError) as caught:
+                await client.list_my_mrs()
+
+        assert [mr.number for mr in caught.value.items] == [1, 3]
+        assert isinstance(caught.value.cause, NotFoundError)
+        assert "1 of 3" in str(caught.value)
+
+    @pytest.mark.asyncio
+    async def test_result_cap_reports_truncation(self, monkeypatch) -> None:
+        monkeypatch.setattr(github_module, "_SEARCH_RESULT_CAP", 200)
+        search_pages: list[str] = []
+        client, http = _make_github_client(
+            _search_handler(total_count=450, search_pages=search_pages)
+        )
+        async with http:
+            with pytest.raises(PartialResultsError) as caught:
+                await client.list_my_reviews()
+
+        assert search_pages == ["1", "2"]
+        assert len(caught.value.items) == 200
+        assert "450" in str(caught.value.cause)
+
+    @pytest.mark.asyncio
+    async def test_incomplete_search_reports_truncation(self) -> None:
+        search_pages: list[str] = []
+        client, http = _make_github_client(
+            _search_handler(total_count=2, search_pages=search_pages, incomplete=True)
+        )
+        async with http:
+            with pytest.raises(PartialResultsError) as caught:
+                await client.list_my_reviews()
+
+        assert [mr.number for mr in caught.value.items] == [1, 2]
+        assert "timed out" in str(caught.value.cause)
+
+    @pytest.mark.asyncio
+    async def test_failed_later_search_page_keeps_earlier_results(self) -> None:
+        search_pages: list[str] = []
+        client, http = _make_github_client(
+            _search_handler(
+                total_count=150, search_pages=search_pages, failing_search_page=2
+            )
+        )
+        async with http:
+            with pytest.raises(PartialResultsError) as caught:
+                await client.list_my_reviews()
+
+        assert search_pages == ["1", "2"]
+        assert len(caught.value.items) == 100
+        assert isinstance(caught.value.cause, ForgeError)
+
+    @pytest.mark.asyncio
+    async def test_failed_first_search_page_raises_its_error(self) -> None:
+        search_pages: list[str] = []
+        client, http = _make_github_client(
+            _search_handler(
+                total_count=5, search_pages=search_pages, failing_search_page=1
+            )
+        )
+        async with http:
+            with pytest.raises(ForgeError) as caught:
+                await client.list_my_reviews()
+
+        assert not isinstance(caught.value, PartialResultsError)
+        assert search_pages == ["1"]

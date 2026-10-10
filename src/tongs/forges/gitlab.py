@@ -96,6 +96,9 @@ def _parse_ci_status(value: str | None) -> CIStatus:
         "success": CIStatus.SUCCESS,
         "failed": CIStatus.FAILED,
         "running": CIStatus.RUNNING,
+        # Cancellation was requested but jobs are still stopping, so the
+        # pipeline is not finished yet.
+        "canceling": CIStatus.RUNNING,
         "pending": CIStatus.PENDING,
         "canceled": CIStatus.CANCELED,
         "cancelled": CIStatus.CANCELED,
@@ -105,6 +108,8 @@ def _parse_ci_status(value: str | None) -> CIStatus:
         "waiting_for_resource": CIStatus.PENDING,
         "preparing": CIStatus.PENDING,
         "scheduled": CIStatus.PENDING,
+        # A job that waits for an external system to report back.
+        "waiting_for_callback": CIStatus.PENDING,
     }
     return mapping.get(value or "", CIStatus.UNKNOWN)
 

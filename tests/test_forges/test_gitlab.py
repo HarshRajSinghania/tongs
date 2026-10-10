@@ -63,6 +63,8 @@ class TestParseDatetime:
         ("cancelled", CIStatus.CANCELED),
         ("created", CIStatus.PENDING),
         ("manual", CIStatus.PENDING),
+        ("canceling", CIStatus.RUNNING),
+        ("waiting_for_callback", CIStatus.PENDING),
         ("something_new", CIStatus.UNKNOWN),
         (None, CIStatus.UNKNOWN),
     ],

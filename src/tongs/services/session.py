@@ -14,6 +14,7 @@ from typing import Protocol, Self, TypeVar, cast
 
 from tongs.cache.store import CacheStore
 from tongs.config import Config, load_config
+from tongs.errors import PartialResultsError
 from tongs.forges.base import ForgeClient, read_mr_page
 from tongs.forges.models import (
     Commit,
@@ -658,6 +659,7 @@ class ApplicationSession:
         ) -> tuple[tuple[ReviewListItem, ...], HostFailure | None]:
             async with semaphore:
                 next_page: str | None = None
+                partial: HostFailure | None = None
                 try:
                     client = await self._get_client(hostname, "list_reviews")
                     if query.scope == ReviewScope.ALL_OPEN and query.paged:
@@ -679,10 +681,16 @@ class ApplicationSession:
                             state=query.state.value,
                             per_page=query.per_page,
                         )
-                    elif query.scope == ReviewScope.MY_REVIEWS:
-                        summaries = await client.list_my_reviews()
                     else:
-                        summaries = await client.list_my_mrs()
+                        try:
+                            if query.scope == ReviewScope.MY_REVIEWS:
+                                summaries = await client.list_my_reviews()
+                            else:
+                                summaries = await client.list_my_mrs()
+                        except PartialResultsError as error:
+                            # Keep what the search read and report the rest.
+                            summaries = list(error.items)
+                            partial = _partial_failure(error, hostname, repository)
                     self._require_started()
                     items = self._accept_summaries(
                         summaries,
@@ -697,7 +705,7 @@ class ApplicationSession:
                     # Only a page that passed validation offers the next one.
                     if next_page is not None and repository is not None:
                         next_cursors[repository] = next_page
-                    return items, None
+                    return items, partial
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:  # noqa: BLE001 - Preserve partial results.
@@ -1260,3 +1268,24 @@ def _page_items(page: object) -> tuple[MRSummary, ...]:
             "The forge returned an invalid review list.",
         )
     return page.items
+
+
+def _partial_failure(
+    error: PartialResultsError,
+    hostname: str,
+    repository: RepositoryRef | None,
+) -> HostFailure:
+    """Describe the results a forge left out of a partial review list."""
+    safe = translate_error(error.cause, operation="list_reviews", hostname=hostname)
+    message = (
+        "Some reviews could not be listed, so this list is incomplete."
+        if safe.code == ServiceErrorCode.INTERNAL
+        else f"Some reviews could not be listed. {safe.message}"
+    )
+    return HostFailure(
+        hostname=hostname,
+        code=safe.code,
+        message=message,
+        retryable=safe.retryable,
+        repository=repository,
+    )

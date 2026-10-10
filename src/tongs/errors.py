@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
+from typing import Any
 
 
 class ForgeError(Exception):
@@ -43,6 +45,25 @@ class ValidationError(ForgeError):
 
 class ConfigError(ForgeError):
     """Configuration error (malformed config, invalid scan root, etc.)."""
+
+
+class PartialResultsError(ForgeError):
+    """A list read returned only some of its results.
+
+    ``items`` holds the results that were read and ``cause`` the failure that
+    left the rest out, for example a pull request that could not be fetched or
+    a search that stopped at the forge's result cap.
+    """
+
+    def __init__(
+        self,
+        items: Iterable[Any],
+        cause: ForgeError,
+        message: str | None = None,
+    ):
+        super().__init__(message if message is not None else str(cause))
+        self.items: tuple[Any, ...] = tuple(items)
+        self.cause = cause
 
 
 _TOKEN_PATTERNS = re.compile(
