@@ -261,9 +261,10 @@ class TUIServiceAdapter:
     ) -> CIStatus:
         """Look up the CI status of one listed review.
 
-        This fills in a row from an All Open page read without CI. The lookup
-        is cached for the review list lifetime unless ``fresh`` is set, and its
-        requests share the per-host request limit with every other read.
+        This fills in a row of an inbox list read without CI: an All Open
+        page, or the Reviews and My MRs lists. The lookup is cached for the
+        review list lifetime unless ``fresh`` is set, and its requests share
+        the per-host request limit with every other read.
         """
         return await self.session.get_review_ci_status(
             self.review_ref(summary),

@@ -139,6 +139,11 @@ class _Forge:
                         "check_runs": [{"status": "completed", "conclusion": "success"}]
                     },
                 )
+            if path.startswith(f"/repos/{project}/commits/") and path.endswith(
+                "/status"
+            ):
+                # The commit's legacy statuses, read beside its check runs.
+                return httpx.Response(200, json={"total_count": 0, "statuses": []})
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
 

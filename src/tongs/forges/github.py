@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import fields
 from datetime import UTC, datetime
 from urllib.parse import quote as urlquote
@@ -12,7 +13,9 @@ import httpx
 from tongs.errors import (
     ConflictError,
     ForgeError,
+    ForgePermissionError,
     NetworkError,
+    NotFoundError,
     PartialResultsError,
     ValidationError,
     redact_credentials,
@@ -46,9 +49,22 @@ _PR_FILES_CAP = 3000
 _SEARCH_PAGE_SIZE = 100
 _SEARCH_RESULT_CAP = 1000
 
-# Check runs are read in pages of 100, up to this many pages per commit.
+# Check runs and commit statuses are each read in pages of 100, up to this
+# many pages per commit.
 _CHECK_RUNS_PAGE_SIZE = 100
 _CHECK_RUNS_MAX_PAGES = 10
+
+# The state of one legacy commit status (Jenkins, Prow and similar).
+_COMMIT_STATUS_STATES = {
+    "success": CIStatus.SUCCESS,
+    "failure": CIStatus.FAILED,
+    "error": CIStatus.FAILED,
+    "pending": CIStatus.PENDING,
+}
+
+# A CI source the token may not read counts as empty when the other answers:
+# a token without the commit statuses permission still shows its check runs.
+_UNREADABLE_CI_SOURCE = (ForgePermissionError, NotFoundError)
 
 # Review threads are read in GraphQL pages of 100, up to this many pages.
 _REVIEW_THREADS_MAX_PAGES = 50
@@ -140,13 +156,23 @@ def _check_run_state(run: dict) -> CIStatus:
 
 
 def _aggregate_check_runs(runs: list[dict]) -> CIStatus:
-    """Combine a commit's check runs into one status.
+    """Combine a commit's check runs into one status."""
+    return _aggregate_ci_states([_check_run_state(run) for run in runs])
+
+
+def _commit_status_state(status: object) -> CIStatus:
+    """Classify one legacy commit status for the commit-level aggregate."""
+    state = status.get("state") if isinstance(status, dict) else None
+    return _COMMIT_STATUS_STATES.get(str(state or "").lower(), CIStatus.UNKNOWN)
+
+
+def _aggregate_ci_states(statuses: list[CIStatus]) -> CIStatus:
+    """Combine the states of a commit's check runs and commit statuses.
 
     Any failure wins, then running, then pending work. Skipped and neutral
     checks do not block success; a commit whose checks were all skipped is
-    SKIPPED.
+    SKIPPED. A commit with no check run and no commit status is UNKNOWN.
     """
-    statuses = [_check_run_state(run) for run in runs]
     if not statuses:
         return CIStatus.UNKNOWN
     for blocking in (
@@ -409,11 +435,13 @@ class GitHubClient(ForgeClient):
     async def get_mr_ci_status(
         self, repo_path: str, number: int, head_sha: str = ""
     ) -> CIStatus:
-        """Read the combined check-run status of one pull request's head.
+        """Read the CI status of one pull request's head commit.
 
-        Without ``head_sha`` the pull request is read first to find its head.
-        A failed request raises, so a caller never caches a failure as a
-        status; a response without usable check runs is UNKNOWN.
+        Check runs and commit statuses are read together (two requests, more
+        only past 100 of either) and combined. Without ``head_sha`` the pull
+        request is read first to find its head. A failed request raises, so a
+        caller never caches a failure as a status; a head with no usable check
+        run or commit status is UNKNOWN.
         """
         owner, repo = _split_repo_path(repo_path)
         if not head_sha:
@@ -1157,43 +1185,89 @@ class GitHubClient(ForgeClient):
             return CIStatus.UNKNOWN
 
     async def _read_ci_status(self, owner: str, repo: str, sha: str) -> CIStatus:
-        """Read combined CI status from the check-runs API.
+        """Read a commit's CI from its check runs and its commit statuses.
 
-        Check runs are paged up to the reported ``total_count``. When a commit
-        has more runs than the page limit reads, a failure among the runs read
-        is still reported, but no other aggregate is claimed. A failed request
-        raises ForgeError; an unreadable response is UNKNOWN.
+        CI reports either through check runs (GitHub Actions and other apps)
+        or through legacy commit statuses (Jenkins, Prow and similar), so both
+        are read, at the same time, and combined by ``_aggregate_ci_states``:
+        any failure wins, then running and pending work, then success, and a
+        commit with neither stays UNKNOWN. A failure is reported even when the
+        other source could not be read or was cut short; otherwise a source
+        cut short makes the result UNKNOWN. A source the token may not read
+        (403 or 404) counts as empty when the other one answers. Any other
+        failed request raises ForgeError, so a caller never caches it.
+        """
+        path = f"/repos/{owner}/{repo}/commits/{urlquote(sha, safe='')}"
+        results = await asyncio.gather(
+            self._read_ci_source(f"{path}/check-runs", "check_runs", _check_run_state),
+            self._read_ci_source(f"{path}/status", "statuses", _commit_status_state),
+            return_exceptions=True,
+        )
+        states: list[CIStatus] = []
+        complete = True
+        errors: list[ForgeError] = []
+        for result in results:
+            if isinstance(result, ForgeError):
+                errors.append(result)
+            elif isinstance(result, BaseException):
+                raise result
+            elif result is None:
+                complete = False
+            else:
+                source_states, source_complete = result
+                states.extend(source_states)
+                complete = complete and source_complete
+        if CIStatus.FAILED in states:
+            return CIStatus.FAILED
+        if errors and (
+            len(errors) == len(results)
+            or not all(isinstance(error, _UNREADABLE_CI_SOURCE) for error in errors)
+        ):
+            raise errors[0]
+        if not complete:
+            # Some runs or statuses were never read, so only a failure is
+            # certain.
+            return CIStatus.UNKNOWN
+        return _aggregate_ci_states(states)
+
+    async def _read_ci_source(
+        self,
+        path: str,
+        items_key: str,
+        classify: Callable[[dict], CIStatus],
+    ) -> tuple[list[CIStatus], bool] | None:
+        """Read one CI source of a commit, paged up to its ``total_count``.
+
+        Returns the state of each item read and whether every item was read,
+        or None for an unreadable response. A failed request raises.
         """
         try:
-            runs: list[dict] = []
+            items: list[dict] = []
             total_count: int | None = None
             for page in range(1, _CHECK_RUNS_MAX_PAGES + 1):
                 data = await request(
                     self._http,
                     "GET",
-                    f"/repos/{owner}/{repo}/commits/{urlquote(sha, safe='')}/check-runs",
+                    path,
                     params={"per_page": _CHECK_RUNS_PAGE_SIZE, "page": page},
                 )
                 if not isinstance(data, dict):
-                    return CIStatus.UNKNOWN
-                page_runs = data.get("check_runs", [])
-                if not isinstance(page_runs, list):
-                    return CIStatus.UNKNOWN
-                runs.extend(page_runs)
+                    return None
+                page_items = data.get(items_key, [])
+                if not isinstance(page_items, list):
+                    return None
+                items.extend(page_items)
                 if total_count is None:
-                    reported = data.get("total_count", len(page_runs))
+                    reported = data.get("total_count", len(page_items))
                     if type(reported) is not int or reported < 0:
-                        return CIStatus.UNKNOWN
+                        return None
                     total_count = reported
-                if len(runs) >= total_count or len(page_runs) < _CHECK_RUNS_PAGE_SIZE:
+                if len(items) >= total_count or len(page_items) < _CHECK_RUNS_PAGE_SIZE:
                     break
-            status = _aggregate_check_runs(runs)
-            if total_count is not None and len(runs) < total_count:
-                # Some runs were never read, so only a failure is certain.
-                return status if status == CIStatus.FAILED else CIStatus.UNKNOWN
-            return status
+            states = [classify(item) for item in items]
+            return states, total_count is None or len(items) >= total_count
         except (ValueError, KeyError, TypeError, AttributeError):
-            return CIStatus.UNKNOWN
+            return None
 
     async def _fetch_approvals(
         self, owner: str, repo: str, number: int

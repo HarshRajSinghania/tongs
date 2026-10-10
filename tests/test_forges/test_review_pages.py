@@ -126,6 +126,9 @@ class TestGitHubPage:
                         "check_runs": [{"status": "completed", "conclusion": "failure"}]
                     },
                 )
+            if request.url.path.endswith("/status"):
+                ci_paths.append(request.url.path)
+                return httpx.Response(200, json={"total_count": 0, "statuses": []})
             raise AssertionError(str(request.url))
 
         async with httpx.AsyncClient(
@@ -148,7 +151,9 @@ class TestGitHubPage:
         assert page.has_next is True
         assert sorted(ci_paths) == [
             "/repos/acme/repo/commits/sha-7/check-runs",
+            "/repos/acme/repo/commits/sha-7/status",
             "/repos/acme/repo/commits/sha-8/check-runs",
+            "/repos/acme/repo/commits/sha-8/status",
         ]
         assert {item.ci_status for item in page.items} == {CIStatus.FAILED}
 
