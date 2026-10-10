@@ -38,9 +38,9 @@ CI_EVENT = "push"
 #: Compare statuses of ``<sha>...main`` that mean main contains ``<sha>``.
 ON_MAIN_STATUSES = frozenset({"ahead", "identical"})
 RETRY_ADVICE = (
-    "re-run both tag workflows (publish.yml and release-desktop.yml) once the "
-    "ci.yml push run on main for this commit is green; never move or recreate "
-    "the tag"
+    "once the ci.yml push run on main for this commit is green, re-run the "
+    "failed jobs of whichever tag workflow failed (publish.yml or "
+    "release-desktop.yml); never move or recreate the tag"
 )
 
 
@@ -112,17 +112,34 @@ def _check_notes(tag: str, notes_path: Path) -> list[str]:
         text = notes_path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as error:
         return [f"{expected} cannot be read as UTF-8 text: {error}"]
-    if not text.strip():
+    if not _without_front_matter(text).strip():
         return [f"{expected} is empty in the tagged tree"]
     return []
+
+
+def _without_front_matter(text: str) -> str:
+    """Drop a leading ``---`` block, as the desktop release's notes step does."""
+    lines = text.splitlines()
+    if not lines or lines[0] != "---":
+        return text
+    for index, line in enumerate(lines[1:], start=1):
+        if line == "---":
+            return "\n".join(lines[index + 1 :])
+    return ""
 
 
 def _is_main_ci_push_run(run: Any, sha: str, repository_id: str) -> bool:
     if not isinstance(run, dict):
         return False
     repository = run.get("repository")
+    head_repository = run.get("head_repository")
     run_repository_id = (
         _integer(repository.get("id")) if isinstance(repository, dict) else None
+    )
+    head_repository_id = (
+        _integer(head_repository.get("id"))
+        if isinstance(head_repository, dict)
+        else None
     )
     return (
         run.get("event") == CI_EVENT
@@ -131,6 +148,7 @@ def _is_main_ci_push_run(run: Any, sha: str, repository_id: str) -> bool:
         and run.get("path") == CI_WORKFLOW_PATH
         and run_repository_id is not None
         and str(run_repository_id) == repository_id
+        and head_repository_id == run_repository_id
     )
 
 

@@ -232,9 +232,10 @@ GitHub Release unless all three checks pass for the tagged commit:
 
 1. It is on `main`: the compare `<sha>...main` reports `ahead` or `identical`.
    Any commit `main` contains passes, not only its tip.
-2. `docs/releases/<tag>.md` exists in the tagged tree and is not empty.
-3. The newest `ci.yml` run for a push to `main` of exactly that commit, in this
-   repository, completed with conclusion `success`. A run reports its latest
+2. `docs/releases/<tag>.md` exists in the tagged tree and has a body after
+   any leading front matter, the same text the GitHub Release uses.
+3. The newest `ci.yml` run for a push to `main` of exactly that commit, from
+   this repository and not a fork, completed with conclusion `success`. A run reports its latest
    attempt, so a partial re-run that turned green counts.
 
 The gate is a hard failure and never polls; each failed check prints its own
@@ -243,6 +244,10 @@ reads the two API responses into `$RUNNER_TEMP`; the jobs hold
 `contents: read` and `actions: read`. `tests/ci/test_release_gate.py` covers
 the checks against recorded API responses in `tests/ci/fixtures/release_gate/`,
 and `tests/ci/test_workflow_hygiene.py` holds every tag workflow to the gate.
+
+The gate catches release mistakes, not a deliberately bad tag: on a tag push
+both the workflow and the gate script come from the tagged commit. Who can
+push tags, and the PyPI publisher settings, remain the security boundary.
 
 ### Pre-tag checklist
 
@@ -255,10 +260,12 @@ and `tests/ci/test_workflow_hygiene.py` holds every tag workflow to the gate.
 4. Get the maintainer's go to tag. Tags are never delegated.
 5. Push the signed `vX.Y.Z` tag on that merge commit.
 6. If the gate fails because `main` CI was still running, wait for it to turn
-   green, then re-run both tag workflows (`publish.yml` and
-   `release-desktop.yml`) for the tag. Never delete, move or recreate the tag.
-   Any other gate failure means the tag cannot publish; nothing was uploaded,
-   so stop and raise it with the maintainer rather than retagging.
+   green, then re-run the failed jobs of whichever tag workflow failed
+   (`publish.yml` or `release-desktop.yml`). The two gates run separately, so
+   one may already have passed and published. Never delete, move or recreate
+   the tag. Any other gate failure means that workflow cannot publish: check
+   whether the other one already did, then stop and raise it with the
+   maintainer rather than retagging.
 
 ## Pinned actions and tools
 

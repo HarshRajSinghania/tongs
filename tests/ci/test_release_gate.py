@@ -148,10 +148,31 @@ def test_missing_release_notes_fail(tmp_path: Path) -> None:
     ]
 
 
-@pytest.mark.parametrize("content", ["", "\n", "  \n\t\n"])
+@pytest.mark.parametrize(
+    "content",
+    [
+        "",
+        "\n",
+        "  \n\t\n",
+        "---\ntitle: v1.0.4\n---\n",
+        "---\ntitle: v1.0.4\n---\n\n  \n",
+    ],
+)
 def test_empty_release_notes_fail(notes: Path, content: str) -> None:
     notes.write_text(content)
     assert _evaluate(notes) == [f"docs/releases/{TAG}.md is empty in the tagged tree"]
+
+
+def test_release_notes_with_front_matter_and_a_body_pass(notes: Path) -> None:
+    notes.write_text("---\ntitle: v1.0.4\n---\n\nFixes stuck review drafts.\n")
+    assert _evaluate(notes) == []
+
+
+def test_a_green_main_run_from_a_fork_head_is_ignored() -> None:
+    (run,) = _fixture("runs-success.json")["workflow_runs"]
+    forked = {**run, "head_repository": {**run["head_repository"], "id": 1399999999}}
+    assert not gate._is_main_ci_push_run(forked, SHA, REPOSITORY_ID)
+    assert gate._is_main_ci_push_run(run, SHA, REPOSITORY_ID)
 
 
 def test_release_notes_for_another_tag_fail(notes: Path) -> None:
@@ -176,7 +197,7 @@ def test_a_main_run_still_running_fails_without_polling(
 ) -> None:
     (failure,) = _evaluate(notes, runs=runs)
     assert f"is {status}, not completed" in failure
-    assert "re-run both tag workflows" in failure
+    assert "re-run the failed jobs of whichever tag workflow failed" in failure
     assert "never move or recreate the tag" in failure
 
 
