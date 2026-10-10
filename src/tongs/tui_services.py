@@ -376,7 +376,8 @@ class TUIServiceAdapter:
         Durable attempt reads do not carry the failure, so the adapter keeps it
         in memory for the life of the app. A reopened review screen therefore
         still explains why its submission paused. The record is forgotten once
-        the attempt is submitted or returns to editing.
+        the attempt is submitted, returns to editing or reaches an unknown
+        outcome.
         """
         return self._submission_failures.get(attempt_id)
 
@@ -587,6 +588,13 @@ class TUIServiceAdapter:
             self._submission_failures.pop(progress.attempt_id, None)
             return progress
         self._known_draft_attempts[key] = progress.attempt_id
+        if progress.outcome is not SubmissionOutcome.PAUSED:
+            # Only a failure that paused the attempt explains a later paused
+            # read. An unknown outcome's failure (for example a mutation that
+            # stopped without a confirmed result) would otherwise be shown
+            # for a resumable pause and hide the resume action.
+            self._submission_failures.pop(progress.attempt_id, None)
+            return progress
         if progress.failure is not None:
             self._submission_failures[progress.attempt_id] = progress.failure
             return progress

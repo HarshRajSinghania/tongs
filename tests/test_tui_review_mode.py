@@ -13,7 +13,7 @@ from textual.widgets import OptionList, Static, TextArea
 from tests.test_tui_mr_services import _app, _settle, _wait_until
 from tongs.errors import RateLimitError, ValidationError
 from tongs.forges.models import ReviewDecision
-from tongs.services.review_submission import SubmissionFailure
+from tongs.services.review_submission import SubmissionFailure, SubmissionOutcome
 from tongs.state.drafts import (
     DiffSide,
     DraftContent,
@@ -1419,6 +1419,58 @@ async def test_non_retryable_pause_hides_resume_and_keeps_draft_locked(
         bar = screen.query_one("#review-draft-bar", ReviewDraftBar)
         assert "reason:" not in _rendered(bar)
         assert len([call for call in forge.calls if call[0] == "verdict"]) == verdicts
+
+
+@pytest.mark.asyncio
+async def test_unknown_outcome_failure_is_not_attached_to_a_later_pause(
+    tmp_path: Path,
+) -> None:
+    """A failure reported with an unknown outcome never explains a pause.
+
+    The service attaches non-retryable failures to unknown outcomes. If the
+    adapter kept one, a later durable paused read of the same attempt would
+    show that stale reason and hide the resume action for a resumable pause.
+    """
+    app, forge = _app(tmp_path)
+    forge.verdict_error = RateLimitError("controlled rate limit", retry_after=1)
+
+    async with app.run_test(size=(160, 40), notifications=True) as pilot:
+        screen = await _open_detail(app, pilot)
+        screen.action_review_draft()
+        await _wait_until(app, lambda: screen._review_draft is not None)
+        await _submit_until_paused(app, pilot, screen)
+        paused = screen._review_progress
+        attempt_id = paused.attempt_id
+        assert app.services.last_submission_failure(attempt_id) is not None
+        assert screen._current_review_revision is not None
+        target = app.services.draft_target(
+            screen.mr_summary, screen._current_review_revision
+        )
+
+        unknown_failure = SubmissionFailure(
+            "unknown_outcome",
+            "The review mutation stopped with an unknown outcome.",
+            False,
+        )
+        unknown = replace(
+            paused, outcome=SubmissionOutcome.UNKNOWN, failure=unknown_failure
+        )
+        remembered = app.services._remember_draft_attempt(target, unknown)
+        assert remembered.failure == unknown_failure
+        assert app.services.last_submission_failure(attempt_id) is None
+
+        durable = await app.session.review_submissions.get(attempt_id)
+        assert durable.outcome is SubmissionOutcome.PAUSED
+        assert durable.failure is None
+        read = await app.services.get_draft_submission(target, attempt_id)
+        assert read.outcome is SubmissionOutcome.PAUSED
+        assert read.failure is None
+        recoveries = await app.services.list_draft_recoveries(target)
+        recovered = [r for r in recoveries if r.progress.attempt_id == attempt_id]
+        assert len(recovered) == 1
+        assert recovered[0].progress.outcome is SubmissionOutcome.PAUSED
+        assert recovered[0].progress.failure is None
+        assert app.services.last_submission_failure(attempt_id) is None
 
 
 @pytest.mark.asyncio
