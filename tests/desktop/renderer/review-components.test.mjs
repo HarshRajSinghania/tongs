@@ -18,6 +18,15 @@ import {
   beginSubmission,
   createReviewWorkflowState,
 } from "../../../desktop/dist/src/renderer/features/review/state.js";
+import {
+  CAPABILITY_LOADING,
+  capabilitiesReady,
+  enabledButton,
+  settle,
+  waitForCount,
+  waitForFlag,
+  waitForText,
+} from "./wait.mjs";
 
 const desktopRequire = createRequire(
   new URL("../../../desktop/package.json", import.meta.url),
@@ -32,7 +41,7 @@ Object.assign(globalThis, {
   HTMLElement: dom.window.HTMLElement,
   Node: dom.window.Node,
 });
-const { cleanup, fireEvent, render, waitFor } = desktopRequire(
+const { cleanup, fireEvent, render } = desktopRequire(
   "@testing-library/react",
 );
 afterEach(cleanup);
@@ -60,13 +69,12 @@ test("quick comment remains immediate, retains unknown intent, and needs explici
   fireEvent.click(await enabledButton(view, "Add comment now"));
   // The composer says what happened to its own write; the one way out is in
   // the review header, the same on every tab.
-  await waitFor(() =>
-    assert.equal(
+  await waitForCount(
+    () =>
       view.queryAllByRole("button", {
         name: "I inspected the forge; acknowledge uncertainty",
       }).length,
-      1,
-    ),
+    1,
   );
   assert.equal(
     view.container.querySelector(".review-header").textContent.includes(
@@ -90,7 +98,7 @@ test("quick comment remains immediate, retains unknown intent, and needs explici
     target: { value: "Deliberate second intent" },
   });
   fireEvent.click(await enabledButton(view, "Add comment now"));
-  await waitFor(() => assert.equal(calls, 2));
+  await waitForCount(() => calls, 2);
   assert.notEqual(operations[0], operations[1]);
 });
 
@@ -215,13 +223,13 @@ test("a second take-theirs keeps both retained texts, each dismissed on its own"
   fireEvent.click(
     view.getByRole("button", { name: "Dismiss my text replaced by version 2" }),
   );
-  await waitFor(() =>
-    assert.equal(
+  await waitForCount(
+    () =>
       view.container.querySelectorAll(
         '[aria-label="My superseded draft text replaced by version 2"]',
       ).length,
-      0,
-    ));
+    0,
+  );
   assert.match(
     view.getByLabelText("My superseded draft text replaced by version 4").value,
     /second local/,
@@ -313,7 +321,7 @@ test("submission needs confirmation and unknown progress exposes reconciliation 
   assert.match(view.getByText(/can repeat an unconfirmed remote write/).textContent, /Confirmed receipt steps stay excluded/);
   assert.equal(reconciles, 0);
   fireEvent.click(view.getByRole("button", { name: "Confirm possible repeat of remaining writes" }));
-  await waitFor(() => assert.equal(reconciles, 1));
+  await waitForCount(() => reconciles, 1);
   assert.equal(starts, 1);
   await view.findByText("Review submitted.");
 });
@@ -375,11 +383,10 @@ test("the Discussions jump list lists unresolved threads first and jumps to the 
     navigate: (route) => navigated.push(route),
   });
 
-  const rows = await waitFor(() => {
-    const found = view.container.querySelectorAll(".review-workflow-thread");
-    assert.equal(found.length, 2);
-    return found;
-  });
+  const threads = () =>
+    view.container.querySelectorAll(".review-workflow-thread");
+  await waitForCount(() => threads().length, 2);
+  const rows = threads();
   // Unresolved first, whatever order the forge listed them in.
   assert.match(
     rows[0].querySelector(".review-workflow-thread-summary").textContent,
@@ -460,13 +467,12 @@ test("a review-level note reads on Overview and never in the jump list", async (
   });
 
   const overview = renderOverview(bridge, review);
-  const notes = await waitFor(() => {
-    const found = overview.container.querySelectorAll(
+  const levelThreads = () =>
+    overview.container.querySelectorAll(
       ".review-level-discussions .review-workflow-thread",
     );
-    assert.equal(found.length, 1);
-    return found;
-  });
+  await waitForCount(() => levelThreads().length, 1);
+  const notes = levelThreads();
   assert.equal(
     notes[0].querySelector(".review-workflow-thread-meta").textContent,
     "Reviewer",
@@ -481,11 +487,10 @@ test("a review-level note reads on Overview and never in the jump list", async (
 
   // The jump list carries only threads that resolve to a diff position.
   const panel = renderFeature(bridge, review);
-  const rows = await waitFor(() => {
-    const found = panel.container.querySelectorAll(".review-workflow-thread");
-    assert.equal(found.length, 1);
-    return found;
-  });
+  const threads = () =>
+    panel.container.querySelectorAll(".review-workflow-thread");
+  await waitForCount(() => threads().length, 1);
+  const rows = threads();
   assert.match(
     rows[0].querySelector(".review-workflow-thread-meta").textContent,
     /src\/example\.py/,
@@ -536,7 +541,8 @@ test("discussion roots and replies use shared safe Markdown without changing sou
   assert.equal(suggestion, "```suggestion\nreplacement(`value`)\n```");
   assert.deepEqual(opened, []);
   fireEvent.click(view.getByRole("link", { name: "docs" }));
-  await waitFor(() => assert.deepEqual(opened, ["https://example.com/help"]));
+  await waitForCount(() => opened.length, 1);
+  assert.deepEqual(opened, ["https://example.com/help"]);
 });
 
 test("discussion Markdown aggregate allocation is deterministic in source order", () => {
@@ -586,12 +592,11 @@ test("discussion callsite stops rendering bodies after its aggregate budget", as
   });
   const view = renderFeature(bridge, review);
 
-  await waitFor(() =>
-    assert.equal(
+  await waitForCount(
+    () =>
       view.container.querySelectorAll(".safe-markdown-aggregate-omission")
         .length,
-      1,
-    ),
+    1,
   );
   assert.equal(
     view.container.querySelectorAll(".safe-markdown-fallback").length,
@@ -621,7 +626,7 @@ test("quick verdict and merge cleanup require explicit confirmation with immutab
   fireEvent.click(
     overview.getByRole("button", { name: "Confirm approve review" }),
   );
-  await waitFor(() => assert.equal(verdicts, 1));
+  await waitForCount(() => verdicts, 1);
   cleanup();
 
   const view = renderFeature(bridge, review);
@@ -632,7 +637,7 @@ test("quick verdict and merge cleanup require explicit confirmation with immutab
   fireEvent.click(view.getByRole("button", { name: "Merge" }));
   assert.equal(merges.length, 0);
   fireEvent.click(view.getByRole("button", { name: "Confirm Merge" }));
-  await waitFor(() => assert.equal(merges.length, 1));
+  await waitForCount(() => merges.length, 1);
   assert.equal(merges[0].squash, true);
   assert.deepEqual(merges[0].source_cleanup, { branch: "feature" });
 });
@@ -707,7 +712,7 @@ test("draft comments are reviewable, editable, and deliberately removable", asyn
   fireEvent.click(
     view.getByRole("button", { name: "Save pending comment on general comment" }),
   );
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   assert.equal(saves[0].content.comments.length, 3);
   assert.equal(
     saves[0].content.comments.find((item) => item.id === comments[0].id).body,
@@ -726,7 +731,7 @@ test("draft comments are reviewable, editable, and deliberately removable", asyn
       name: "Delete pending comment on src/example.py, new line 4",
     }),
   );
-  await waitFor(() => assert.equal(saves.length, 2));
+  await waitForCount(() => saves.length, 2);
   assert.equal(saves[1].content.comments.length, 2);
   assert.equal(
     saves[1].content.comments.some((item) => item.id === comments[1].id),
@@ -792,7 +797,7 @@ test("stale draft migration creates a separate draft and keeps inline and reply 
   fireEvent.click(view.getByRole("button", { name: "Create current-revision draft" }));
   assert.equal(creates.length, 0);
   fireEvent.click(view.getByRole("button", { name: "Confirm create separate current-revision draft" }));
-  await waitFor(() => assert.equal(creates.length, 1));
+  await waitForCount(() => creates.length, 1);
   assert.equal(creates[0].revision.head_sha, "new-head");
   assert.deepEqual(creates[0].content.comments.map((item) => item.kind), ["general"]);
   assert.equal(creates[0].content.body, "Portable body");
@@ -867,7 +872,7 @@ test("durable recovery loads and binds the attempt draft instead of another cand
   fireEvent.click(await view.findByRole("button", {
     name: "Recover unknown attempt with 0 confirmed step(s)",
   }));
-  await waitFor(() => assert.equal(loads.length, 1));
+  await waitForCount(() => loads.length, 1);
   assert.equal(loads[0].draft_id, otherId);
   assert.equal(view.getByLabelText("Summary").value, "matching recovered draft");
   await view.findByText(/Remote status is unknown/);
@@ -958,8 +963,26 @@ test("a verdict tile explains the capability read before it explains the body", 
   );
   assert.equal(tiles().filter((tile) => tile.disabled).length, 3);
 
+  // The composer's writes say the same thing in their own words. Ctrl/Cmd+Enter
+  // presses these buttons, and the shared `capabilitiesReady` wait the keyboard
+  // tests settle on only knows the sentences in `CAPABILITY_LOADING`, so a
+  // reword here has to fail this pin rather than silently pass those waits.
+  const writes = () =>
+    [...view.container.querySelectorAll(COMPOSER_BUTTONS)]
+      .filter((button) =>
+        ["Add comment now", "Start a review"].includes(button.textContent),
+      )
+      .map((button) => button.title);
+  assert.deepEqual(writes(), [COMPOSER_LOADING, COMPOSER_LOADING]);
+  assert.equal(CAPABILITY_LOADING.includes(COMPOSER_LOADING), true);
+  assert.equal(CAPABILITY_LOADING.includes(VERDICTS_LOADING), true);
+
   release();
-  await settledCapabilities(view);
+  await capabilitiesReady(
+    view.container,
+    `${VERDICT_TILES}, ${COMPOSER_BUTTONS}`,
+  );
+  assert.deepEqual(writes(), ["", ""]);
   assert.equal(
     view.getByRole("button", { name: "Submit comment verdict" }).title,
     "Enter a review body in the general composer first.",
@@ -984,7 +1007,7 @@ test("the comment verdict reads the body the composer is holding", async () => {
   // The tile is disabled while the capability read is in flight and again once
   // it answers with no body to submit, so the read has to have answered before
   // its title says anything about the body.
-  await settledCapabilities(view);
+  await capabilitiesReady(view.container, VERDICT_TILES);
   assert.equal(
     view.container.querySelectorAll(".review-workflow-verdicts button").length,
     3,
@@ -997,15 +1020,16 @@ test("the comment verdict reads the body the composer is holding", async () => {
     target: { value: "the verdict body" },
   });
   fireEvent.click(await enabledButton(view, "Submit comment verdict"));
-  await waitFor(() => assert.equal(verdicts.length, 1));
+  await waitForCount(() => verdicts.length, 1);
   assert.equal(verdicts[0].body, "the verdict body");
   assert.equal(verdicts[0].verdict, "comment");
 
   // A submitted verdict says so, empties the box it was written in, and does
   // not offer the same press again until the next comment is written.
   await view.findByText("Comment verdict submitted.");
-  await waitFor(() =>
-    assert.equal(view.getByLabelText("General review comment").value, ""),
+  await waitForText(
+    () => view.getByLabelText("General review comment").value,
+    "",
   );
   assert.equal(readInlineBuffer(review, null), "");
   assert.equal(
@@ -1025,11 +1049,9 @@ test("the comment verdict reads the body the composer is holding", async () => {
   fireEvent.change(view.getByLabelText("General review comment"), {
     target: { value: "a second body" },
   });
-  await waitFor(() =>
-    assert.equal(
-      view.getByRole("button", { name: "Approve review" }).disabled,
-      false,
-    ),
+  await waitForFlag(
+    () => view.getByRole("button", { name: "Approve review" }).disabled,
+    false,
   );
   assert.equal(
     view.container.querySelectorAll(".notice-verdict").length,
@@ -1063,7 +1085,7 @@ test("an unsupported verdict names its capability even while another verdict sta
   });
   fireEvent.click(await enabledButton(view, "Submit comment verdict"));
   await view.findByText("Comment verdict submitted.");
-  await settledCapabilities(view);
+  await capabilitiesReady(view.container, VERDICT_TILES);
 
   // A missing capability is permanent; a standing lasts until the next
   // comment, so the tile names the one that will still be true tomorrow.
@@ -1097,7 +1119,7 @@ test("a verdict in flight never takes the text written while it was open", async
     target: { value: "the submitted body" },
   });
   fireEvent.click(await enabledButton(view, "Submit comment verdict"));
-  await waitFor(() => assert.equal(verdicts.length, 1));
+  await waitForCount(() => verdicts.length, 1);
   assert.equal(verdicts[0].body, "the submitted body");
 
   // The box stays writable for the round trip, which is exactly when a reader
@@ -1153,7 +1175,7 @@ test("a failed review-level discussions read is stated, not reported as an absen
 
   const retry = view.getByRole("button", { name: "Retry" });
   fireEvent.click(retry);
-  await waitFor(() => assert.equal(attempts, 2));
+  await waitForCount(() => attempts, 2);
 });
 
 test("review-level discussions still being read say so instead of saying there are none", async () => {
@@ -1166,10 +1188,13 @@ test("review-level discussions still being read say so instead of saying there a
   });
   const view = renderOverview(bridge, review);
 
-  await waitFor(() => {
-    const section = view.container.querySelector(".review-level-discussions");
-    assert.equal(section.querySelectorAll(".notice-loading").length, 1);
-  });
+  await waitForCount(
+    () =>
+      view.container
+        .querySelector(".review-level-discussions")
+        .querySelectorAll(".notice-loading").length,
+    1,
+  );
   await settle();
   const section = view.container.querySelector(".review-level-discussions");
   assert.equal(section.querySelectorAll(".notice-loading").length, 1);
@@ -1223,7 +1248,7 @@ test("a general entry is refused while the review's submission is in flight", as
   // Same race as #215 on the composer's own primary: it is disabled while the
   // capability read is in flight and again for the submission, and only the
   // second is what this test is about.
-  await settledCapabilities(view);
+  await capabilitiesReady(view.container, COMPOSER_BUTTONS);
   const primary = view.getByRole("button", { name: "Add to review" });
   assert.equal(primary.disabled, true);
   assert.equal(
@@ -1288,7 +1313,7 @@ test("both Overview buttons write a general entry, never an inline one and never
   const composer = await view.findByLabelText("General review comment");
   fireEvent.change(composer, { target: { value: "First general note" } });
   fireEvent.click(await enabledButton(view, "Start a review"));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   assert.equal(creates.length, 1);
   assert.equal(posts.length, 0);
 
@@ -1298,7 +1323,7 @@ test("both Overview buttons write a general entry, never an inline one and never
     target: { value: "Second general note" },
   });
   fireEvent.click(await enabledButton(view, "Add to review"));
-  await waitFor(() => assert.equal(saves.length, 2));
+  await waitForCount(() => saves.length, 2);
   assert.equal(creates.length, 1);
   assert.equal(posts.length, 0);
 
@@ -1318,8 +1343,9 @@ test("both Overview buttons write a general entry, never an inline one and never
     ["First general note", "Second general note"],
   );
   assert.equal(saves[1].expected_version, 2);
-  await waitFor(() =>
-    assert.equal(view.getByLabelText("General review comment").value, ""),
+  await waitForText(
+    () => view.getByLabelText("General review comment").value,
+    "",
   );
   await view.findByText("Review in progress, 2 pending");
 });
@@ -1347,14 +1373,15 @@ test("Add comment now posts a general comment immediately and writes no draft", 
   const composer = await view.findByLabelText("General review comment");
   fireEvent.change(composer, { target: { value: "Immediate general note" } });
   fireEvent.click(await enabledButton(view, "Add comment now"));
-  await waitFor(() => assert.equal(posts.length, 1));
+  await waitForCount(() => posts.length, 1);
   assert.equal(posts[0].body, "Immediate general note");
   assert.equal(Object.hasOwn(posts[0], "anchor"), false);
   assert.equal(Object.hasOwn(posts[0], "revision"), false);
   assert.equal(drafts, 0);
   assert.equal(saves, 0);
-  await waitFor(() =>
-    assert.equal(view.getByLabelText("General review comment").value, ""),
+  await waitForText(
+    () => view.getByLabelText("General review comment").value,
+    "",
   );
   // The primary stays the start of a review, because none was started.
   assert.equal(
@@ -1364,50 +1391,18 @@ test("Add comment now posts a general comment immediately and writes no draft", 
 });
 
 /**
- * The button under `name`, once the capability read behind it has answered. A
- * capability-gated control renders disabled while the read is in flight, and a
- * press on it does nothing, so waiting for the element alone is a race.
- */
-/**
- * The sentences a capability-gated control shows while the read behind it is
- * still in flight. They are the reason the control is disabled at that moment,
- * and they are not the reason it will be disabled for once the read answers.
+ * The sentences a capability-gated control on the Overview shows while the
+ * read behind it is still in flight, written out here so a reword in the source
+ * fails the pins below instead of leaving `capabilitiesReady` blind to it.
  */
 const VERDICTS_LOADING = "Verdict support for this review is still loading.";
 const COMPOSER_LOADING =
   "General comment support for this review is still loading.";
 
-/**
- * Waits until every capability-gated control on the surface has an answer
- * behind it. A control is disabled both while its read is in flight and for
- * its own standing reason, so waiting on `disabled` cannot tell the two apart
- * and leaves a loading sentence readable as if it were the reason: that is the
- * race #215 caught on a slow runner. Counted rather than matched against a
- * node, so the wait can only end when no control is still loading.
- */
-async function settledCapabilities(view) {
-  await waitFor(() => {
-    const loading = [...view.container.querySelectorAll("button")].filter(
-      (button) =>
-        button.title === VERDICTS_LOADING || button.title === COMPOSER_LOADING,
-    ).length;
-    assert.equal(loading, 0);
-  });
-}
-
-/** Lets every already-dispatched read and its follow-on effects settle. */
-async function settle(rounds = 20) {
-  for (let round = 0; round < rounds; round += 1)
-    await new Promise((resolve) => setTimeout(resolve, 5));
-}
-
-async function enabledButton(view, name) {
-  return waitFor(() => {
-    const found = view.getByRole("button", { name });
-    assert.equal(found.disabled, false);
-    return found;
-  });
-}
+/** The Overview's capability-gated controls: the verdict tiles and the
+ * general composer's own buttons. */
+const VERDICT_TILES = ".review-workflow-verdicts button";
+const COMPOSER_BUTTONS = ".general-composer button";
 
 function renderFeature(bridge, review, contextChanges = {}) {
   const feature = createReviewFeature(bridge);

@@ -16,6 +16,7 @@ import {
   WorkspaceUtilityController,
   WorkspaceUtilityOverlay,
 } from "../../../desktop/dist/src/renderer/features/utilities/index.js";
+import { waitForCount, waitForText } from "./wait.mjs";
 
 const desktopRequire = createRequire(
   new URL("../../../desktop/package.json", import.meta.url),
@@ -32,7 +33,7 @@ Object.assign(globalThis, {
   HTMLInputElement: dom.window.HTMLInputElement,
   Node: dom.window.Node,
 });
-const { act, cleanup, fireEvent, render, waitFor } = desktopRequire(
+const { act, cleanup, fireEvent, render } = desktopRequire(
   "@testing-library/react",
 );
 afterEach(() => {
@@ -56,7 +57,7 @@ test("F2 opens the loaded log when focus is on the document body", async () => {
 
   assert.equal(focused(), BODY);
   assert.equal(fireEvent.keyDown(document.body, { key: "F2" }), false);
-  await waitFor(() => assert.equal(editorOpens, 1));
+  await waitForCount(() => editorOpens, 1);
 });
 
 test("slash focuses the log search when nothing in the view holds focus", async () => {
@@ -102,37 +103,37 @@ test("typing filters live and n and N step matches with a wrapping counter", asy
 
   fireEvent.keyDown(document.body, { key: "/" });
   fireEvent.change(search, { target: { value: "error" } });
-  await matchCount(view, `1 of ${MATCH_LINES.length} matches`);
-  assert.equal(selectedLine(view), MATCH_LINES[0] + 1);
+  await waitForText(() => matchText(view), `1 of ${MATCH_LINES.length} matches`);
+  await waitForCount(() => selectedLine(view), MATCH_LINES[0] + 1);
 
   // n and N belong to the log, so Enter hands the keyboard back first.
   assert.equal(fireEvent.keyDown(search, { key: "n" }), true);
-  await matchCount(view, `1 of ${MATCH_LINES.length} matches`);
+  await waitForText(() => matchText(view), `1 of ${MATCH_LINES.length} matches`);
 
   fireEvent.keyDown(search, { key: "Enter" });
   assert.equal(focused(), BODY);
 
   assert.equal(fireEvent.keyDown(document.body, { key: "n" }), false);
-  await matchCount(view, `2 of ${MATCH_LINES.length} matches`);
-  assert.equal(selectedLine(view), MATCH_LINES[1] + 1);
+  await waitForText(() => matchText(view), `2 of ${MATCH_LINES.length} matches`);
+  await waitForCount(() => selectedLine(view), MATCH_LINES[1] + 1);
 
   fireEvent.keyDown(document.body, { key: "n" });
-  await matchCount(view, `3 of ${MATCH_LINES.length} matches`);
-  assert.equal(rowWindow(view), "301-600 of 700");
+  await waitForText(() => matchText(view), `3 of ${MATCH_LINES.length} matches`);
+  await waitForText(() => rowWindow(view), "301-600 of 700");
 
   fireEvent.keyDown(document.body, { key: "N" });
-  await matchCount(view, `2 of ${MATCH_LINES.length} matches`);
+  await waitForText(() => matchText(view), `2 of ${MATCH_LINES.length} matches`);
 
   fireEvent.keyDown(document.body, { key: "N" });
   fireEvent.keyDown(document.body, { key: "N" });
-  await matchCount(
-    view,
+  await waitForText(
+    () => matchText(view),
     `${MATCH_LINES.length} of ${MATCH_LINES.length} matches`,
   );
-  assert.equal(rowWindow(view), "601-700 of 700");
+  await waitForText(() => rowWindow(view), "601-700 of 700");
 
   fireEvent.keyDown(document.body, { key: "n" });
-  await matchCount(view, `1 of ${MATCH_LINES.length} matches`);
+  await waitForText(() => matchText(view), `1 of ${MATCH_LINES.length} matches`);
 });
 
 test("n does nothing without matches", async () => {
@@ -142,10 +143,10 @@ test("n does nothing without matches", async () => {
   fireEvent.keyDown(document.body, { key: "/" });
   fireEvent.change(search, { target: { value: "no such text" } });
   fireEvent.keyDown(search, { key: "Enter" });
-  await matchCount(view, "No matches");
+  await waitForText(() => matchText(view), "No matches");
 
   assert.equal(fireEvent.keyDown(document.body, { key: "n" }), true);
-  await matchCount(view, "No matches");
+  await waitForText(() => matchText(view), "No matches");
 });
 
 test("escape closes the search and restores the row window and focus", async () => {
@@ -154,17 +155,17 @@ test("escape closes the search and restores the row window and focus", async () 
   const nextRows = view.getByRole("button", { name: "Next rows" });
   nextRows.focus();
   fireEvent.click(nextRows);
-  assert.equal(rowWindow(view), "301-600 of 700");
+  await waitForText(() => rowWindow(view), "301-600 of 700");
 
   fireEvent.keyDown(nextRows, { key: "/" });
   fireEvent.change(search, { target: { value: "error" } });
-  assert.equal(rowWindow(view), "1-300 of 700");
-  await matchCount(view, `1 of ${MATCH_LINES.length} matches`);
+  await waitForText(() => rowWindow(view), "1-300 of 700");
+  await waitForText(() => matchText(view), `1 of ${MATCH_LINES.length} matches`);
 
   assert.equal(fireEvent.keyDown(search, { key: "Escape" }), false);
   assert.equal(search.value, "");
-  await matchCount(view, "700 lines");
-  assert.equal(rowWindow(view), "301-600 of 700");
+  await waitForText(() => matchText(view), "700 lines");
+  await waitForText(() => rowWindow(view), "301-600 of 700");
   assert.equal(focused(), "BUTTON[Next rows]");
   assert.equal(view.container.querySelectorAll(".ci-log-match").length, 0);
 });
@@ -182,7 +183,7 @@ test("escape from the log reopens a clean search on the next slash", async () =>
   fireEvent.keyDown(document.body, { key: "/" });
   assert.equal(focused(), SEARCH);
   assert.equal(search.value, "");
-  await matchCount(view, "700 lines");
+  await waitForText(() => matchText(view), "700 lines");
 });
 
 test("escape closes a search that was typed into the field with the mouse", async () => {
@@ -190,11 +191,11 @@ test("escape closes a search that was typed into the field with the mouse", asyn
   const search = searchBox(view);
   fireEvent.change(search, { target: { value: "error" } });
   view.getByRole("button", { name: "Refresh log" }).focus();
-  await matchCount(view, `1 of ${MATCH_LINES.length} matches`);
+  await waitForText(() => matchText(view), `1 of ${MATCH_LINES.length} matches`);
 
   assert.equal(fireEvent.keyDown(document.activeElement, { key: "Escape" }), false);
   assert.equal(search.value, "");
-  await matchCount(view, "700 lines");
+  await waitForText(() => matchText(view), "700 lines");
 });
 
 test("escape is left to other consumers when no search is running", async () => {
@@ -224,7 +225,7 @@ test("the search keys are ignored while a modal dialog owns the keyboard", async
   fireEvent.keyDown(document.body, { key: "/" });
   fireEvent.change(search, { target: { value: "error" } });
   fireEvent.keyDown(search, { key: "Enter" });
-  await matchCount(view, `1 of ${MATCH_LINES.length} matches`);
+  await waitForText(() => matchText(view), `1 of ${MATCH_LINES.length} matches`);
 
   await act(async () => controller.beginClear());
   assert.ok(view.getByText("Clear shared API cache?"));
@@ -236,13 +237,13 @@ test("the search keys are ignored while a modal dialog owns the keyboard", async
 
   // n must not walk the log behind the dialog.
   assert.equal(fireEvent.keyDown(document.activeElement, { key: "n" }), true);
-  await matchCount(view, `1 of ${MATCH_LINES.length} matches`);
+  await waitForText(() => matchText(view), `1 of ${MATCH_LINES.length} matches`);
 
   // Escape belongs to the dialog alone, so the log search survives it.
   fireEvent.keyDown(document.activeElement, { key: "Escape" });
   assert.equal(view.queryAllByText("Clear shared API cache?").length, 0);
   assert.equal(search.value, "error");
-  await matchCount(view, `1 of ${MATCH_LINES.length} matches`);
+  await waitForText(() => matchText(view), `1 of ${MATCH_LINES.length} matches`);
 });
 
 test("a log refresh ends an open search and restores the row window", async () => {
@@ -250,20 +251,20 @@ test("a log refresh ends an open search and restores the row window", async () =
   const search = searchBox(view);
   const nextRows = view.getByRole("button", { name: "Next rows" });
   fireEvent.click(nextRows);
-  assert.equal(rowWindow(view), "301-600 of 700");
+  await waitForText(() => rowWindow(view), "301-600 of 700");
 
   fireEvent.keyDown(document.body, { key: "/" });
   fireEvent.change(search, { target: { value: "error" } });
   fireEvent.keyDown(search, { key: "Enter" });
-  await matchCount(view, `1 of ${MATCH_LINES.length} matches`);
-  assert.equal(rowWindow(view), "1-300 of 700");
+  await waitForText(() => matchText(view), `1 of ${MATCH_LINES.length} matches`);
+  await waitForText(() => rowWindow(view), "1-300 of 700");
 
   await act(async () => {
     fireEvent.click(view.getByRole("button", { name: "Refresh log" }));
   });
   assert.equal(search.value, "");
-  await matchCount(view, "700 lines");
-  assert.equal(rowWindow(view), "301-600 of 700");
+  await waitForText(() => matchText(view), "700 lines");
+  await waitForText(() => rowWindow(view), "301-600 of 700");
   assert.equal(view.container.querySelectorAll(".ci-log-match").length, 0);
 
   // Nothing is left running for Escape to close, and the keys still work.
@@ -319,15 +320,10 @@ function searchBox(view) {
 // The status text depends on the synchronous `matches` memo and on
 // `selectedMatch`, which a query change resets through a separate effect, so
 // a query or step event can need more than one commit before the text
-// settles. Wait for the expected string rather than reading it right away.
-async function matchCount(view, expected) {
-  await waitFor(() => {
-    assert.equal(
-      view.container.querySelector(".ci-match-count").textContent,
-      expected,
-    );
-  });
-  return expected;
+// settles. Every read of it, and of the row window and selected line that
+// follow it, waits for the expected value rather than reading it right away.
+function matchText(view) {
+  return view.container.querySelector(".ci-match-count").textContent;
 }
 
 function rowWindow(view) {
