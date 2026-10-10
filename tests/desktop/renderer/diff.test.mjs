@@ -23,7 +23,7 @@ Object.assign(globalThis, {
   HTMLElement: dom.window.HTMLElement,
   Node: dom.window.Node,
 });
-const { cleanup, render, waitFor } = desktopRequire("@testing-library/react");
+const { cleanup, fireEvent, render, waitFor } = desktopRequire("@testing-library/react");
 const React = desktopRequire("react");
 afterEach(() => {
   cleanup();
@@ -531,4 +531,337 @@ test("an old-side discussion on a renamed file resolves to its deleted line", ()
     }),
     null,
   );
+});
+
+// #305: a layout switch is a view of the diff already read, and the diff is
+// drawn from its first page while the rest is still arriving.
+
+function fileRow(index, path) {
+  return {
+    kind: "file",
+    file_index: index,
+    old_path: path,
+    new_path: path,
+    status: "modified",
+    additions: 1,
+    deletions: 0,
+    is_binary: false,
+    language: "python",
+    is_truncated: false,
+    is_empty: false,
+    is_mode_only: false,
+    is_rename_only: false,
+    is_unavailable: false,
+  };
+}
+
+function hunkRow(fileIndex) {
+  return {
+    kind: "hunk",
+    file_index: fileIndex,
+    hunk_index: 0,
+    header: "@@ -0,0 +1 @@",
+    old_start: 0,
+    old_count: 0,
+    new_start: 1,
+    new_count: 1,
+    context_text: "",
+  };
+}
+
+function sourceRow(fileIndex, layout, content) {
+  const line = { old_line: null, new_line: 1, content, line_type: "addition" };
+  return layout === "split"
+    ? {
+        kind: "split",
+        file_index: fileIndex,
+        hunk_index: 0,
+        row_index: 0,
+        old: null,
+        new: { ...line, anchor_side: "new" },
+      }
+    : { kind: "line", file_index: fileIndex, hunk_index: 0, ...line };
+}
+
+function fileRows(fileIndex, layout) {
+  const path = `src/file_${fileIndex}.py`;
+  return [
+    fileRow(fileIndex, path),
+    hunkRow(fileIndex),
+    sourceRow(fileIndex, layout, `value_${fileIndex} = ${fileIndex}`),
+  ];
+}
+
+function diffBridge(review, { openDiff, pageDiff }) {
+  return {
+    cancelRead: async () => true,
+    openExternal: async () => true,
+    getReview: trackedDetail({}).getReview,
+    openDiff,
+    pageDiff,
+    listDiscussions: () =>
+      settledRead({
+        snapshot_id: "discussions-snapshot",
+        resource: review,
+        revision: { discussion_count: 0 },
+        cursor: 0,
+        next_cursor: null,
+        discussions: [],
+      }),
+    pageDiscussions: () => {
+      throw new Error("the fixture discussions have one page");
+    },
+    getReviewMutationCapabilities: () =>
+      settledRead({
+        review,
+        capabilities: {
+          general_comment: true,
+          inline_comment: true,
+          multiline_comment: true,
+          reply: true,
+          resolve: true,
+          approve: true,
+          request_changes: true,
+          comment_verdict: true,
+          atomic_review_batch: false,
+        },
+      }),
+    listReviewDrafts: () =>
+      settledRead({ cursor: 0, next_cursor: null, drafts: [] }),
+  };
+}
+
+function renderDiff(review, bridge) {
+  const feature = createDiffFeature();
+  const route = {
+    kind: "review",
+    item: { handle: review, repository: "repo", summary: overflowSummary() },
+    panel: "diff",
+  };
+  function Harness() {
+    const [inlineAnchor, setInlineAnchor] = React.useState(null);
+    const queries = React.useMemo(() => new QueryCoordinator(bridge), []);
+    return feature.render(
+      {
+        bridge,
+        queries,
+        repositories: [
+          { handle: "repo", display_name: "acme/widgets", forge_type: "gitlab" },
+        ],
+        repositoriesReady: true,
+        repositoryGeneration: 1,
+        reviewPanels: [{ id: "diff", label: "Files changed", order: 20 }],
+        inlineAnchor,
+        selectInlineAnchor: setInlineAnchor,
+        navigate: () => {},
+      },
+      route,
+    );
+  }
+  return render(React.createElement(Harness));
+}
+
+function filePaths(view) {
+  return [
+    ...view.container.querySelectorAll(
+      ".file-list .file-item:not(.hunk-item) > span:first-child",
+    ),
+  ].map((node) => node.textContent);
+}
+
+function lineTexts(view, selector) {
+  return [...view.container.querySelectorAll(selector)].map(
+    (node) => node.textContent,
+  );
+}
+
+function loadingTexts(view) {
+  return lineTexts(view, ".notice-loading");
+}
+
+test("diff reconstruction reports the pages read so far before the next page", async () => {
+  const order = [];
+  const bridge = {
+    cancelRead: async () => true,
+    openDiff: (params) => {
+      order.push(`open:${params.from_snapshot ?? "fresh"}`);
+      return read("open", {
+        snapshot_id: "s2",
+        resource: "review",
+        revision,
+        cursor: 0,
+        next_cursor: 3,
+        entries: fileRows(0, "split"),
+      });
+    },
+    pageDiff: () => {
+      order.push("page");
+      return read("page", {
+        snapshot_id: "s2",
+        resource: "review",
+        revision,
+        cursor: 3,
+        next_cursor: null,
+        entries: fileRows(1, "split"),
+      });
+    },
+  };
+  const result = await loadAllPages(
+    "review",
+    "split",
+    bridge,
+    new QueryCoordinator(bridge),
+    {
+      fromSnapshot: "s1",
+      onProgress: (loaded) =>
+        order.push(`progress:${loaded.rows.length}:${loaded.loadingMore}`),
+    },
+  );
+  assert.deepEqual(order, ["open:s1", "progress:3:true", "page"]);
+  assert.equal(result.rows.length, 6);
+  assert.equal(result.loadingMore, false);
+  assert.equal(result.snapshotId, "s2");
+});
+
+test("switching the layout re-projects the open snapshot and Refresh reads afresh", async () => {
+  const review = "review-305";
+  const opens = [];
+  let snapshots = 0;
+  const bridge = diffBridge(review, {
+    openDiff: (params) => {
+      opens.push({ ...params });
+      snapshots += 1;
+      return settledRead({
+        snapshot_id: `snapshot-${snapshots}`,
+        resource: review,
+        revision,
+        cursor: 0,
+        next_cursor: null,
+        entries: fileRows(0, params.layout),
+      });
+    },
+    pageDiff: () => {
+      throw new Error("the fixture diff has one page");
+    },
+  });
+  const view = renderDiff(review, bridge);
+  await waitFor(() =>
+    assert.deepEqual(lineTexts(view, ".diff-unified .line-content"), [
+      "+value_0 = 0",
+    ]),
+  );
+
+  fireEvent.click(view.getByText("Split"));
+  await waitFor(() =>
+    assert.equal(
+      view.container.querySelectorAll(".diff-split .split-cell .line-content")
+        .length > 0,
+      true,
+    ),
+  );
+  fireEvent.click(view.getByText("Unified"));
+  await waitFor(() => assert.equal(opens.length, 3));
+  await waitFor(() =>
+    assert.deepEqual(lineTexts(view, ".diff-unified .line-content"), [
+      "+value_0 = 0",
+    ]),
+  );
+  fireEvent.click(view.getByText("Refresh"));
+  await waitFor(() => assert.equal(opens.length, 4));
+
+  assert.deepEqual(opens, [
+    { review, layout: "unified", max_items: 1000 },
+    { review, layout: "split", max_items: 1000, from_snapshot: "snapshot-1" },
+    { review, layout: "unified", max_items: 1000, from_snapshot: "snapshot-2" },
+    { review, layout: "unified", max_items: 1000 },
+  ]);
+  // Only the first open and the Refresh may read the forge.
+  assert.equal(
+    opens.filter((params) => params.from_snapshot === undefined).length,
+    2,
+  );
+});
+
+test("the diff is drawn from its first page while the rest is loading", async () => {
+  const review = "review-progressive";
+  let releasePage = () => {};
+  let pages = 0;
+  const bridge = diffBridge(review, {
+    openDiff: () =>
+      settledRead({
+        snapshot_id: "snapshot-progressive",
+        resource: review,
+        revision,
+        cursor: 0,
+        next_cursor: 3,
+        entries: fileRows(0, "unified"),
+      }),
+    pageDiff: () => {
+      pages += 1;
+      return {
+        requestToken: crypto.randomUUID(),
+        result: new Promise((resolve) => {
+          releasePage = () =>
+            resolve({
+              snapshot_id: "snapshot-progressive",
+              resource: review,
+              revision,
+              cursor: 3,
+              next_cursor: null,
+              entries: fileRows(1, "unified"),
+            });
+        }),
+      };
+    },
+  });
+  const view = renderDiff(review, bridge);
+
+  await waitFor(() => assert.deepEqual(filePaths(view), ["src/file_0.py"]));
+  assert.deepEqual(lineTexts(view, ".diff-unified .line-content"), [
+    "+value_0 = 0",
+  ]);
+  assert.deepEqual(loadingTexts(view), ["Loading the rest of the diff…"]);
+  await waitFor(() => assert.equal(pages, 1));
+
+  releasePage();
+  await waitFor(() =>
+    assert.deepEqual(filePaths(view), ["src/file_0.py", "src/file_1.py"]),
+  );
+  assert.deepEqual(loadingTexts(view), []);
+  // The reader stays on the file they were reading when the rest arrives.
+  assert.deepEqual(lineTexts(view, ".diff-unified .line-content"), [
+    "+value_0 = 0",
+  ]);
+});
+
+test("a page that fails after the first keeps the drawn rows as a partial diff", async () => {
+  const review = "review-partial";
+  const bridge = diffBridge(review, {
+    openDiff: () =>
+      settledRead({
+        snapshot_id: "snapshot-partial",
+        resource: review,
+        revision,
+        cursor: 0,
+        next_cursor: 3,
+        entries: fileRows(0, "unified"),
+      }),
+    pageDiff: () => ({
+      requestToken: crypto.randomUUID(),
+      result: Promise.reject({
+        code: "snapshot_expired",
+        message: "The resource snapshot is invalid or expired; refetch it.",
+        retryable: true,
+      }),
+    }),
+  });
+  const view = renderDiff(review, bridge);
+
+  await waitFor(() =>
+    assert.deepEqual(lineTexts(view, ".notice-error"), [
+      "This diff snapshot expired. Reload the diff to continue.",
+    ]),
+  );
+  assert.deepEqual(filePaths(view), ["src/file_0.py"]);
+  assert.deepEqual(loadingTexts(view), []);
 });

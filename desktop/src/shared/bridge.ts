@@ -88,7 +88,12 @@ export interface SplitDiffRow { readonly kind: "split"; readonly file_index: num
 export type DiffRow = DiffFileRow | DiffHunkRow | DiffLineRow | SplitDiffRow;
 export interface SnapshotPage<T, R extends JsonObject> { readonly snapshot_id: string; readonly resource: OpaqueHandle; readonly revision: R; readonly cursor: number; readonly next_cursor: number | null; readonly entries: readonly T[]; }
 export type DiffPage = SnapshotPage<DiffRow, ReviewRevisionDto & JsonObject>;
-export interface OpenDiffParams { readonly review: OpaqueHandle; readonly layout?: DiffLayout; readonly max_items?: number; }
+/**
+ * `from_snapshot` names a diff snapshot already open for this review. The
+ * sidecar then projects the same read again in `layout`, with no forge request,
+ * or reads the forge afresh when it no longer holds that read.
+ */
+export interface OpenDiffParams { readonly review: OpaqueHandle; readonly layout?: DiffLayout; readonly max_items?: number; readonly from_snapshot?: string; }
 export interface PageParams { readonly snapshot: string; readonly resource: OpaqueHandle; readonly cursor: number; readonly max_items?: number; }
 
 /** `file_path` is null on a review-level note, which carries no inline position. */

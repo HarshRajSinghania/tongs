@@ -33,7 +33,11 @@ from tongs.desktop.protocol.ci_operations import (
     CI_METHODS,
     CIOperations,
 )
-from tongs.desktop.protocol.diff_projection import DiffLayout, flatten_diff
+from tongs.desktop.protocol.diff_projection import (
+    ConvertedDiffCache,
+    DiffLayout,
+    flatten_diff,
+)
 from tongs.desktop.protocol.messages import (
     DEFAULT_JSON_LIMITS,
     MAX_EVENT_FRAME_BYTES,
@@ -372,6 +376,9 @@ class DesktopSidecarServer:
         # so a CI lookup never takes a commit from the renderer.
         self._review_heads: dict[ReviewRef, str] = {}
         self._snapshots = SnapshotStore()
+        # Converted files of recent diff reads, so a layout switch re-projects
+        # the read the reader sees instead of reading the forge again.
+        self._diff_cache = ConvertedDiffCache()
         self._assets = AssetCatalog()
         self._operations: dict[str, _Operation] = {}
         self._pending: dict[str, _PendingRequest] = {}
@@ -887,9 +894,18 @@ class DesktopSidecarServer:
         return self._review_snapshot_wire(snapshot)
 
     async def _diff_open(self, params: JsonObject, _context: RequestContext) -> object:
+        """Project a review's diff in one layout and return its first page.
+
+        With ``from_snapshot`` naming a diff snapshot this connection projected
+        for the same review, the files of that read are projected again from
+        the sidecar's cache, so a layout switch makes no forge request and
+        shows the same revision. A snapshot the cache no longer holds falls
+        back to a fresh read. An open without it is a fresh read, and it drops
+        the review's cached files before reading.
+        """
         _require_params(
             params,
-            allowed=frozenset({"review", "layout", "max_items"}),
+            allowed=frozenset({"review", "layout", "max_items", "from_snapshot"}),
             required=frozenset({"review"}),
         )
         try:
@@ -901,12 +917,25 @@ class DesktopSidecarServer:
                 ProtocolErrorCode.INVALID_PARAMS,
                 "The diff layout is invalid.",
             ) from None
+        source = (
+            _text(params, "from_snapshot", max_length=100)
+            if "from_snapshot" in params
+            else None
+        )
         review_handle = _text(params, "review", max_length=100)
         review = self._handles.resolve(review_handle, HandleKind.REVIEW, ReviewRef)
-        raw = await self._session.get_raw_diff(review)
-        files = convert_forge_changes(raw.changes)
+        cached = (
+            None if source is None else self._diff_cache.lookup(review_handle, source)
+        )
+        if cached is None:
+            self._diff_cache.drop(review_handle)
+            raw = await self._session.get_raw_diff(review)
+            files = convert_forge_changes(raw.changes)
+            revision = cast(JsonObject, to_json_value(raw.revision))
+        else:
+            files = cached.files
+            revision = cached.revision
         entries = flatten_diff(files, layout)
-        revision = cast(JsonObject, to_json_value(raw.revision))
         snapshot_id = self._snapshots.create(
             review_handle,
             revision,
@@ -914,6 +943,10 @@ class DesktopSidecarServer:
             projection=layout.value,
             kind=_DIFF_SNAPSHOT,
         )
+        if cached is None:
+            self._diff_cache.store(review_handle, snapshot_id, revision, files)
+        else:
+            self._diff_cache.remember(review_handle, snapshot_id)
         return self._snapshot_page_wire(
             self._snapshots.page(
                 snapshot_id,
@@ -1419,6 +1452,7 @@ class DesktopSidecarServer:
             resource_handle = self._handles.find(HandleKind.REVIEW, event.resource)
             if resource_handle is not None:
                 self._snapshots.expire_for_resource(resource_handle)
+                self._diff_cache.drop(resource_handle)
         elif isinstance(event.resource, PipelineRef):
             resource_handle = self._handles.find(HandleKind.PIPELINE, event.resource)
         await self._events.publish(
@@ -1498,6 +1532,7 @@ class DesktopSidecarServer:
         if self._editor_exports is not None:
             await _bounded_cleanup(self._editor_exports.close(), self._shutdown_timeout)
         self._snapshots.clear()
+        self._diff_cache.clear()
         self._handles.clear()
         self._assets.clear()
         await self._events.close()
