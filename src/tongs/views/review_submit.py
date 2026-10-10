@@ -29,6 +29,7 @@ from tongs.state.drafts import (
     ReconciliationResolution,
     ReplyDraftComment,
 )
+from tongs.widgets.two_press import TwoPressConfirm
 
 
 class ReviewSubmitActionKind(str, Enum):
@@ -130,7 +131,7 @@ class ReviewSubmitScreen(ModalScreen[ReviewSubmitAction | None]):
             else draft.verdict
         ) or DraftVerdict.COMMENT
         self._comment_ids: list[UUID] = []
-        self._pending_confirmation: str | None = None
+        self._two_press = TwoPressConfirm()
 
     @property
     def paused(self) -> bool:
@@ -308,7 +309,7 @@ class ReviewSubmitScreen(ModalScreen[ReviewSubmitAction | None]):
         if self.supports_request_changes:
             verdicts.append(DraftVerdict.REQUEST_CHANGES)
         self._verdict = verdicts[(verdicts.index(self._verdict) + 1) % len(verdicts)]
-        self._pending_confirmation = None
+        self._two_press.reset()
         self._render_state()
 
     def action_submit(self) -> None:
@@ -427,7 +428,8 @@ class ReviewSubmitScreen(ModalScreen[ReviewSubmitAction | None]):
             ReconciliationResolution.MARK_SUBMITTED: "Mark submitted only after inspecting the forge.",
         }[resolution]
         if not self._confirm(
-            f"reconcile:{resolution.value}", f"{warning} Press again to confirm."
+            f"reconcile:{resolution.value}:{self.progress.attempt_id}",
+            f"{warning} Press again to confirm.",
         ):
             return
         self.dismiss(
@@ -455,12 +457,11 @@ class ReviewSubmitScreen(ModalScreen[ReviewSubmitAction | None]):
         return self._comment_ids[highlighted]
 
     def _confirm(self, key: str, message: str) -> bool:
-        if self._pending_confirmation != key:
-            self._pending_confirmation = key
-            self.notify(message, severity="warning")
-            return False
-        self._pending_confirmation = None
-        return True
+        """Confirm only a second press on the same key within the timeout."""
+        if self._two_press.arm(key):
+            return True
+        self.notify(message, severity="warning")
+        return False
 
 
 __all__ = ["ReviewSubmitAction", "ReviewSubmitActionKind", "ReviewSubmitScreen"]

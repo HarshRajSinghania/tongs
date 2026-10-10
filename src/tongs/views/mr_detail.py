@@ -105,6 +105,7 @@ from tongs.widgets.review_draft import (
     inline_markers,
 )
 from tongs.widgets.split_diff import DiffSelection
+from tongs.widgets.two_press import TwoPressConfirm
 
 
 def _ci_label(status: CIStatus) -> str:
@@ -252,6 +253,7 @@ class MRDetailScreen(Screen):
         self._pending_draft_start_line: int | None = None
         self._pending_draft_start_side: DiffSide | None = None
         self._current_discussion_ids: set[str] = set()
+        self._two_press = TwoPressConfirm()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -989,12 +991,14 @@ class MRDetailScreen(Screen):
     def action_focus_tab(self, tab_id: str) -> None:
         tabbed = self.query_one(TabbedContent)
         tabbed.active = tab_id
+        self._two_press.reset()
         self._on_tab_switch(tab_id)
 
     def on_tabbed_content_tab_activated(
         self, event: TabbedContent.TabActivated
     ) -> None:
         tab_id = event.pane.id
+        self._two_press.reset()
         if tab_id:
             self._on_tab_switch(tab_id)
 
@@ -1381,7 +1385,6 @@ class MRDetailScreen(Screen):
             self._clear_pending_draft_editor()
         editor.open_general(defer_close=draft is not None)
 
-    _pending_action: str = ""
     _action_taken: bool = False
 
     def _check_open(self) -> bool:
@@ -1390,19 +1393,24 @@ class MRDetailScreen(Screen):
             return False
         return True
 
+    def _confirm_action(self, action: str) -> bool:
+        """Arm or confirm one MR action on this review at its current head."""
+        summary = self.mr_summary
+        head_sha = self.mr_detail.head_sha if self.mr_detail is not None else ""
+        review = (summary.forge_host, summary.repo_path, summary.number)
+        return self._two_press.arm((action, review, head_sha))
+
     def action_approve(self) -> None:
         if not self._check_open():
             return
         if self._review_draft is not None:
             self._show_review_draft()
             return
-        if self._pending_action == "approve":
-            self._pending_action = ""
+        if self._confirm_action("approve"):
             intent = self._begin_mutation("approve", "Approval")
             if intent is not None:
                 self._do_approve(intent)
         else:
-            self._pending_action = "approve"
             self.notify(
                 f"Approve !{self.mr_summary.number}? Press A again to confirm.",
                 severity="warning",
@@ -1411,13 +1419,11 @@ class MRDetailScreen(Screen):
     def action_unapprove(self) -> None:
         if not self._check_open():
             return
-        if self._pending_action == "unapprove":
-            self._pending_action = ""
+        if self._confirm_action("unapprove"):
             intent = self._begin_mutation("unapprove", "Unapprove")
             if intent is not None:
                 self._do_unapprove(intent)
         else:
-            self._pending_action = "unapprove"
             self.notify(
                 f"Revoke approval on !{self.mr_summary.number}? Press U again.",
                 severity="warning",
@@ -1426,13 +1432,11 @@ class MRDetailScreen(Screen):
     def action_merge(self) -> None:
         if not self._check_open():
             return
-        if self._pending_action == "merge":
-            self._pending_action = ""
+        if self._confirm_action("merge"):
             intent = self._begin_mutation("merge", "Merge")
             if intent is not None:
                 self._do_merge(intent)
         else:
-            self._pending_action = "merge"
             self.notify(
                 f"Merge !{self.mr_summary.number} into {self.mr_summary.target_branch}? "
                 "Press M again to confirm.",
@@ -1443,13 +1447,11 @@ class MRDetailScreen(Screen):
     def action_close_mr(self) -> None:
         if not self._check_open():
             return
-        if self._pending_action == "close":
-            self._pending_action = ""
+        if self._confirm_action("close"):
             intent = self._begin_mutation("close", "Close")
             if intent is not None:
                 self._do_close(intent)
         else:
-            self._pending_action = "close"
             self.notify(
                 f"Close !{self.mr_summary.number}? Press X again to confirm.",
                 severity="warning",
@@ -2122,6 +2124,7 @@ class MRDetailScreen(Screen):
             )
 
     def action_refresh(self) -> None:
+        self._two_press.reset()
         self._diff_loaded = False
         self._commits_loaded = False
         self._discussions_loaded = False

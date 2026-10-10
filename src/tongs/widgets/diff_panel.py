@@ -40,6 +40,7 @@ from tongs.widgets.split_diff import (
     is_actionable,
     placeholder_message,
 )
+from tongs.widgets.two_press import TwoPressConfirm
 
 
 class CommentMode(Enum):
@@ -197,7 +198,7 @@ class DiffOptionList(OptionList):
         self._comment_map: dict[int, list[Discussion]] = {}
         self._expanded_threads: set[str] = set()
         self._comment_indices: list[int] = []
-        self._pending_resolve: str | None = None
+        self._resolve_confirm = TwoPressConfirm()
         self._explicit_selection_side: DiffSide | None = None
 
     _ADDITION_BG = VisualStyle(background=TextualColor(0, 40, 0))
@@ -393,11 +394,9 @@ class DiffOptionList(OptionList):
         if not disc.resolvable:
             self.app.notify("Thread resolution not supported")
             return
-        if self._pending_resolve == disc.id:
-            self._pending_resolve = None
+        if self._resolve_confirm.arm(disc.id):
             self.post_message(ResolveRequested(disc.id, resolved=not disc.is_resolved))
         else:
-            self._pending_resolve = disc.id
             action = "Unresolve" if disc.is_resolved else "Resolve"
             self.app.notify(
                 f"{action} thread by @{disc.root_comment.author.username}? Press R again.",
@@ -704,6 +703,7 @@ class DiffContent(Widget):
         option_list._current_file = file
         option_list._selection_anchor = None
         option_list._explicit_selection_side = None
+        option_list._resolve_confirm.reset()
 
         if file.is_binary or not file.hunks:
             # One shared line with the split view, so a binary, empty, mode
@@ -844,7 +844,7 @@ class DiffContent(Widget):
         option_list._expanded_threads.clear()
         option_list._current_file = None
         option_list._selection_anchor = None
-        option_list._pending_resolve = None
+        option_list._resolve_confirm.reset()
         option_list._explicit_selection_side = None
         option_list.add_option(
             Option(Text(message, style=Style(dim=True)), disabled=True)

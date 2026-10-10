@@ -10,7 +10,7 @@ from typing import cast
 import pytest
 from textual.widgets import OptionList, Static, TextArea
 
-from tests.test_tui_mr_services import _app, _settle, _wait_until
+from tests.test_tui_mr_services import _app, _Clock, _settle, _wait_until
 from tongs.errors import RateLimitError, ValidationError
 from tongs.forges.models import ReviewDecision
 from tongs.services.review_submission import SubmissionFailure, SubmissionOutcome
@@ -35,6 +35,7 @@ from tongs.widgets.split_diff import (
     SplitDiffColumn,
     SplitDiffView,
 )
+from tongs.widgets.two_press import TwoPressConfirm
 
 
 async def _open_detail(app, pilot) -> MRDetailScreen:
@@ -515,6 +516,36 @@ async def test_discard_requires_confirmation_and_never_calls_forge(
         assert not any(
             call[0] in {"comment", "inline", "reply", "verdict"} for call in forge.calls
         )
+
+
+@pytest.mark.asyncio
+async def test_discard_pressed_late_rearms_instead_of_discarding(
+    tmp_path: Path,
+) -> None:
+    app, _forge = _app(tmp_path)
+    clock = _Clock()
+
+    async with app.run_test(notifications=True) as pilot:
+        screen = await _open_detail(app, pilot)
+        screen.action_review_draft()
+        await _wait_until(app, lambda: screen._review_draft is not None)
+        screen.action_review_draft()
+        await _wait_until(app, lambda: isinstance(app.screen, ReviewSubmitScreen))
+        modal = cast(ReviewSubmitScreen, app.screen)
+        modal._two_press = TwoPressConfirm(clock=clock)
+
+        await pilot.press("D")
+        clock.now += 6.0
+        await pilot.press("D")
+        await _settle(app)
+        assert app.screen is modal
+        assert screen._review_draft is not None
+        assert len(await app.session.drafts.list_drafts()) == 1
+
+        clock.now += 1.0
+        await pilot.press("D")
+        await _wait_until(app, lambda: screen._review_draft is None)
+        assert await app.session.drafts.list_drafts() == ()
 
 
 @pytest.mark.asyncio
