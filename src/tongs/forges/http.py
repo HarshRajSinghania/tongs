@@ -36,6 +36,10 @@ _MAX_HEADER_DIGITS = 12
 
 # Retry sleeps go through this name so tests can observe them without waiting.
 _sleep = asyncio.sleep
+#: Methods safe to send twice. A rate-limited write fails at once instead of
+#: sleeping and resending, so callers with their own deadline (review
+#: submission) report the rate limit rather than an unknown outcome.
+_RETRYABLE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
 class HostRequestLimiter:
@@ -329,8 +333,10 @@ async def request(
 
     Returns parsed JSON response body.
     Raises appropriate ForgeError subclass on failure.
-    On a rate limit, waits ``retry_after`` seconds and retries once, unless the
-    wait is longer than ``MAX_RETRY_AFTER_SECONDS``. A timeout is not retried.
+    On a rate limit, a GET, HEAD or OPTIONS request waits ``retry_after``
+    seconds and retries once, unless the wait is longer than
+    ``MAX_RETRY_AFTER_SECONDS``. A rate-limited write raises at once. A timeout
+    is not retried.
     """
     response = await _send(client, method, path, _retried=_retried, **kwargs)
     if response.status_code == 204:
@@ -393,7 +399,11 @@ async def _send(
 
     if response.status_code >= 400:
         err = map_http_error(response)
-        if isinstance(err, RateLimitError) and not _retried:
+        if (
+            isinstance(err, RateLimitError)
+            and not _retried
+            and method.upper() in _RETRYABLE_METHODS
+        ):
             delay = (
                 err.retry_after
                 if err.retry_after is not None

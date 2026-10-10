@@ -420,6 +420,25 @@ class TestRateLimitWaits:
         assert sleeps == [http.DEFAULT_RETRY_AFTER_SECONDS]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+    async def test_rate_limited_write_fails_at_once(self, sleeps, method):
+        calls = 0
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(
+                429, json={"message": "slow down"}, headers={"Retry-After": "45"}
+            )
+
+        async with _make_async_client(handler) as client:
+            with pytest.raises(RateLimitError) as caught:
+                await request(client, method, "/projects/1/notes", json={"b": "x"})
+        assert caught.value.retry_after == 45
+        assert calls == 1
+        assert sleeps == []
+
+    @pytest.mark.asyncio
     async def test_timeout_is_never_retried(self, sleeps):
         calls = 0
 
