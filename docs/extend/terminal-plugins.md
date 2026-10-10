@@ -194,12 +194,11 @@ tongs ships one built-in plugin, registered through the same entry points.
 
 ### MCP server (`mcp`)
 
-The `mcp` plugin adds a **Start MCP Server** command to the palette when the
+The `mcp` plugin adds an **MCP Server Setup** command to the palette when the
 optional MCP dependency is installed (`pip install "tongs[mcp]"`). Without
-that extra, it adds no command. The command launches
-`python -m tongs.mcp.server` in the background. MCP clients normally start the
-server themselves; see [MCP server](/extend/mcp/) for setup and the tools it
-offers.
+that extra, it adds no command. The command shows how to register `tongs-mcp`
+with an MCP client and does not start a server, because MCP clients start it
+themselves; see [MCP server](/extend/mcp/) for setup and the tools it offers.
 
 tongs registers it in its own `pyproject.toml`:
 
@@ -348,5 +347,6 @@ instance with `ctx.push_screen()` instead.
 :::note
 Plugin errors are logged and do not stop the app. If a plugin fails to load,
 or raises in a lifecycle hook, `get_commands` or `get_screens`, tongs logs a
-warning and carries on.
+warning and carries on. If a palette command callback raises, tongs also shows
+an error notice.
 :::

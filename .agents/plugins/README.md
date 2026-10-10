@@ -95,9 +95,9 @@ The `plugin_config` dict is loaded in `config.py:load_config()` from the `[plugi
 
 Defined in `src/tongs/mcp/plugin.py`. Demonstrates the plugin pattern:
 
-- `name = "mcp"`, `version = "0.2.0"`
-- `get_commands()` returns one command, "Start MCP Server", which launches `tongs-mcp` as a subprocess, but only when the optional `mcp` extra is installed; otherwise it returns no commands
-- No lifecycle hooks, no screens
+- `name = "mcp"`, `version = "0.3.0"`
+- `get_commands()` returns one command, "MCP Server Setup", which shows the `tongs-mcp` registration command in a notice and starts no process, but only when the optional `mcp` extra is installed; otherwise it returns no commands
+- Lifecycle hooks only keep the `PluginContext` for that notice; no screens
 - Registered as the `mcp` entry point in `pyproject.toml`
 
 ## MCP Server
@@ -219,11 +219,14 @@ session-local handles. Package and filesystem paths are not renderer inputs.
 `DesktopPluginRegistry.discover()` is single-use. It produces stable-ID-ordered
 immutable records with `discovered`, `disabled`, `terminal_only`, `incompatible`,
 or `failed` state. `start_all()` moves successful providers to `started`.
-`stop_all()` processes providers in reverse ID order and moves successful
-providers to `stopped`; a retained earlier failure is not erased.
+`stop_all()` first signals every provider (stopping flag, lifecycle and call
+cancellation, pending tasks), then runs every `stop()` concurrently and moves
+successful providers to `stopped`; a retained earlier failure is not erased.
 
-Default deadlines are 10 seconds for start, 30 seconds for a call, and 2 seconds
-for aggregate provider cleanup. Shutdown signals lifecycle and per-call
+`start_all()` starts every provider concurrently under one overall budget.
+Default deadlines are 6 seconds for all starts together (below Electron's
+10 second sidecar start limit), 25 seconds for a call (below Electron's 30
+second request timeout), and 2 seconds for aggregate provider cleanup. Shutdown signals lifecycle and per-call
 cancellation, cancels pending tasks, and bounds cleanup even when trusted plugin
 code suppresses cancellation. A timed-out invocation ID remains reserved until
 its provider task actually exits. Failures are typed `DesktopPluginError`
