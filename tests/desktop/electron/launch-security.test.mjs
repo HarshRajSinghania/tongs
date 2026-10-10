@@ -65,9 +65,21 @@ test("reviews.ci_status takes one review handle and an optional fresh flag", () 
     assert.throws(() => assertParams("reviews.ci_status", { review }), /Invalid desktop/, JSON.stringify(review));
   }
   for (const status of ["pending", "running", "success", "failed", "canceled", "skipped", "unknown"]) {
-    assertResult("reviews.ci_status", { ci_status: status });
+    assertResult("reviews.ci_status", { ci_status: status, retry_after_seconds: null });
   }
-  for (const value of [{}, { ci_status: "" }, { ci_status: "green" }, { ci_status: null }, { ci_status: 1 }, { ci_status: "success", head_sha: "abc" }]) {
+  // A rate-limited lookup knows no status and names a bounded wait.
+  for (const wait of [1, 120, 86_400]) {
+    assertResult("reviews.ci_status", { ci_status: "unknown", retry_after_seconds: wait });
+  }
+  for (const value of [
+    {}, { ci_status: "success" }, { ci_status: "", retry_after_seconds: null }, { ci_status: "green", retry_after_seconds: null },
+    { ci_status: null, retry_after_seconds: null }, { ci_status: 1, retry_after_seconds: null },
+    { ci_status: "success", retry_after_seconds: null, head_sha: "abc" },
+    { ci_status: "unknown", retry_after_seconds: 0 }, { ci_status: "unknown", retry_after_seconds: -1 },
+    { ci_status: "unknown", retry_after_seconds: 1.5 }, { ci_status: "unknown", retry_after_seconds: 86_401 },
+    { ci_status: "unknown", retry_after_seconds: "60" }, { ci_status: "unknown", retry_after_seconds: true },
+    { ci_status: "success", retry_after_seconds: 60 },
+  ]) {
     assert.throws(() => assertResult("reviews.ci_status", value), /Invalid reviews.ci_status result/, JSON.stringify(value));
   }
 });

@@ -67,7 +67,12 @@ export const CI_STATUS_VALUES: readonly CIStatusValue[] = Object.freeze([
 ]);
 /** `fresh` reads past the service's CI cache, as after an explicit refresh. */
 export interface ReviewCIStatusParams { readonly review: OpaqueHandle; readonly fresh?: boolean; }
-export interface ReviewCIStatusResult { readonly ci_status: CIStatusValue; }
+/**
+ * `retry_after_seconds` is null unless the forge host is rate limited: the
+ * lookup then made no status known (`ci_status` is `unknown`) and lookups can
+ * start again after that many seconds.
+ */
+export interface ReviewCIStatusResult { readonly ci_status: CIStatusValue; readonly retry_after_seconds: number | null; }
 export interface ReviewSnapshotDto {
   readonly handle: OpaqueHandle; readonly repository: OpaqueHandle;
   readonly detail: ReviewDetailDto; readonly capabilities: ForgeCapabilitiesDto;
