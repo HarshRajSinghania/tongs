@@ -31,6 +31,7 @@ from tongs.widgets.split_diff import (
     is_actionable,
     placeholder_message,
 )
+from tongs.widgets.two_press import TwoPressConfirm
 
 
 def _file() -> DiffFile:
@@ -353,6 +354,116 @@ async def test_discussion_state_and_actions_survive_layout_changes() -> None:
         assert [(event.discussion_id, event.resolved) for event in app.resolutions] == [
             (discussion.id, True)
         ]
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.mark.asyncio
+async def test_split_resolve_pressed_late_rearms_instead_of_resolving() -> None:
+    app = _DiffApp()
+    clock = _Clock()
+
+    async with app.run_test(size=(160, 35), notifications=True) as pilot:
+        panel = app.query_one(DiffPanel)
+        panel.set_files([_file()], [_discussion()])
+        panel.request_mode(DiffViewMode.SPLIT)
+        await pilot.pause()
+        split = app.query_one(SplitDiffView)
+        assert split.jump_to(21, DiffSide.NEW)
+        new = app.query_one("#split-new", SplitDiffColumn)
+        new._resolve_confirm = TwoPressConfirm(clock=clock)
+
+        new.action_resolve_discussion()
+        clock.now += 6.0
+        new.action_resolve_discussion()
+        await pilot.pause()
+        assert app.resolutions == []
+        clock.now += 1.0
+        new.action_resolve_discussion()
+        await pilot.pause()
+        assert [event.discussion_id for event in app.resolutions] == ["thread-1"]
+
+        new.action_resolve_discussion()
+        panel.show_placeholder("Loading diff...")
+        assert not new._resolve_confirm.armed
+
+
+@pytest.mark.asyncio
+async def test_split_file_switch_clears_an_armed_resolve() -> None:
+    app = _DiffApp()
+    discussion = _discussion()
+
+    async with app.run_test(size=(160, 35), notifications=True) as pilot:
+        panel = app.query_one(DiffPanel)
+        panel.set_files([_file()], [discussion])
+        panel.request_mode(DiffViewMode.SPLIT)
+        await pilot.pause()
+        split = app.query_one(SplitDiffView)
+        old = app.query_one("#split-old", SplitDiffColumn)
+        new = app.query_one("#split-new", SplitDiffColumn)
+        assert split.jump_to(21, DiffSide.NEW)
+        new.action_resolve_discussion()
+        old._resolve_confirm.arm(discussion.id)
+        assert new._resolve_confirm.armed
+        assert old._resolve_confirm.armed
+
+        split.show_file(_file(), [discussion], {})
+        await pilot.pause()
+        assert not new._resolve_confirm.armed
+        assert not old._resolve_confirm.armed
+
+        # The next press after the switch arms again instead of resolving.
+        assert split.jump_to(21, DiffSide.NEW)
+        new.action_resolve_discussion()
+        await pilot.pause()
+        assert app.resolutions == []
+        new.action_resolve_discussion()
+        await pilot.pause()
+        assert [event.discussion_id for event in app.resolutions] == [discussion.id]
+
+
+@pytest.mark.asyncio
+async def test_unified_resolve_expires_and_a_rerender_clears_it() -> None:
+    app = _DiffApp()
+    clock = _Clock()
+    discussion = _discussion()
+
+    async with app.run_test(size=(160, 35), notifications=True) as pilot:
+        panel = app.query_one(DiffPanel)
+        panel.set_files([_file()], [discussion])
+        panel.request_mode(DiffViewMode.UNIFIED)
+        await pilot.pause()
+        content = app.query_one(DiffContent)
+        unified = app.query_one(DiffOptionList)
+        unified._resolve_confirm = TwoPressConfirm(clock=clock)
+        assert content.jump_to(21, DiffSide.NEW, discussion.id)
+        await pilot.pause()
+
+        unified.action_resolve_discussion()
+        clock.now += 6.0
+        unified.action_resolve_discussion()
+        await pilot.pause()
+        assert app.resolutions == []
+
+        # Redrawing the file drops the armed press, so the next one re-arms.
+        assert unified._resolve_confirm.armed
+        content.show_file(_file(), [discussion])
+        await pilot.pause()
+        assert not unified._resolve_confirm.armed
+        assert content.jump_to(21, DiffSide.NEW, discussion.id)
+        unified.action_resolve_discussion()
+        await pilot.pause()
+        assert app.resolutions == []
+
+        unified.action_resolve_discussion()
+        await pilot.pause()
+        assert [event.discussion_id for event in app.resolutions] == [discussion.id]
 
 
 @pytest.mark.asyncio

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import ClassVar
 
 from rich.text import Text
 from textual.binding import Binding
 from textual.widgets import DataTable
-from textual.widgets.data_table import CellDoesNotExist
+from textual.widgets.data_table import CellDoesNotExist, RowKey
 
 from tongs.forges.models import CIStatus, MRSummary
 from tongs.helpers import ci_icon, forge_label, relative_time
@@ -37,6 +38,10 @@ def sort_mrs(mrs: list[MRSummary], key: str) -> list[MRSummary]:
     return sorted(
         mrs, key=lambda m: m.updated_at or m.created_at or m.updated_at, reverse=True
     )
+
+
+def _row_key(mr: MRSummary) -> str:
+    return f"{mr.forge_host.hostname}:{mr.repo_path}:{mr.number}"
 
 
 class MRTable(DataTable):
@@ -75,7 +80,7 @@ class MRTable(DataTable):
         else:
             title.append("  ")
         title.append(mr.title)
-        row_key = f"{mr.forge_host.hostname}:{mr.repo_path}:{mr.number}"
+        row_key = _row_key(mr)
         self._mr_data[row_key] = mr
         row: list[Text] = [
             Text.from_markup(forge_label(mr.forge_host.forge_type)),
@@ -88,6 +93,64 @@ class MRTable(DataTable):
             row.append(Text(mr.repo_path))
         row.append(Text(relative_time(mr.updated_at)))
         self.add_row(*row, key=row_key)
+
+    def merge_mrs(
+        self,
+        mrs: Iterable[MRSummary],
+        ascii_mode: bool = False,
+        *,
+        replace: bool = False,
+    ) -> None:
+        """Add rows in the active sort order, keeping the cursor on its MR.
+
+        ``replace`` drops the current rows first. Otherwise only the incoming
+        rows are built and the existing rows are moved into place, so adding
+        one repository at a time stays cheap however many rows are shown. The
+        highlighted MR keeps the cursor when it is still listed.
+        """
+        selected = self._selected_row_key()
+        incoming = {_row_key(mr): mr for mr in mrs}
+        if replace:
+            self.clear()
+        elif not incoming:
+            return
+        for key in incoming:
+            if key in self._mr_data:
+                self.remove_row(key)
+        for mr in incoming.values():
+            self.add_mr_row(mr, ascii_mode)
+        self._order_rows(sort_mrs(list(self._mr_data.values()), self._sort_key))
+        if selected is not None and selected in self._mr_data:
+            index = self.get_row_index(selected)
+            if index != self.cursor_row:
+                self.move_cursor(row=index)
+
+    def _order_rows(self, ordered: list[MRSummary]) -> None:
+        """Move the existing rows into ``ordered`` without rebuilding them.
+
+        This updates the row locations the way ``DataTable.sort`` does. Only
+        the rows whose position changes are touched, and the positions they
+        leave are exactly the ones they fill, so the mapping stays one to one.
+        """
+        locations = self._row_locations
+        moved = False
+        for index, mr in enumerate(ordered):
+            key = _row_key(mr)
+            if locations.get(key) != index:
+                locations[RowKey(key)] = index
+                moved = True
+        if moved:
+            self._update_count += 1
+            self.refresh()
+
+    def _selected_row_key(self) -> str | None:
+        if self.row_count == 0:
+            return None
+        try:
+            row_key, _ = self.coordinate_to_cell_key(self.cursor_coordinate)
+        except CellDoesNotExist:
+            return None
+        return row_key.value
 
     def get_selected_mr(self) -> MRSummary | None:
         if self.cursor_row is None or self.row_count == 0:

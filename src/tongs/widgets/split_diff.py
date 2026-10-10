@@ -29,6 +29,7 @@ from tongs.diff.models import DiffFile, DiffLine, LineType, SplitDiffRow
 from tongs.forges.models import Discussion
 from tongs.helpers import relative_time
 from tongs.state.drafts import DiffSide
+from tongs.widgets.two_press import TwoPressConfirm
 
 if TYPE_CHECKING:
     from tongs.widgets.review_draft import DraftMarker
@@ -223,7 +224,7 @@ class SplitDiffColumn(OptionList):
         self._selection_anchor: int | None = None
         self._current_file: DiffFile | None = None
         self._expanded_threads: set[str] = set()
-        self._pending_resolve: str | None = None
+        self._resolve_confirm = TwoPressConfirm()
 
     @property
     def selection(self) -> DiffSelection | None:
@@ -412,13 +413,11 @@ class SplitDiffColumn(OptionList):
         if not discussion.resolvable:
             self.app.notify("Thread resolution not supported")
             return
-        if self._pending_resolve == discussion.id:
-            self._pending_resolve = None
+        if self._resolve_confirm.arm(discussion.id):
             self.post_message(
                 SplitResolveRequested(discussion.id, not discussion.is_resolved)
             )
             return
-        self._pending_resolve = discussion.id
         action = "Unresolve" if discussion.is_resolved else "Resolve"
         self.app.notify(
             f"{action} thread by @{discussion.root_comment.author.username}? Press R again.",
@@ -533,6 +532,9 @@ class SplitDiffView(Widget):
         self._discussion_index = _discussion_index(discussions)
         self._highlight_map = highlight_map
         self._draft_markers = draft_markers
+        # Like the unified view, redrawing the file drops an armed resolve.
+        for column in self._columns():
+            column._resolve_confirm.reset()
         self._populate()
         if selection is not None:
             self.restore_selection(selection)
@@ -554,7 +556,7 @@ class SplitDiffView(Widget):
             column._selection_anchor = None
             column._current_file = None
             column._expanded_threads.clear()
-            column._pending_resolve = None
+            column._resolve_confirm.reset()
             column.add_option(
                 Option(_single_line(message, Style(dim=True)), disabled=True)
             )

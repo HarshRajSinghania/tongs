@@ -10,7 +10,7 @@ from textual.app import App, ComposeResult
 
 from tongs.diff.models import DiffFile, DiffHunk, DiffLine, FileStatus, LineType
 from tongs.forges.models import Discussion, InlineComment, User
-from tongs.widgets.diff_panel import DiffRenderer
+from tongs.widgets.diff_panel import DiffRenderer, ResolveRequested
 from tongs.widgets.discussion_list import (
     DiscussionPanel,
     DiscussionReplyRequested,
@@ -18,6 +18,7 @@ from tongs.widgets.discussion_list import (
     _render_thread,
     render_diff_snippet,
 )
+from tongs.widgets.two_press import TwoPressConfirm
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -400,6 +401,7 @@ class DiscussionPanelApp(App[None]):
         super().__init__()
         self.jumps: list[JumpToDiffDiscussion] = []
         self.replies: list[DiscussionReplyRequested] = []
+        self.resolutions: list[ResolveRequested] = []
 
     def compose(self) -> ComposeResult:
         yield DiscussionPanel(id="discussions")
@@ -409,6 +411,9 @@ class DiscussionPanelApp(App[None]):
 
     def on_discussion_reply_requested(self, message: DiscussionReplyRequested) -> None:
         self.replies.append(message)
+
+    def on_resolve_requested(self, message: ResolveRequested) -> None:
+        self.resolutions.append(message)
 
 
 def _deleted_line_disc() -> Discussion:
@@ -487,3 +492,56 @@ async def test_next_unresolved_skips_threads_that_cannot_be_resolved() -> None:
             visited.append(focused.id if focused else None)
 
     assert visited == ["d-open", "d-open", "d-open"]
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.mark.asyncio
+async def test_resolve_pressed_late_rearms_instead_of_resolving() -> None:
+    app = DiscussionPanelApp()
+    clock = _Clock()
+    async with app.run_test() as pilot:
+        panel = app.query_one(DiscussionPanel)
+        panel._resolve_confirm = TwoPressConfirm(clock=clock)
+        panel.set_discussions([_make_disc(id="d-open")])
+        await pilot.pause()
+        panel.action_resolve()
+        clock.now += 6.0
+        panel.action_resolve()
+        await pilot.pause()
+        assert app.resolutions == []
+        clock.now += 1.0
+        panel.action_resolve()
+        await pilot.pause()
+
+    assert [(m.discussion_id, m.resolved) for m in app.resolutions] == [
+        ("d-open", True)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_armed_on_one_thread_does_not_resolve_another() -> None:
+    app = DiscussionPanelApp()
+    discs = [
+        _make_disc(id="d-a", file_path="a.py", new_line=1),
+        _make_disc(id="d-b", file_path="b.py", new_line=1),
+    ]
+    async with app.run_test() as pilot:
+        panel = app.query_one(DiscussionPanel)
+        panel.set_discussions(discs)
+        await pilot.pause()
+        panel.action_resolve()
+        panel.action_next_card()
+        panel.action_resolve()
+        await pilot.pause()
+        assert app.resolutions == []
+        panel.action_resolve()
+        await pilot.pause()
+
+    assert [m.discussion_id for m in app.resolutions] == ["d-b"]

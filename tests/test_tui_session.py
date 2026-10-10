@@ -6,8 +6,10 @@ import asyncio
 import sqlite3
 import threading
 from contextlib import suppress
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -17,7 +19,7 @@ from textual.worker import WorkerCancelled
 from tongs.app import TongsApp
 from tongs.cache.store import CacheStore
 from tongs.config import Config
-from tongs.errors import NetworkError
+from tongs.errors import NetworkError, NotFoundError
 from tongs.forges.base import ForgeClient
 from tongs.forges.models import (
     CIStatus,
@@ -30,8 +32,11 @@ from tongs.plugins.base import TongsPlugin
 from tongs.plugins.context import PluginContext
 from tongs.plugins.registry import PluginRegistry
 from tongs.scanner.repo import ForgeType, Remote, Repo
+from tongs.services.errors import ServiceErrorCode
 from tongs.services.models import (
+    HostFailure,
     RepositoryRef,
+    ReviewListItem,
     ReviewPage,
     ReviewQuery,
     ReviewRef,
@@ -40,6 +45,7 @@ from tongs.services.models import (
 )
 from tongs.services.session import ApplicationSession
 from tongs.state.drafts import DraftContent, DraftStore, RecoveryWarning
+from tongs.tui_services import TUIRepositoryProgress, TUIServiceAdapter
 from tongs.views.inbox import InboxScreen
 from tongs.views.repo_list import RepoListScreen
 from tongs.widgets.mr_table import MRTable
@@ -90,6 +96,8 @@ class MockForgeClient:
         self.host = host
         self.summaries = summaries
         self.error: Exception | None = None
+        # Errors raised only for one repository's list, keyed by project path.
+        self.repo_errors: dict[str, Exception] = {}
         self.calls: list[tuple[str, str | None]] = []
         self.block_personal = False
         self.personal_started = asyncio.Event()
@@ -115,6 +123,8 @@ class MockForgeClient:
         self.calls.append(("all_open", repo_path))
         if self.error is not None:
             raise self.error
+        if repo_path in self.repo_errors:
+            raise self.repo_errors[repo_path]
         return [summary for summary in self.summaries if summary.repo_path == repo_path]
 
 
@@ -606,3 +616,288 @@ async def test_unmount_finishes_workers_before_session_close(tmp_path: Path) -> 
         await asyncio.wait_for(started.wait(), timeout=1)
 
     assert finished.is_set()
+
+
+class InstrumentedAllOpenSession:
+    """Session double that counts overlapping All Open repository reads."""
+
+    def __init__(
+        self,
+        tmp_path: Path,
+        refs: list[RepositoryRef],
+        *,
+        max_parallel: int,
+        pages: dict[RepositoryRef, ReviewPage] | None = None,
+        gates: dict[RepositoryRef, asyncio.Event] | None = None,
+    ) -> None:
+        self.config = Config(scan_root=str(tmp_path), max_parallel=max_parallel)
+        self.refs = refs
+        self.local_repositories = tuple(
+            make_repo(tmp_path, ref.project_path, hostname=ref.hostname) for ref in refs
+        )
+        self.pages = pages or {}
+        self.queries: list[ReviewQuery] = []
+        self.in_flight = 0
+        self.peak = 0
+        self.saturated = asyncio.Event()
+        self.release = asyncio.Event()
+        # A repository with its own gate waits for it instead of release.
+        self.gates = gates or {}
+        self.cancelled: list[RepositoryRef] = []
+
+    async def discover_repositories(self) -> tuple[SimpleNamespace, ...]:
+        return tuple(SimpleNamespace(ref=ref) for ref in self.refs)
+
+    async def list_reviews(self, query: ReviewQuery) -> ReviewPage:
+        self.queries.append(query)
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            if self.in_flight >= self.config.max_parallel:
+                self.saturated.set()
+            assert query.repository is not None
+            await self.gates.get(query.repository, self.release).wait()
+        except asyncio.CancelledError:
+            assert query.repository is not None
+            self.cancelled.append(query.repository)
+            raise
+        finally:
+            self.in_flight -= 1
+        assert query.repository is not None
+        return self.pages.get(query.repository, ReviewPage(()))
+
+
+def make_item(ref: RepositoryRef, number: int, age_hours: int) -> ReviewListItem:
+    host = ForgeHost(ref.hostname, ForgeType.GITHUB, "https://api.github.com")
+    summary = replace(
+        make_summary(host, ref.project_path, number),
+        updated_at=NOW - timedelta(hours=age_hours),
+    )
+    return ReviewListItem(ReviewRef(ref, number), summary)
+
+
+async def discovered_adapter(
+    session: InstrumentedAllOpenSession,
+) -> TUIServiceAdapter:
+    adapter = TUIServiceAdapter(cast(ApplicationSession, session))
+    await adapter.discover_repositories()
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_all_open_reads_repositories_in_parallel_up_to_max_parallel(
+    tmp_path: Path,
+) -> None:
+    # Every repository is on one host, so a per-host loop would read one at a
+    # time; per-repository reads overlap up to max_parallel instead.
+    refs = [RepositoryRef("github.com", f"acme/repo-{index}") for index in range(5)]
+    session = InstrumentedAllOpenSession(tmp_path, refs, max_parallel=2)
+    adapter = await discovered_adapter(session)
+
+    task = asyncio.create_task(adapter.list_reviews(ReviewScope.ALL_OPEN, fresh=True))
+    await asyncio.wait_for(session.saturated.wait(), timeout=2)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert session.in_flight == 2
+    assert len(session.queries) == 2
+
+    session.release.set()
+    page = await asyncio.wait_for(task, timeout=2)
+
+    assert page == ReviewPage((), ())
+    assert session.peak == 2
+    assert [query.repository for query in session.queries] == refs
+    assert all(query.scope is ReviewScope.ALL_OPEN for query in session.queries)
+    assert all(query.hostnames is None for query in session.queries)
+    assert all(query.fresh for query in session.queries)
+
+
+@pytest.mark.asyncio
+async def test_all_open_passes_a_cached_read_through_without_fresh(
+    tmp_path: Path,
+) -> None:
+    refs = [RepositoryRef("github.com", "acme/widgets")]
+    session = InstrumentedAllOpenSession(tmp_path, refs, max_parallel=4)
+    session.release.set()
+    adapter = await discovered_adapter(session)
+
+    await adapter.list_reviews(ReviewScope.ALL_OPEN)
+
+    assert [query.fresh for query in session.queries] == [False]
+
+
+@pytest.mark.asyncio
+async def test_all_open_failure_does_not_stop_the_host_and_results_stay_sorted(
+    tmp_path: Path,
+) -> None:
+    broken = RepositoryRef("github.com", "acme/broken")
+    older = RepositoryRef("github.com", "acme/older")
+    newer = RepositoryRef("gitlab.com", "team/newer")
+    middle = RepositoryRef("github.com", "acme/middle")
+    failure = HostFailure(
+        "github.com",
+        ServiceErrorCode.NOT_FOUND,
+        "The requested forge resource was not found.",
+        retryable=False,
+        repository=broken,
+    )
+    pages = {
+        broken: ReviewPage((), (failure,)),
+        older: ReviewPage((make_item(older, 1, 30), make_item(older, 2, 10))),
+        newer: ReviewPage((make_item(newer, 3, 1),)),
+        middle: ReviewPage((make_item(middle, 4, 5),)),
+    }
+    session = InstrumentedAllOpenSession(
+        tmp_path, [broken, older, newer, middle], max_parallel=8, pages=pages
+    )
+    session.release.set()
+    adapter = await discovered_adapter(session)
+
+    page = await adapter.list_reviews(ReviewScope.ALL_OPEN)
+
+    assert [query.repository for query in session.queries] == [
+        broken,
+        older,
+        newer,
+        middle,
+    ]
+    assert [item.ref.number for item in page.items] == [3, 4, 2, 1]
+    assert page.failures == (failure,)
+
+
+@pytest.mark.asyncio
+async def test_all_open_tab_lists_other_repositories_and_names_the_failing_one(
+    tmp_path: Path,
+) -> None:
+    host = ForgeHost("github.com", ForgeType.GITHUB, "https://api.github.com")
+    client = MockForgeClient(
+        host,
+        [
+            make_summary(host, "acme/broken", 1),
+            make_summary(host, "acme/gadgets", 2),
+            make_summary(host, "acme/widgets", 3),
+        ],
+    )
+    client.repo_errors["acme/broken"] = NotFoundError("private forge detail")
+    registry = MockForgeRegistry({host.hostname: client})
+    repos = [
+        make_repo(tmp_path, "acme/broken"),
+        make_repo(tmp_path, "acme/gadgets"),
+        make_repo(tmp_path, "acme/widgets"),
+    ]
+    app, _session, _cache = make_app(tmp_path, repos, registry)
+
+    async with app.run_test(notifications=True) as pilot:
+        await settle(app)
+        await pilot.press("3")
+        await settle(app)
+        table = app.screen.query_one("#all-open-table", MRTable)
+        assert table.row_count == 2
+        assert sorted(path for name, path in client.calls if name == "all_open") == [
+            "acme/broken",
+            "acme/gadgets",
+            "acme/widgets",
+        ]
+        messages = [
+            str(notice.message)
+            for notice in app._notifications
+            if str(notice.message).startswith("All Open")
+        ]
+        expected = (
+            "All Open skipped: github.com/acme/broken: "
+            "The requested forge resource was not found."
+        )
+        assert messages == [expected]
+
+
+@pytest.mark.asyncio
+async def test_all_open_stream_yields_each_repository_as_it_finishes(
+    tmp_path: Path,
+) -> None:
+    slow = RepositoryRef("github.com", "acme/slow")
+    fast = RepositoryRef("github.com", "acme/fast")
+    gates = {slow: asyncio.Event(), fast: asyncio.Event()}
+    pages = {
+        slow: ReviewPage((make_item(slow, 1, 1),)),
+        fast: ReviewPage((make_item(fast, 2, 5),)),
+    }
+    session = InstrumentedAllOpenSession(
+        tmp_path, [slow, fast], max_parallel=4, pages=pages, gates=gates
+    )
+    adapter = await discovered_adapter(session)
+    steps = adapter.stream_all_open(fresh=True)
+
+    first = await asyncio.wait_for(anext(steps), timeout=2)
+    assert first == TUIRepositoryProgress(None, ReviewPage(()), 0, 2)
+    gates[fast].set()
+    second = await asyncio.wait_for(anext(steps), timeout=2)
+    assert second == TUIRepositoryProgress(fast, pages[fast], 1, 2)
+    # The finished repository's reviews are issued before the slow one ends.
+    assert adapter.review_ref(pages[fast].items[0].summary) == ReviewRef(fast, 2)
+    assert not gates[slow].is_set()
+
+    gates[slow].set()
+    third = await asyncio.wait_for(anext(steps), timeout=2)
+    assert third == TUIRepositoryProgress(slow, pages[slow], 2, 2)
+    with pytest.raises(StopAsyncIteration):
+        await anext(steps)
+    assert all(query.fresh for query in session.queries)
+
+
+@pytest.mark.asyncio
+async def test_closing_the_all_open_stream_cancels_reads_in_flight(
+    tmp_path: Path,
+) -> None:
+    refs = [RepositoryRef("github.com", f"acme/repo-{index}") for index in range(4)]
+    fast = refs[0]
+    gates = {ref: asyncio.Event() for ref in refs}
+    session = InstrumentedAllOpenSession(tmp_path, refs, max_parallel=2, gates=gates)
+    adapter = await discovered_adapter(session)
+    steps = adapter.stream_all_open()
+
+    await asyncio.wait_for(anext(steps), timeout=2)
+    gates[fast].set()
+    step = await asyncio.wait_for(anext(steps), timeout=2)
+    assert step.repository == fast
+
+    async def third_read_started() -> None:
+        while len(session.queries) < 3:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(third_read_started(), timeout=2)
+    assert session.in_flight == 2
+
+    await steps.aclose()
+
+    # The reads in flight are cancelled and the queued one never starts.
+    assert session.in_flight == 0
+    assert set(session.cancelled) == set(refs[1:3])
+    assert len(session.cancelled) == 2
+    assert [query.repository for query in session.queries] == refs[:3]
+
+
+@pytest.mark.asyncio
+async def test_all_open_page_still_waits_for_every_repository(
+    tmp_path: Path,
+) -> None:
+    slow = RepositoryRef("github.com", "acme/slow")
+    fast = RepositoryRef("gitlab.com", "team/fast")
+    gates = {slow: asyncio.Event(), fast: asyncio.Event()}
+    pages = {
+        slow: ReviewPage((make_item(slow, 1, 1),)),
+        fast: ReviewPage((make_item(fast, 2, 5),)),
+    }
+    session = InstrumentedAllOpenSession(
+        tmp_path, [slow, fast], max_parallel=4, pages=pages, gates=gates
+    )
+    adapter = await discovered_adapter(session)
+
+    task = asyncio.create_task(adapter.list_reviews(ReviewScope.ALL_OPEN))
+    gates[fast].set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not task.done()
+
+    gates[slow].set()
+    page = await asyncio.wait_for(task, timeout=2)
+    assert [item.ref.number for item in page.items] == [1, 2]

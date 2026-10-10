@@ -178,6 +178,14 @@ class ForgeClient(ABC):
         """Invalidate cached review reads when this client owns a cache."""
         return True
 
+    async def invalidate_repository_reads(self, repo_path: str) -> bool:
+        """Drop cached reads of one repository when this client owns a cache.
+
+        Returns whether cached entries were dropped. A client without a cache
+        has nothing to drop and returns False; its next read goes to the forge.
+        """
+        return False
+
     @abstractmethod
     async def list_pipelines(
         self,

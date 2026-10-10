@@ -6,16 +6,18 @@ import asyncio
 import sqlite3
 import threading
 from contextlib import suppress
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 import httpx
 import pytest
 
 from tongs.cache.cached_client import CachedForgeClient
+from tongs.cache.store import CacheStore
 from tongs.config import Config
 from tongs.errors import AuthError, ForgeError, NotFoundError, PartialResultsError
 from tongs.forges.base import ForgeClient
@@ -46,6 +48,8 @@ from tongs.services import (
     PipelineMutationTarget,
     PipelineRef,
     RepositoryRef,
+    RepositorySnapshot,
+    RetryPipelineCommand,
     ReviewActionTarget,
     ReviewQuery,
     ReviewRef,
@@ -1901,6 +1905,304 @@ class TestRevisionBoundDiff:
         cache.get_json.assert_not_awaited()
         assert inner.get_mr_fresh_calls == 2
         assert inner.get_mr_diff_fresh_calls == 1
+        await session.close()
+
+
+class ForgettingRegistry(FakeRegistry):
+    """Record which hosts a read asks to look up again."""
+
+    def __init__(self, clients: dict[str, object] | None = None) -> None:
+        super().__init__(clients)
+        self.forgotten: list[str | None] = []
+        self.refresh_modes: list[bool] = []
+
+    def forget_auth_failures(
+        self, hostname: str | None = None, *, refresh: bool = False
+    ) -> None:
+        self.forgotten.append(hostname)
+        self.refresh_modes.append(refresh)
+
+
+class PruningCache(FakeCache):
+    def __init__(self, *, prune_error: Exception | None = None) -> None:
+        super().__init__()
+        self.prune_error = prune_error
+        self.prune_calls = 0
+
+    async def prune(self) -> None:
+        self.prune_calls += 1
+        if self.prune_error is not None:
+            raise self.prune_error
+
+
+class TestExplicitRefresh:
+    """An explicit refresh reads past the list cache (#309)."""
+
+    @staticmethod
+    async def _cached_session(
+        tmp_path: Path,
+    ) -> tuple[ApplicationSession, FakeClient, CacheStore, RepositoryRef]:
+        store = CacheStore(db_path=tmp_path / "cache.db", max_size_mb=1)
+        await store.open()
+        inner = FakeClient()
+        client = CachedForgeClient(
+            cast(ForgeClient, inner), store, hostname="github.com"
+        )
+        registry = ForgettingRegistry({"github.com": client})
+        session = await start_session(registry)
+        repository = await session.open_repository("github.com", "acme/widgets")
+        inner.list_mrs_calls = 0
+        return session, inner, store, repository.ref
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("paged", [False, True])
+    async def test_fresh_all_open_bypasses_the_cached_list_and_stores_the_new_one(
+        self, tmp_path: Path, paged: bool
+    ) -> None:
+        session, inner, store, ref = await self._cached_session(tmp_path)
+
+        def query(*, fresh: bool = False) -> ReviewQuery:
+            return ReviewQuery(
+                ReviewScope.ALL_OPEN, repository=ref, paged=paged, fresh=fresh
+            )
+
+        first = await session.list_reviews(query())
+        await session.list_reviews(query())
+        assert inner.list_mrs_calls == 1
+        assert [item.ref.number for item in first.items] == [7]
+
+        # The review was merged and another opened; the cache still holds the
+        # old list for up to a minute.
+        inner.repository_reviews = [make_summary(number=9)]
+        stale = await session.list_reviews(query())
+        assert [item.ref.number for item in stale.items] == [7]
+
+        refreshed = await session.list_reviews(query(fresh=True))
+        assert inner.list_mrs_calls == 2
+        assert [item.ref.number for item in refreshed.items] == [9]
+
+        # What the refresh read is what the cache now serves.
+        again = await session.list_reviews(query())
+        assert inner.list_mrs_calls == 2
+        assert [item.ref.number for item in again.items] == [9]
+        await session.close()
+        await store.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("paged", [False, True])
+    async def test_fresh_all_open_keeps_cached_diffs(
+        self, tmp_path: Path, paged: bool
+    ) -> None:
+        session, inner, store, ref = await self._cached_session(tmp_path)
+        query = ReviewQuery(ReviewScope.ALL_OPEN, repository=ref, paged=paged)
+        await session.list_reviews(query)
+        diff_key = "github.com:acme/widgets:mr:7:diff"
+        await store.put_json(diff_key, [{"filename": "cached.py"}], 300)
+
+        await session.list_reviews(replace(query, fresh=True))
+
+        # The refresh reread the list but left the review's diff cached.
+        assert inner.list_mrs_calls == 2
+        assert await store.get_json(diff_key) == [{"filename": "cached.py"}]
+        await session.close()
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_ci_action_invalidation_drops_lists_and_keeps_diffs(
+        self, tmp_path: Path
+    ) -> None:
+        session, inner, store, ref = await self._cached_session(tmp_path)
+        query = ReviewQuery(ReviewScope.ALL_OPEN, repository=ref)
+        await session.list_reviews(query)
+        diff_key = "github.com:acme/widgets:mr:7:diff"
+        await store.put_json(diff_key, [{"filename": "cached.py"}], 300)
+
+        await session._invalidate_pipeline_reads(PipelineRef(ref, 11))
+
+        assert await store.get_json("github.com:acme/widgets:mrs:open") is None
+        assert await store.get_json(diff_key) == [{"filename": "cached.py"}]
+        await session.list_reviews(query)
+        assert inner.list_mrs_calls == 2
+        await session.close()
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_fresh_read_forgets_failed_sign_ins_only_for_hosts_it_reads(
+        self,
+    ) -> None:
+        registry = ForgettingRegistry(
+            {"github.com": FakeClient(), "gitlab.com": FakeClient()}
+        )
+        session = await start_session(registry)
+
+        await session.list_reviews(
+            ReviewQuery(ReviewScope.MY_REVIEWS, hostnames=("github.com",))
+        )
+        assert registry.forgotten == []
+
+        await session.list_reviews(
+            ReviewQuery(ReviewScope.MY_REVIEWS, hostnames=("github.com",), fresh=True)
+        )
+        assert registry.forgotten == ["github.com"]
+
+        registry.forgotten.clear()
+        await session.list_reviews(ReviewQuery(ReviewScope.MY_MRS, fresh=True))
+        assert registry.forgotten == ["github.com", "gitlab.com"]
+        # A refresh never orphans a running lookup or drops a fresh failure.
+        assert registry.refresh_modes == [True, True, True]
+        await session.close()
+
+    @pytest.mark.asyncio
+    async def test_fresh_read_looks_up_a_failed_sign_in_again(self) -> None:
+        now = [0.0]
+        registry = ForgeRegistry(clock=lambda: now[0])
+        session = await start_session(cast(FakeRegistry, registry))
+        query = ReviewQuery(ReviewScope.MY_REVIEWS, hostnames=("github.com",))
+        with patch(
+            "tongs.forges.registry.resolve_token",
+            side_effect=AuthError("No credentials found for github.com"),
+        ) as resolved:
+            first = await session.list_reviews(query)
+            remembered = await session.list_reviews(query)
+            assert resolved.call_count == 1
+
+            # The user fixes their sign-in and refreshes well inside the
+            # failure's minute.
+            now[0] = 10.0
+            refreshed = await session.list_reviews(replace(query, fresh=True))
+            assert resolved.call_count == 2
+
+        for page in (first, remembered, refreshed):
+            assert [failure.code for failure in page.failures] == [
+                ServiceErrorCode.AUTHENTICATION_FAILED
+            ]
+        await session.close()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_fresh_reads_share_one_sign_in_lookup(
+        self, tmp_path: Path
+    ) -> None:
+        # The desktop Refresh button sends one fresh read per repository, up
+        # to eight at a time, and keeps going after a repository fails.
+        repos = [make_repo(tmp_path, project=f"acme/repo{i}") for i in range(12)]
+        now = [0.0]
+        registry = ForgeRegistry(clock=lambda: now[0])
+        session = await start_session(
+            cast(FakeRegistry, registry), discoverer=lambda *args, **kwargs: repos
+        )
+        snapshots = await session.discover_repositories()
+        assert len(snapshots) == 12
+        started = threading.Event()
+        release = threading.Event()
+
+        def resolve(_hostname: str, _forge_type: ForgeType) -> str:
+            started.set()
+            assert release.wait(10)
+            raise AuthError("No credentials found for github.com")
+
+        def fresh_read(snapshot: RepositorySnapshot) -> ReviewQuery:
+            return ReviewQuery(
+                ReviewScope.ALL_OPEN, repository=snapshot.ref, paged=True, fresh=True
+            )
+
+        with patch(
+            "tongs.forges.registry.resolve_token", side_effect=resolve
+        ) as resolved:
+            release.set()
+            await session.list_reviews(replace(fresh_read(snapshots[0]), fresh=False))
+            assert resolved.call_count == 1
+
+            # Signed out and refreshing: the burst shares one new lookup.
+            now[0] = 30.0
+            started.clear()
+            release.clear()
+            burst = asyncio.gather(
+                *(session.list_reviews(fresh_read(s)) for s in snapshots[:8])
+            )
+            assert await asyncio.to_thread(started.wait, 10)
+            await asyncio.sleep(0.05)
+            release.set()
+            pages = list(await asyncio.wait_for(burst, 10))
+            assert resolved.call_count == 2
+
+            # The rest of the same refresh reuses the failure it just saw.
+            pages.extend(
+                await asyncio.gather(
+                    *(session.list_reviews(fresh_read(s)) for s in snapshots[8:])
+                )
+            )
+            assert resolved.call_count == 2
+
+            # A later refresh looks again.
+            now[0] = 40.0
+            pages.append(await session.list_reviews(fresh_read(snapshots[0])))
+            assert resolved.call_count == 3
+
+        assert len(pages) == 13
+        for page in pages:
+            assert page.items == ()
+            assert [failure.code for failure in page.failures] == [
+                ServiceErrorCode.AUTHENTICATION_FAILED
+            ]
+        await session.close()
+
+    @pytest.mark.asyncio
+    async def test_fresh_read_works_with_a_registry_without_failed_sign_ins(
+        self,
+    ) -> None:
+        session = await start_session(FakeRegistry())
+
+        page = await session.list_reviews(
+            ReviewQuery(ReviewScope.MY_REVIEWS, fresh=True)
+        )
+
+        assert [item.ref.number for item in page.items] == [7]
+        assert page.failures == ()
+        await session.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["retry", "cancel"])
+    async def test_ci_action_invalidates_the_repository_list(
+        self, tmp_path: Path, action: str
+    ) -> None:
+        session, inner, store, ref = await self._cached_session(tmp_path)
+        query = ReviewQuery(ReviewScope.ALL_OPEN, repository=ref, paged=True)
+        await session.list_reviews(query)
+        await session.list_reviews(query)
+        assert inner.list_mrs_calls == 1
+
+        target = PipelineMutationTarget(PipelineRef(ref, 11))
+        command = (
+            RetryPipelineCommand("ci-retry", target)
+            if action == "retry"
+            else CancelPipelineCommand("ci-cancel", target)
+        )
+        receipt = await session.ci_mutations.execute(command)
+        assert receipt.error is None
+        assert receipt.resync_required is False
+
+        inner.repository_reviews = [make_summary(number=9)]
+        page = await session.list_reviews(query)
+        assert inner.list_mrs_calls == 2
+        assert [item.ref.number for item in page.items] == [9]
+        await session.close()
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_session_start_prunes_expired_cache_entries(self) -> None:
+        cache = PruningCache()
+        session = await start_session(FakeRegistry(), cache=cache)
+
+        assert cache.prune_calls == 1
+        await session.close()
+
+    @pytest.mark.asyncio
+    async def test_failed_prune_does_not_fail_session_start(self) -> None:
+        cache = PruningCache(prune_error=sqlite3.OperationalError("locked"))
+        session = await start_session(FakeRegistry(), cache=cache)
+
+        assert cache.prune_calls == 1
+        await session.list_reviews(ReviewQuery(ReviewScope.MY_REVIEWS))
         await session.close()
 
 

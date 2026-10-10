@@ -181,6 +181,38 @@ class TestGraphQLProperties:
         client = GitHubClient(_TEST_HOST, http)
         assert client.supports_thread_resolution is True
 
+    @pytest.mark.asyncio
+    async def test_graphql_empty_errors_returns_data(self) -> None:
+        """An empty errors list is not an error."""
+        client, http = _make_github_client(
+            lambda _: httpx.Response(200, json={"errors": [], "data": {"ok": 1}})
+        )
+        async with http:
+            assert await client._graphql("query { ok }") == {"ok": 1}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("errors", "message"),
+        [
+            ("boom", "GraphQL error"),
+            ({"message": "boom"}, "GraphQL error"),
+            ([None], "GraphQL error"),
+            ([{"message": 5}], "GraphQL error"),
+            ([{"message": "denied"}], "denied"),
+        ],
+    )
+    async def test_graphql_malformed_errors_raise_forge_error(
+        self, errors: object, message: str
+    ) -> None:
+        """A non-empty errors value of any shape raises ForgeError."""
+        client, http = _make_github_client(
+            lambda _: httpx.Response(200, json={"errors": errors})
+        )
+        async with http:
+            with pytest.raises(ForgeError) as caught:
+                await client._graphql("query { ok }")
+        assert str(caught.value) == message
+
 
 class TestRevisionMetadata:
     def test_detail_captures_head_and_base_sha(self):
@@ -1073,6 +1105,9 @@ class TestThreadResolution:
         "graphql_response",
         [
             httpx.Response(200, json={"errors": [{"message": "boom"}]}),
+            httpx.Response(200, json={"errors": []}),
+            httpx.Response(200, json={"errors": "boom"}),
+            httpx.Response(200, json={"errors": [None]}),
             httpx.Response(401, json={"message": "Bad credentials"}),
             httpx.Response(502, text="bad gateway"),
             httpx.Response(200, json={"data": {"repository": None}}),

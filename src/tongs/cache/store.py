@@ -12,6 +12,11 @@ import aiosqlite
 from tongs.config import cache_dir
 
 
+def _escape_like(text: str) -> str:
+    """Escape LIKE wildcards so ``text`` matches only itself."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 class CacheStore:
     """Async SQLite cache with TTL and LRU eviction."""
 
@@ -91,9 +96,24 @@ class CacheStore:
         await self._db.commit()
 
     async def invalidate_prefix(self, prefix: str) -> None:
+        """Remove the key ``prefix`` and every key below it.
+
+        A key is below the prefix only across a ':' boundary, so invalidating
+        ``host:o/r`` keeps ``host:o/r-docs`` and invalidating ``host:o/r:mr:1``
+        keeps ``host:o/r:mr:12``. '_' and '%' in the prefix match literally.
+        The match stays ASCII case-insensitive, like the forges' own paths.
+        """
         if self._db is None:
             return
-        await self._db.execute("DELETE FROM cache WHERE key LIKE ?", (f"{prefix}%",))
+        stem = prefix.removesuffix(":")
+        escaped = _escape_like(stem)
+        await self._db.execute(
+            """
+            DELETE FROM cache
+            WHERE key LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\'
+            """,
+            (escaped, f"{escaped}:%"),
+        )
         await self._db.commit()
 
     async def clear(self) -> None:
@@ -117,17 +137,27 @@ class CacheStore:
         )
         row = await cursor.fetchone()
         total = row[0] if row else 0
-        if total <= self._max_size_bytes:
-            return
-        await self._db.execute(
-            """
-            DELETE FROM cache WHERE key IN (
-                SELECT key FROM cache ORDER BY created_at ASC
-                LIMIT (SELECT COUNT(*) / 4 FROM cache)
+        # Each pass drops the least recently used quarter, and always at least
+        # one row, so a single oversized entry cannot keep the file over its
+        # limit. The loop ends once the total fits or the table is empty.
+        while total > self._max_size_bytes:
+            cursor = await self._db.execute(
+                """
+                DELETE FROM cache WHERE key IN (
+                    SELECT key FROM cache ORDER BY created_at ASC
+                    LIMIT (SELECT MAX(COUNT(*) / 4, 1) FROM cache)
+                )
+                """
             )
-            """
-        )
-        await self._db.commit()
+            removed = cursor.rowcount
+            await self._db.commit()
+            if removed <= 0:
+                break
+            cursor = await self._db.execute(
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM cache"
+            )
+            row = await cursor.fetchone()
+            total = row[0] if row else 0
 
     async def close(self) -> None:
         if self._db is not None:

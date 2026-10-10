@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import replace
@@ -57,6 +58,8 @@ from tongs.services.review_mutations import ReviewMutationService
 from tongs.services.review_submission import ReviewSubmissionService
 from tongs.state.drafts.models import RecoveryWarning
 from tongs.state.drafts.store import DraftStore
+
+log = logging.getLogger(__name__)
 
 
 class CacheResource(Protocol):
@@ -179,6 +182,7 @@ class ApplicationSession:
             get_client=self._client_for_repository,
             get_pipeline_jobs=self.get_pipeline_jobs,
             emit_change=self.emit_change,
+            invalidate_pipeline=self._invalidate_pipeline_reads,
         )
         self._mr_actions = MRActionService(
             get_client=self._client_for_review,
@@ -306,6 +310,7 @@ class ApplicationSession:
                     )
                     self._cache_open_attempted = True
                     await self._cache.open()
+                    await self._prune_cache()
                     self._require_start_open()
                     self._draft_store_open_attempted = True
                     await self._draft_store.open()
@@ -651,6 +656,12 @@ class ApplicationSession:
 
         semaphore = asyncio.Semaphore(cast(Config, self._config).max_parallel)
 
+        if query.fresh:
+            # Someone who just fixed their sign-in refreshes to see it work, so
+            # a recently failed token lookup for these hosts is not reused.
+            self._forget_auth_failures(
+                tuple(dict.fromkeys(hostname for hostname, _ in operations))
+            )
         page_number = 1 if query.cursor is None else review_cursor_page(query.cursor)
         next_cursors: dict[RepositoryRef, str] = {}
 
@@ -662,6 +673,16 @@ class ApplicationSession:
                 partial: HostFailure | None = None
                 try:
                     client = await self._get_client(hostname, "list_reviews")
+                    if (
+                        query.fresh
+                        and query.scope == ReviewScope.ALL_OPEN
+                        and query.cursor is None
+                        and repository is not None
+                    ):
+                        # Drop the cached list and first page first: what the
+                        # cache holds afterwards was read after this refresh.
+                        # Cached diffs stay; the refresh does not reread them.
+                        await _invalidate_review_lists(client, repository.project_path)
                     if query.scope == ReviewScope.ALL_OPEN and query.paged:
                         assert repository is not None
                         page = await read_mr_page(
@@ -987,6 +1008,38 @@ class ApplicationSession:
             self._require_started()
             return client
 
+    async def _invalidate_pipeline_reads(self, pipeline: PipelineRef) -> None:
+        """Drop a repository's cached review lists after a CI retry or cancel.
+
+        The cached review list carries each review's CI status, so it would
+        otherwise show the state before the action until it expires. No other
+        cached read holds CI status, so cached diffs stay.
+        """
+        repository = pipeline.repository
+        client = await self._client_for_repository(repository, "invalidate_pipeline")
+        await _invalidate_review_lists(client, repository.project_path)
+
+    def _forget_auth_failures(self, hostnames: tuple[str, ...]) -> None:
+        forget = getattr(self._registry, "forget_auth_failures", None)
+        if forget is None:
+            # A provided registry without a failed-lookup memory has none to
+            # forget.
+            return
+        for hostname in hostnames:
+            # A refresh keeps a running lookup and a failure from moments ago,
+            # so the per-repository requests of one refresh share one lookup.
+            forget(hostname, refresh=True)
+
+    async def _prune_cache(self) -> None:
+        """Drop expired cache entries once per session start, best effort."""
+        prune = getattr(self._cache, "prune", None)
+        if prune is None:
+            return
+        try:
+            await prune()
+        except Exception:  # noqa: BLE001 - An expired entry is never served.
+            log.warning("Pruning expired cache entries failed")
+
     async def _close_late_clients(self) -> None:
         if not self._registry_close_attempted:
             await self._close_registry_once()
@@ -1268,6 +1321,21 @@ def _page_items(page: object) -> tuple[MRSummary, ...]:
             "The forge returned an invalid review list.",
         )
     return page.items
+
+
+async def _invalidate_review_lists(client: ForgeClient, repo_path: str) -> bool:
+    """Drop a repository's cached review lists, including on duck-typed clients.
+
+    A client without the narrower ``invalidate_review_list_reads`` drops every
+    cached read of the repository instead. One that defines neither (a test
+    double or an older plugin) owns no cache through this interface.
+    """
+    invalidate = getattr(client, "invalidate_review_list_reads", None)
+    if invalidate is None:
+        invalidate = getattr(client, "invalidate_repository_reads", None)
+    if invalidate is None:
+        return False
+    return bool(await invalidate(repo_path))
 
 
 def _partial_failure(

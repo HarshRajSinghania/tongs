@@ -20,6 +20,7 @@ from textual.widgets import Static
 from tongs.diff.models import DiffFile, DiffLine
 from tongs.forges.models import Discussion
 from tongs.helpers import relative_time
+from tongs.widgets.two_press import TwoPressConfirm
 
 
 def is_unresolved(discussion: Discussion) -> bool:
@@ -200,7 +201,7 @@ class DiscussionPanel(Widget):
         self._diff_files: list[DiffFile] = []
         self._filtered: list[Discussion] = []
         self._filter: str = "all"
-        self._pending_resolve: str | None = None
+        self._resolve_confirm = TwoPressConfirm()
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="disc-scroll")
@@ -366,11 +367,9 @@ class DiscussionPanel(Widget):
             return
         from tongs.widgets.diff_panel import ResolveRequested
 
-        if self._pending_resolve == disc.id:
-            self._pending_resolve = None
+        if self._resolve_confirm.arm(disc.id):
             self.post_message(ResolveRequested(disc.id, resolved=not disc.is_resolved))
         else:
-            self._pending_resolve = disc.id
             action = "Unresolve" if disc.is_resolved else "Resolve"
             self.app.notify(
                 f"{action} thread by @{disc.root_comment.author.username}? Press R again.",
