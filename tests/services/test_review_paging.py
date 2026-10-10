@@ -14,10 +14,12 @@ from tests.services.test_session import (
     make_summary,
     start_session,
 )
-from tongs.forges.models import MRPage, MRState
+from tongs.errors import NetworkError
+from tongs.forges.models import CIStatus, MRPage, MRState
 from tongs.services import (
     RepositoryRef,
     ReviewQuery,
+    ReviewRef,
     ReviewScope,
     ServiceError,
     ServiceErrorCode,
@@ -279,4 +281,173 @@ async def test_later_page_that_fails_validation_keeps_its_cursor() -> None:
     assert page.items == ()
     assert len(page.failures) == 1
     assert page.next_cursor == "2"
+    await session.close()
+
+
+class _LazyClient(_PagedClient):
+    """Pages without CI on request and looks CI up per review (#396)."""
+
+    supports_lazy_ci = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.with_ci: list[bool] = []
+        self.lookups: list[tuple[str, str, int, str]] = []
+        self.lookup_error: Exception | None = None
+        self.lookup_result: object = CIStatus.FAILED
+
+    async def list_mrs_page(
+        self,
+        repo_path: str,
+        state: str = "open",
+        page: int = 1,
+        per_page: int = 100,
+        *,
+        with_ci: bool = True,
+    ) -> MRPage:
+        self.with_ci.append(with_ci)
+        return await super().list_mrs_page(repo_path, state, page, per_page)
+
+    async def get_mr_ci_status(
+        self, repo_path: str, number: int, head_sha: str = ""
+    ) -> CIStatus:
+        return await self._lookup("cached", repo_path, number, head_sha)
+
+    async def get_mr_ci_status_fresh(
+        self, repo_path: str, number: int, head_sha: str = ""
+    ) -> CIStatus:
+        return await self._lookup("fresh", repo_path, number, head_sha)
+
+    async def _lookup(
+        self, kind: str, repo_path: str, number: int, head_sha: str
+    ) -> CIStatus:
+        self.lookups.append((kind, repo_path, number, head_sha))
+        if self.lookup_error is not None:
+            raise self.lookup_error
+        return cast(CIStatus, self.lookup_result)
+
+
+@pytest.mark.asyncio
+async def test_a_paged_read_without_ci_reaches_a_lazy_client() -> None:
+    client = _LazyClient()
+    session = await _session_with(client)
+    client.with_ci.clear()
+
+    await session.list_reviews(
+        ReviewQuery(
+            ReviewScope.ALL_OPEN, repository=_REPOSITORY, paged=True, with_ci=False
+        )
+    )
+    await session.list_reviews(
+        ReviewQuery(ReviewScope.ALL_OPEN, repository=_REPOSITORY, paged=True)
+    )
+
+    # The desktop's paged read keeps CI on the list; only an opt-out skips it.
+    assert client.with_ci == [False, True]
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_client_without_lazy_ci_keeps_its_page_with_ci() -> None:
+    client = _PagedClient()
+    session = await _session_with(client)
+
+    page = await session.list_reviews(
+        ReviewQuery(
+            ReviewScope.ALL_OPEN, repository=_REPOSITORY, paged=True, with_ci=False
+        )
+    )
+
+    assert {item.summary.ci_status for item in page.items} == {CIStatus.SUCCESS}
+    await session.close()
+
+
+def test_with_ci_must_be_a_boolean() -> None:
+    with pytest.raises(TypeError):
+        ReviewQuery(ReviewScope.ALL_OPEN, with_ci=cast(bool, 0))
+
+
+@pytest.mark.asyncio
+async def test_ci_lookup_names_the_review_and_its_head() -> None:
+    client = _LazyClient()
+    session = await _session_with(client)
+    review = ReviewRef(_REPOSITORY, 7)
+
+    cached = await session.get_review_ci_status(review, head_sha="sha-7")
+    fresh = await session.get_review_ci_status(review, head_sha="sha-7", fresh=True)
+
+    assert (cached, fresh) == (CIStatus.FAILED, CIStatus.FAILED)
+    assert client.lookups == [
+        ("cached", "acme/widgets", 7, "sha-7"),
+        ("fresh", "acme/widgets", 7, "sha-7"),
+    ]
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_ci_lookup_needs_an_issued_repository() -> None:
+    client = _LazyClient()
+    session = await _session_with(client)
+
+    with pytest.raises(ServiceError) as caught:
+        await session.get_review_ci_status(
+            ReviewRef(RepositoryRef("github.com", "acme/other"), 7)
+        )
+
+    assert caught.value.code is ServiceErrorCode.RESOURCE_NOT_ISSUED
+    assert client.lookups == []
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_ci_lookup_failures_are_translated() -> None:
+    client = _LazyClient()
+    client.lookup_error = NetworkError("private transport detail")
+    session = await _session_with(client)
+
+    with pytest.raises(ServiceError) as caught:
+        await session.get_review_ci_status(ReviewRef(_REPOSITORY, 7))
+
+    assert caught.value.code is ServiceErrorCode.NETWORK_UNAVAILABLE
+    assert "private" not in caught.value.message
+    await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kwargs", "result"),
+    [
+        ({"head_sha": cast(str, None)}, CIStatus.SUCCESS),
+        ({"head_sha": "x" * 129}, CIStatus.SUCCESS),
+        ({"head_sha": "../../x"}, CIStatus.SUCCESS),
+        ({}, "success"),
+    ],
+)
+async def test_ci_lookup_rejects_bad_input_and_bad_results(
+    kwargs: dict[str, object], result: object
+) -> None:
+    client = _LazyClient()
+    client.lookup_result = result
+    session = await _session_with(client)
+
+    with pytest.raises(ServiceError) as caught:
+        await session.get_review_ci_status(ReviewRef(_REPOSITORY, 7), **kwargs)  # type: ignore[arg-type]
+
+    expected = (
+        ServiceErrorCode.INVALID_RESPONSE
+        if not kwargs
+        else ServiceErrorCode.INVALID_INPUT
+    )
+    assert caught.value.code is expected
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_client_without_a_ci_lookup_reports_unknown() -> None:
+    client = _PagedClient()
+    session = await _session_with(client)
+
+    status = await session.get_review_ci_status(ReviewRef(_REPOSITORY, 7))
+
+    assert status is CIStatus.UNKNOWN
     await session.close()

@@ -119,6 +119,12 @@ class MRSummary:
     review_decision: ReviewDecision | None = None
     additions: int | None = None
     deletions: int | None = None
+    # The source branch head commit, when the list response names it, so CI
+    # can be looked up for one review after a list read without CI. Appended
+    # with a default so existing constructors and cached rows keep working.
+    # It is not named ``head_sha`` because MRDetail already has that field at
+    # a fixed position, filled from the revision the detail read returns.
+    head_commit_sha: str = ""
 
 
 @dataclass(frozen=True)

@@ -169,6 +169,10 @@ class ReviewQuery:
     # An explicit refresh: skip any cached list or first page, store what the
     # forge returns, and look up again a sign-in that failed recently.
     fresh: bool = False
+    # False lets a paged All Open read skip the per-review CI requests of
+    # forges that support it. Its rows then carry UNKNOWN CI and a head commit
+    # for ``ApplicationSession.get_review_ci_status``. Other reads ignore it.
+    with_ci: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, ReviewScope) or not isinstance(
@@ -196,6 +200,8 @@ class ReviewQuery:
             raise TypeError("paged must be a boolean")
         if not isinstance(self.fresh, bool):
             raise TypeError("fresh must be a boolean")
+        if not isinstance(self.with_ci, bool):
+            raise TypeError("with_ci must be a boolean")
         if self.cursor is not None:
             review_cursor_page(self.cursor)
             if (

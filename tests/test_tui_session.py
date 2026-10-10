@@ -901,3 +901,102 @@ async def test_all_open_page_still_waits_for_every_repository(
     gates[slow].set()
     page = await asyncio.wait_for(task, timeout=2)
     assert [item.ref.number for item in page.items] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_all_open_stream_reads_first_pages_without_ci(tmp_path: Path) -> None:
+    refs = [RepositoryRef("github.com", f"acme/repo-{index}") for index in range(3)]
+    session = InstrumentedAllOpenSession(tmp_path, refs, max_parallel=4)
+    session.release.set()
+    adapter = await discovered_adapter(session)
+
+    steps = [step async for step in adapter.stream_all_open(fresh=True)]
+
+    assert len(steps) == 4
+    assert [query.repository for query in session.queries] == refs
+    assert all(query.paged for query in session.queries)
+    assert not any(query.with_ci for query in session.queries)
+    assert all(query.cursor is None for query in session.queries)
+    assert all(query.fresh for query in session.queries)
+
+
+@pytest.mark.asyncio
+async def test_scoped_all_open_stream_reads_only_its_repository(
+    tmp_path: Path,
+) -> None:
+    refs = [RepositoryRef("github.com", f"acme/repo-{index}") for index in range(3)]
+    session = InstrumentedAllOpenSession(tmp_path, refs, max_parallel=4)
+    session.release.set()
+    adapter = await discovered_adapter(session)
+
+    steps = [
+        step
+        async for step in adapter.stream_all_open(
+            repository=session.local_repositories[1]
+        )
+    ]
+
+    assert [step.total for step in steps] == [1, 1]
+    assert [query.repository for query in session.queries] == [refs[1]]
+
+
+@pytest.mark.asyncio
+async def test_load_more_reads_only_repositories_with_a_cursor(
+    tmp_path: Path,
+) -> None:
+    more = RepositoryRef("github.com", "acme/more")
+    done = RepositoryRef("github.com", "acme/done")
+    pages = {more: ReviewPage((make_item(more, 3, 9),), (), "3")}
+    session = InstrumentedAllOpenSession(
+        tmp_path, [more, done], max_parallel=4, pages=pages
+    )
+    session.release.set()
+    adapter = await discovered_adapter(session)
+
+    steps = [step async for step in adapter.stream_all_open_more({more: "2"})]
+
+    assert [(step.repository, step.completed, step.total) for step in steps] == [
+        (None, 0, 1),
+        (more, 1, 1),
+    ]
+    assert steps[1].page.next_cursor == "3"
+    assert [(query.repository, query.cursor) for query in session.queries] == [
+        (more, "2")
+    ]
+    assert session.queries[0].paged is True
+    assert session.queries[0].with_ci is False
+    assert session.queries[0].fresh is False
+    # The later page's reviews are issued for detail reads and CI lookups.
+    assert adapter.review_ref(pages[more].items[0].summary) == ReviewRef(more, 3)
+
+
+@pytest.mark.asyncio
+async def test_ci_lookup_goes_through_the_session_with_the_listed_head(
+    tmp_path: Path,
+) -> None:
+    ref = RepositoryRef("github.com", "acme/widgets")
+    item = make_item(ref, 7, 1)
+    summary = replace(item.summary, head_commit_sha="sha-7")
+    item = ReviewListItem(item.ref, summary)
+    session = InstrumentedAllOpenSession(
+        tmp_path, [ref], max_parallel=4, pages={ref: ReviewPage((item,))}
+    )
+    session.release.set()
+    lookups: list[tuple[ReviewRef, str, bool]] = []
+
+    async def get_review_ci_status(
+        review: ReviewRef, *, head_sha: str = "", fresh: bool = False
+    ) -> CIStatus:
+        lookups.append((review, head_sha, fresh))
+        return CIStatus.FAILED
+
+    session.get_review_ci_status = get_review_ci_status  # type: ignore[attr-defined]
+    adapter = await discovered_adapter(session)
+    await adapter.list_reviews(ReviewScope.ALL_OPEN)
+
+    assert await adapter.get_ci_status(summary) is CIStatus.FAILED
+    assert await adapter.get_ci_status(summary, fresh=True) is CIStatus.FAILED
+    assert lookups == [
+        (ReviewRef(ref, 7), "sha-7", False),
+        (ReviewRef(ref, 7), "sha-7", True),
+    ]

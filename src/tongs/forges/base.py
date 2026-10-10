@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
 from tongs.forges.models import (
+    CIStatus,
     Commit,
     Discussion,
     ForgeMergeResult,
@@ -41,12 +42,17 @@ class ForgeClient(ABC):
         state: str = "open",
         page: int = 1,
         per_page: int = 100,
+        *,
+        with_ci: bool = True,
     ) -> MRPage:
         """Read one page of reviews, most recently updated first.
 
         Forge clients override this with a single list request and CI lookups
-        for that page only. This fallback keeps third-party clients working by
-        slicing the complete list.
+        for that page only. A client whose ``supports_lazy_ci`` is true skips
+        those lookups when ``with_ci`` is false: its rows then carry
+        ``CIStatus.UNKNOWN`` and a ``head_commit_sha`` for
+        ``get_mr_ci_status``. This fallback keeps third-party clients working by slicing the complete
+        list, which already carries CI, so it ignores ``with_ci``.
         """
         if page < 1 or per_page < 1:
             raise ValueError("page and per_page must be positive")
@@ -57,6 +63,23 @@ class ForgeClient(ABC):
             tuple(ordered[start : start + per_page]),
             has_next=len(ordered) > start + per_page,
         )
+
+    async def get_mr_ci_status(
+        self, repo_path: str, number: int, head_sha: str = ""
+    ) -> CIStatus:
+        """Read the CI status of one review's head commit.
+
+        ``head_sha`` is the head the caller listed; a client may read the
+        review to find it when it is empty. Forge clients override this. A
+        client without a lookup reports UNKNOWN without contacting the forge.
+        """
+        return CIStatus.UNKNOWN
+
+    async def get_mr_ci_status_fresh(
+        self, repo_path: str, number: int, head_sha: str = ""
+    ) -> CIStatus:
+        """Read one review's CI status without a response-cache result."""
+        return await self.get_mr_ci_status(repo_path, number, head_sha)
 
     @abstractmethod
     async def list_my_reviews(self) -> list[MRSummary]: ...
@@ -230,6 +253,11 @@ class ForgeClient(ABC):
         return False
 
     @property
+    def supports_lazy_ci(self) -> bool:
+        """Whether ``list_mrs_page`` honors ``with_ci=False``."""
+        return False
+
+    @property
     def supports_batched_review(self) -> bool:
         return False
 
@@ -264,17 +292,51 @@ def _newest_first_key(item: MRSummary) -> tuple[bool, datetime]:
 
 
 async def read_mr_page(
-    client: ForgeClient, repo_path: str, state: str, page: int, per_page: int
+    client: ForgeClient,
+    repo_path: str,
+    state: str,
+    page: int,
+    per_page: int,
+    *,
+    with_ci: bool = True,
 ) -> MRPage:
     """Read one review page from any client, including ones without paging.
 
     A client that does not define ``list_mrs_page`` (for example a duck-typed
     test double or an older plugin) gets the slicing fallback of the base class.
+    ``with_ci=False`` reaches only a client that declares ``supports_lazy_ci``;
+    any other client returns its page with CI as before.
     """
     if getattr(type(client), "list_mrs_page", None) is None:
         return await ForgeClient.list_mrs_page(
             client, repo_path, state=state, page=page, per_page=per_page
         )
+    if not with_ci and getattr(client, "supports_lazy_ci", False) is True:
+        return await client.list_mrs_page(
+            repo_path, state=state, page=page, per_page=per_page, with_ci=False
+        )
     return await client.list_mrs_page(
         repo_path, state=state, page=page, per_page=per_page
     )
+
+
+async def read_mr_ci_status(
+    client: ForgeClient,
+    repo_path: str,
+    number: int,
+    head_sha: str,
+    *,
+    fresh: bool = False,
+) -> CIStatus:
+    """Read one review's CI status from any client.
+
+    A client without the lookup (a duck-typed test double or an older plugin)
+    reports UNKNOWN without contacting the forge.
+    """
+    name = "get_mr_ci_status_fresh" if fresh else "get_mr_ci_status"
+    lookup = getattr(client, name, None)
+    if lookup is None and fresh:
+        lookup = getattr(client, "get_mr_ci_status", None)
+    if lookup is None:
+        return CIStatus.UNKNOWN
+    return await lookup(repo_path, number, head_sha)
