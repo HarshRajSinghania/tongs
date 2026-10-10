@@ -189,14 +189,26 @@ def _open_menu_parent(path: Path) -> int:
             "The per-user applications directory is unavailable.",
             retryable=True,
         ) from error
-    return _open_existing_menu_parent(path)
+    try:
+        return _open_existing_menu_parent(path)
+    except FileNotFoundError as error:
+        raise InstallerError(
+            InstallerErrorCode.STATE_CONFLICT,
+            "The per-user applications directory is unavailable.",
+            retryable=True,
+        ) from error
 
 
 def _open_existing_menu_parent(path: Path) -> int:
+    """Open the applications folder, following a symlink to a folder we own.
+
+    Dotfile managers often link this folder elsewhere, so the folder itself may
+    be a symlink. What it resolves to must be a directory owned by the current
+    user, and the entry files inside it are still opened without following
+    symlinks.
+    """
     try:
-        descriptor = os.open(
-            path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-        )
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except FileNotFoundError:
         raise
     except OSError as error:

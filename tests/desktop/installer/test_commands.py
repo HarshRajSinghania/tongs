@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +31,12 @@ from tongs.desktop.installer.models import (
 )
 
 from .helpers import documents, verified_metadata
+
+_ORPHAN = f".tongs-stage-{'a' * 32}"
+_LINKED = f".tongs-stage-{'b' * 32}"
+_FOREIGN = f".tongs-stage-{'c' * 32}"
+_SHARED = f".tongs-stage-{'d' * 32}"
+_UNRELATED = "keep-me"
 
 
 class _Stage:
@@ -274,3 +281,117 @@ def test_default_context_failure_is_actionable_without_starting_install(
     assert result == 2
     assert "missing" in errors.getvalue().lower()
     assert not (tmp_path / "data").exists()
+
+
+def _leave_staging(
+    context: DesktopCommandContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Leave an orphan beside entries the sweep must not touch."""
+    with context.store.transaction():
+        pass
+    root = context.store.paths.staging_root
+    orphan = root / _ORPHAN
+    (orphan / "runtime").mkdir(parents=True, mode=0o700)
+    orphan.chmod(0o700)
+    (orphan / "runtime" / "payload").write_text("leftover")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "marker").write_text("outside")
+    (root / _LINKED).symlink_to(outside, target_is_directory=True)
+    foreign = root / _FOREIGN
+    foreign.mkdir(mode=0o700)
+    foreign.chmod(0o700)
+    (foreign / "marker").write_text("foreign")
+    shared = root / _SHARED
+    shared.mkdir()
+    shared.chmod(0o755)
+    (root / _UNRELATED).mkdir(mode=0o700)
+    foreign_inode = foreign.stat().st_ino
+    real_fstat = os.fstat
+
+    def fstat(descriptor: int) -> os.stat_result:
+        details = real_fstat(descriptor)
+        if details.st_ino != foreign_inode:
+            return details
+        values = list(details[:10])
+        values[4] = details.st_uid + 1
+        return os.stat_result(values)
+
+    monkeypatch.setattr(os, "fstat", fstat)
+    return outside
+
+
+def _staging_names(context: DesktopCommandContext) -> list[str]:
+    return sorted(path.name for path in context.store.paths.staging_root.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("argv", "installed_first"),
+    [
+        (["install"], False),
+        (["update"], True),
+        (["repair"], True),
+        (["repair"], False),
+        (["uninstall"], True),
+        (["uninstall"], False),
+    ],
+)
+def test_lifecycle_commands_sweep_only_owned_orphaned_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    installed_first: bool,
+) -> None:
+    context, _stage, _launch = _context(tmp_path)
+    if installed_first:
+        assert run_desktop_cli(["install"], console_argv0="tongs", context=context) == 0
+    outside = _leave_staging(context, tmp_path, monkeypatch)
+
+    run_desktop_cli(
+        argv,
+        console_argv0="tongs",
+        context=context,
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert _staging_names(context) == sorted([_LINKED, _FOREIGN, _SHARED, _UNRELATED])
+    assert (outside / "marker").read_text() == "outside"
+    root = context.store.paths.staging_root
+    assert (root / _LINKED).is_symlink()
+    assert (root / _FOREIGN / "marker").read_text() == "foreign"
+
+
+def test_failed_repair_redownload_also_sweeps_before_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context, stage, _launch = _context(tmp_path)
+    _leave_staging(context, tmp_path, monkeypatch)
+
+    assert (
+        run_desktop_cli(
+            ["repair", "--redownload"],
+            console_argv0="tongs",
+            context=context,
+            stdout=io.StringIO(),
+        )
+        == 0
+    )
+
+    assert stage.requests == [InstallRequest()]
+    assert _ORPHAN not in _staging_names(context)
+
+
+@pytest.mark.parametrize("argv", [["status"], ["status", "--json"], []])
+def test_status_and_launch_never_sweep_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]
+) -> None:
+    context, _stage, _launch = _context(tmp_path)
+    assert run_desktop_cli(["install"], console_argv0="tongs", context=context) == 0
+    _leave_staging(context, tmp_path, monkeypatch)
+
+    assert run_desktop_cli(
+        argv, console_argv0="tongs", context=context, stdout=io.StringIO()
+    ) in {0, 1}
+
+    assert _ORPHAN in _staging_names(context)

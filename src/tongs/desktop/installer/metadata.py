@@ -43,6 +43,7 @@ from tongs.desktop.installer.download import (
     GITHUB_API_ORIGIN,
     download_asset_bytes,
     download_bytes,
+    download_optional_bytes,
 )
 from tongs.desktop.installer.models import (
     BuildIdentity,
@@ -97,20 +98,80 @@ async def discover_release(
     clock: Clock,
     core_version: str | None = None,
 ) -> ReleaseRecord:
-    """Enumerate immutable stable desktop releases and select one exact version.
+    """Select one immutable stable desktop release by its exact tag.
 
     Desktop releases share the core's ``vX.Y.Z`` tag: the same tag that publishes
-    the core to PyPI publishes the desktop assets to the GitHub Release.  Without
-    an explicit request the release whose version equals the running core is the
+    the core to PyPI publishes the desktop assets to the GitHub Release.  When a
+    version is known, either requested explicitly or taken from the running core,
+    exactly that tag is fetched with one request and every release check applies
+    to it, so the number of published releases never matters.  Without an
+    explicit request the release whose version equals the running core is the
     only acceptable choice, because the desktop archive is built from exactly that
     commit; an installer running a version with no published desktop release
     stops with both versions named rather than silently taking the newest.
+    Callers that pass neither version enumerate the release list and take the
+    newest stable release, which is then validated just as strictly.
     """
     now = clock()
     if now.tzinfo is None:
         _metadata_error("Installer clock must include a timezone.")
-    releases: list[ReleaseRecord] = []
-    seen_versions: set[str] = set()
+    if request.version is not None:
+        requested = _validate_requested_version(request.version)
+        release = await _fetch_tagged_release(
+            client, f"{RELEASE_TAG_PREFIX}{requested}", now, limits
+        )
+        if release is None:
+            _metadata_error("The requested desktop release is unavailable.")
+        return release
+    if core_version is not None:
+        current, tag = _core_release_tag(core_version)
+        release = (
+            await _fetch_tagged_release(client, tag, now, limits)
+            if tag is not None
+            else None
+        )
+        if release is None:
+            _no_release_for_core(core_version, current)
+        return release
+    return await _discover_newest_release(client, now, limits)
+
+
+async def _fetch_tagged_release(
+    client: httpx.AsyncClient,
+    tag: str,
+    now: datetime,
+    limits: InstallerLimits,
+) -> ReleaseRecord | None:
+    """Fetch one release by tag, or None when it is missing or not yet public."""
+    url = (
+        f"{GITHUB_API_ORIGIN}/repos/{OFFICIAL_REPOSITORY}/releases/tags/"
+        f"{quote(tag, safe='')}"
+    )
+    document = await download_optional_bytes(
+        client,
+        url,
+        limits=limits,
+        maximum_bytes=limits.max_metadata_bytes,
+    )
+    if document is None:
+        return None
+    value = _decode_json(document, limits.max_metadata_bytes, "release")
+    if not isinstance(value, dict):
+        _metadata_error("GitHub returned invalid desktop release metadata.")
+    if value.get("tag_name") != tag:
+        _metadata_error("GitHub returned a mismatched desktop release tag.")
+    if value.get("draft") is True or value.get("published_at") is None:
+        return None
+    return _parse_release(value, now)
+
+
+async def _discover_newest_release(
+    client: httpx.AsyncClient,
+    now: datetime,
+    limits: InstallerLimits,
+) -> ReleaseRecord:
+    """Enumerate stable tags, then strictly validate only the newest one."""
+    candidates: list[tuple[Version, JsonObject]] = []
     exhausted = False
     for page in range(1, limits.max_release_pages + 1):
         url = (
@@ -130,50 +191,54 @@ async def discover_release(
             _limit_error("GitHub returned too many releases in one page.")
         for raw_release in value:
             if not isinstance(raw_release, dict):
-                _metadata_error("GitHub returned invalid desktop release metadata.")
+                continue
             tag = raw_release.get("tag_name")
-            if not isinstance(tag, str) or not tag.startswith(RELEASE_TAG_PREFIX):
+            if not isinstance(tag, str):
+                continue
+            match = _RELEASE_RE.fullmatch(tag)
+            if match is None:
                 continue
             if (
                 raw_release.get("draft") is True
                 or raw_release.get("prerelease") is True
             ):
                 continue
-            release = _parse_release(raw_release, now)
-            if release.version in seen_versions:
-                _metadata_error("Desktop release versions are ambiguous.")
-            seen_versions.add(release.version)
-            releases.append(release)
+            candidates.append((Version(".".join(match.groups())), raw_release))
         if len(value) < limits.releases_per_page:
             exhausted = True
             break
     if not exhausted:
         _limit_error("Desktop release enumeration exceeded its page bound.")
-    if request.version is not None:
-        requested = _validate_requested_version(request.version)
-        matches = [release for release in releases if release.version == requested]
-        if len(matches) != 1:
-            _metadata_error("The requested desktop release is unavailable.")
-        return matches[0]
-    if core_version is not None:
-        return _select_release_for_core(releases, core_version)
-    if not releases:
+    if not candidates:
         _metadata_error("No immutable stable desktop release is available.")
-    return max(releases, key=lambda item: Version(item.version))
+    newest = max(version for version, _raw in candidates)
+    selected = [raw for version, raw in candidates if version == newest]
+    if len(selected) != 1:
+        _metadata_error("Desktop release versions are ambiguous.")
+    return _parse_release(selected[0], now)
 
 
-def _select_release_for_core(
-    releases: list[ReleaseRecord], core_version: str
-) -> ReleaseRecord:
+def _core_release_tag(core_version: str) -> tuple[Version, str | None]:
+    """Map a stable core version to its release tag; other versions have none."""
     try:
         current = Version(core_version)
     except InvalidVersion:
         _metadata_error("The installed core version is invalid.")
-    matches = [release for release in releases if Version(release.version) == current]
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        _metadata_error("Desktop release versions are ambiguous.")
+    parts = current.release
+    if (
+        current.epoch != 0
+        or current.pre is not None
+        or current.post is not None
+        or current.dev is not None
+        or current.local is not None
+        or any(parts[3:])
+    ):
+        return current, None
+    padded = (*parts[:3], *(0,) * (3 - len(parts[:3])))
+    return current, RELEASE_TAG_PREFIX + ".".join(str(part) for part in padded)
+
+
+def _no_release_for_core(core_version: str, current: Version) -> Never:
     raise InstallerError(
         InstallerErrorCode.INVALID_METADATA,
         f"No desktop release matches tongs {core_version}. A release is published "
@@ -338,7 +403,10 @@ def _parse_release(value: JsonObject, now: datetime) -> ReleaseRecord:
         _metadata_error("Desktop release metadata is not immutable.")
     published_at = _parse_timestamp(value.get("published_at"))
     if published_at > now + timedelta(minutes=5):
-        _metadata_error("Desktop release publication time is invalid.")
+        _metadata_error(
+            "The desktop release was published later than this computer's clock "
+            "shows. Check the system date and time, then retry."
+        )
     raw_assets = value.get("assets")
     if not isinstance(raw_assets, list) or not raw_assets:
         _metadata_error("Desktop release assets are missing.")

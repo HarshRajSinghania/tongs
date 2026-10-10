@@ -61,6 +61,58 @@ The desktop app was installed from a different persistent environment.
 `tongs desktop repair` from the environment you want to keep; it rebinds the
 installation on purpose rather than silently.
 
+## The installer cannot download a release
+
+`install`, `update` and `repair --redownload` ask GitHub's public API for the
+release that matches your tongs version. They do not send a token, so they share
+GitHub's anonymous limit of 60 requests an hour for each IP address, and each
+install uses five or six. A VPN, an office network or a CI runner can spend that
+budget for everyone behind the same address.
+
+```text
+GitHub's anonymous API rate limit was reached. Retry after 2026-10-09 14:32:05 EDT.
+```
+
+The message starts with `GitHub's anonymous API rate limit was reached.` and
+names the time, in your local time zone, when GitHub said the limit resets. Run
+the same command again after that time. Nothing was installed. When
+GitHub sends no reset time, the message asks you to wait a few minutes instead.
+
+`Desktop release download was rejected by its source.` is a different failure:
+GitHub refused the request for a reason other than the rate limit, and waiting
+does not help. Check that `api.github.com` is reachable without a proxy that
+rewrites responses.
+
+```text
+No desktop release matches tongs 1.0.5. A release is published for each stable core version under the tag v1.0.5; if that version was published minutes ago its desktop assets may still be building, so retry shortly, or request an explicit version.
+```
+
+The desktop release for your tongs version is not public yet, or your tongs
+version is a development build that has no release. Retry a few minutes after a
+new release, or name a published version with `tongs desktop install --version`.
+
+`The desktop release was published later than this computer's clock shows. Check the system date and time, then retry.`
+means the computer's clock is more than five minutes behind GitHub. Turn on
+automatic time synchronization, then run the command again.
+
+## The menu folder is a symlink
+
+Dotfile managers such as GNU Stow and chezmoi often replace
+`~/.local/share/applications` with a symlink. The installer follows that
+symlink, as long as it leads to a folder owned by your user, and writes the
+`tongs.desktop` entry there. The entry file itself is never followed: if
+`tongs.desktop` is a symlink, the installer stops with
+`The per-user Tongs menu entry is unsafe.`
+
+| Message | Cause |
+| --- | --- |
+| `The per-user applications directory has unsafe ownership.` | The folder, or the folder the symlink leads to, belongs to another user. Point the symlink at a folder you own. |
+| `The per-user applications directory is unsafe.` | The path, or the symlink's target, is not a folder. |
+| `The per-user applications directory is unavailable.` | The folder cannot be created, or the symlink leads to a folder that does not exist. Create the target folder, then retry. |
+
+The install rolls back when the menu entry cannot be written, so fix the folder
+and run the same command again.
+
 ## The app will not launch
 
 With nothing installed, `tongs desktop` exits with code 2 and prints
