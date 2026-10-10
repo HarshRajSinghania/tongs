@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Iterable, Sequence
 from contextlib import aclosing, suppress
+from dataclasses import dataclass, field
 from typing import ClassVar
 
 from textual import work
@@ -27,6 +28,29 @@ from tongs.services.models import (
 )
 from tongs.tui_services import TUIRepositoryProgress
 from tongs.widgets.mr_table import MRTable, mr_row_key
+
+# Each inbox tab and the table that shows it.
+_TAB_TABLES = {
+    "reviews": "#reviews-table",
+    "my-mrs": "#my-mrs-table",
+    "all-open": "#all-open-table",
+}
+
+
+@dataclass
+class _CILookups:
+    """The per-row CI lookups of one inbox tab.
+
+    Each reload or stop of the tab takes the next generation, and a lookup of
+    an older one never lands. Each queue entry says whether its lookup reads
+    past the CI cache.
+    """
+
+    group: str
+    generation: int = 0
+    queue: deque[tuple[MRSummary, bool]] = field(default_factory=deque)
+    queued: set[str] = field(default_factory=set)
+    workers: int = 0
 
 
 class InboxScreen(Screen):
@@ -71,13 +95,8 @@ class InboxScreen(Screen):
         # The next page of each All Open repository that has more to show.
         self._all_open_cursors: dict[RepositoryRef, str] = {}
         self._all_open_total = 0
-        # CI lookups for All Open rows. Each refresh, stop or tab switch takes
-        # the next generation, and a lookup of an older one never lands.
-        self._ci_generation = 0
-        # Each entry says whether its lookup reads past the CI cache.
-        self._ci_queue: deque[tuple[MRSummary, bool]] = deque()
-        self._ci_queued: set[str] = set()
-        self._ci_workers = 0
+        # Rows of every tab arrive without CI and are filled in per row.
+        self._ci = {tab_id: _CILookups(f"{tab_id}-ci") for tab_id in _TAB_TABLES}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -110,7 +129,8 @@ class InboxScreen(Screen):
         """Reconcile inbox tabs with one successful repository refresh."""
         self._repository_generation = generation
         self._stop_all_open()
-        self._stop_ci_lookups()
+        for tab_id in _TAB_TABLES:
+            self._stop_ci_lookups(tab_id)
         self._all_open_cursors.clear()
         self._loaded_tabs.clear()
         scoped_repo_removed = False
@@ -154,11 +174,13 @@ class InboxScreen(Screen):
         tab_id = event.pane.id
         if self.query_one(TabbedContent).active != "all-open":
             # Leaving All Open mid-load stops it; coming back loads it again.
-            # CI lookups stop too and resume for the rows still waiting.
+            # CI lookups stop too and resume for the rows still waiting. The
+            # Reviews and My MRs lookups finish in the background, like the
+            # list reads they follow.
             self._stop_all_open()
-            self._stop_ci_lookups()
+            self._stop_ci_lookups("all-open")
         elif tab_id == "all-open" and tab_id in self._loaded_tabs:
-            self._resume_ci_lookups()
+            self._resume_ci_lookups("all-open")
         if tab_id and tab_id not in self._loaded_tabs:
             self._loaded_tabs.add(tab_id)
             self._load_tab(tab_id)
@@ -173,7 +195,8 @@ class InboxScreen(Screen):
         self._load_tab(tab_id)
 
     def on_unmount(self) -> None:
-        self._stop_ci_lookups()
+        for tab_id in _TAB_TABLES:
+            self._stop_ci_lookups(tab_id)
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action == "load_more":
@@ -246,7 +269,9 @@ class InboxScreen(Screen):
             if not self.scoped_repo and not self.app.repos:
                 table.clear()
                 return
-            await self._load_page(table, ReviewScope.MY_REVIEWS, "Reviews", fresh=fresh)
+            await self._load_page(
+                table, "reviews", ReviewScope.MY_REVIEWS, "Reviews", fresh=fresh
+            )
         finally:
             self.loading_reviews = False
             with suppress(NoScreen):
@@ -261,7 +286,9 @@ class InboxScreen(Screen):
             if not self.scoped_repo and not self.app.repos:
                 table.clear()
                 return
-            await self._load_page(table, ReviewScope.MY_MRS, "My MRs", fresh=fresh)
+            await self._load_page(
+                table, "my-mrs", ReviewScope.MY_MRS, "My MRs", fresh=fresh
+            )
         finally:
             self.loading_my_mrs = False
             with suppress(NoScreen):
@@ -281,7 +308,7 @@ class InboxScreen(Screen):
         table.loading = True
         status.update("")
         # A new load replaces the rows, so lookups for the old ones stop.
-        self._stop_ci_lookups()
+        self._stop_ci_lookups("all-open")
         self._all_open_cursors.clear()
         try:
             if not self.scoped_repo and not self.app.repos:
@@ -402,7 +429,7 @@ class InboxScreen(Screen):
                 else f"[dim]{unloaded[0].upper()}{unloaded[1:]}[/]"
             )
             # Earlier rows still waiting for CI get their lookups again.
-            self._queue_ci_lookups(table, table.pending_ci_mrs())
+            self._queue_ci_lookups("all-open", table, table.pending_ci_mrs())
         else:
             status.update(f"[dim]{self._all_open_summary(table)}[/]")
         self._notify_failures(
@@ -433,7 +460,7 @@ class InboxScreen(Screen):
         table.merge_mrs(
             summaries, self.app.config.ascii_mode, replace=replace, ci_pending=True
         )
-        self._queue_ci_lookups(table, summaries, fresh=fresh)
+        self._queue_ci_lookups("all-open", table, summaries, fresh=fresh)
 
     def _all_open_summary(self, table: MRTable) -> str:
         """Count the loaded rows and say whether more can be loaded."""
@@ -451,6 +478,7 @@ class InboxScreen(Screen):
 
     def _queue_ci_lookups(
         self,
+        tab_id: str,
         table: MRTable,
         summaries: Iterable[MRSummary],
         *,
@@ -458,29 +486,34 @@ class InboxScreen(Screen):
     ) -> None:
         """Look up CI for rows that still show the loading marker.
 
-        Lookups run in table order, a few at a time, so a load more or a
-        refresh never waits behind every row's lookup. Each request also takes
-        a slot of the per-host request limit shared with every other read.
+        Lookups run in table order, a few at a time per tab, so a load more or
+        a refresh never waits behind every row's lookup. Each request also
+        takes a slot of the per-host request limit shared with every other
+        read.
         """
+        lookups = self._ci[tab_id]
         for summary in summaries:
             key = mr_row_key(summary)
-            if key in self._ci_queued or not table.is_ci_pending(summary):
+            if key in lookups.queued or not table.is_ci_pending(summary):
                 continue
-            self._ci_queued.add(key)
-            self._ci_queue.append((summary, fresh))
+            lookups.queued.add(key)
+            lookups.queue.append((summary, fresh))
         limit = max(1, self.app.config.max_parallel)
-        while self._ci_workers < min(limit, len(self._ci_queue)):
-            self._ci_workers += 1
+        while lookups.workers < min(limit, len(lookups.queue)):
+            lookups.workers += 1
             self.run_worker(
-                self._run_ci_lookups(table, self._ci_generation),
-                group="all-open-ci",
+                self._run_ci_lookups(tab_id, table, lookups.generation),
+                group=lookups.group,
                 exit_on_error=False,
             )
 
-    async def _run_ci_lookups(self, table: MRTable, generation: int) -> None:
+    async def _run_ci_lookups(
+        self, tab_id: str, table: MRTable, generation: int
+    ) -> None:
+        lookups = self._ci[tab_id]
         try:
-            while generation == self._ci_generation and self._ci_queue:
-                summary, fresh = self._ci_queue.popleft()
+            while generation == lookups.generation and lookups.queue:
+                summary, fresh = lookups.queue.popleft()
                 key = mr_row_key(summary)
                 if table.is_ci_pending(summary):
                     try:
@@ -489,33 +522,34 @@ class InboxScreen(Screen):
                         )
                     except ServiceError:
                         status = CIStatus.UNKNOWN
-                    if generation != self._ci_generation:
+                    if generation != lookups.generation:
                         return
                     table.set_ci_status(summary, status, self.app.config.ascii_mode)
                 # The key stays queued until its lookup ends, so a row is never
                 # looked up twice at once. A newer summary that replaced the row
                 # meanwhile is looked up next.
-                self._ci_queued.discard(key)
+                lookups.queued.discard(key)
                 current = table.get_mr(key)
                 if current is not None and table.is_ci_pending(current):
-                    self._queue_ci_lookups(table, (current,), fresh=fresh)
+                    self._queue_ci_lookups(tab_id, table, (current,), fresh=fresh)
         finally:
-            if generation == self._ci_generation:
-                self._ci_workers -= 1
+            if generation == lookups.generation:
+                lookups.workers -= 1
 
-    def _stop_ci_lookups(self) -> None:
-        """Drop queued CI lookups and make any in flight land nowhere."""
-        self._ci_generation += 1
-        self._ci_queue.clear()
-        self._ci_queued.clear()
-        self._ci_workers = 0
-        self.workers.cancel_group(self, "all-open-ci")
+    def _stop_ci_lookups(self, tab_id: str) -> None:
+        """Drop a tab's queued CI lookups and make any in flight land nowhere."""
+        lookups = self._ci[tab_id]
+        lookups.generation += 1
+        lookups.queue.clear()
+        lookups.queued.clear()
+        lookups.workers = 0
+        self.workers.cancel_group(self, lookups.group)
 
-    def _resume_ci_lookups(self) -> None:
+    def _resume_ci_lookups(self, tab_id: str) -> None:
         """Queue lookups again for rows a stop left waiting for CI."""
         with suppress(NoMatches):
-            table = self.query_one("#all-open-table", MRTable)
-            self._queue_ci_lookups(table, table.pending_ci_mrs())
+            table = self.query_one(_TAB_TABLES[tab_id], MRTable)
+            self._queue_ci_lookups(tab_id, table, table.pending_ci_mrs())
 
     def _stop_all_open(self) -> None:
         """Cancel an All Open load in flight so the tab loads again on return."""
@@ -531,20 +565,39 @@ class InboxScreen(Screen):
             self.query_one("#all-open-status", Static).update("")
 
     async def _load_page(
-        self, table: MRTable, scope: ReviewScope, label: str, *, fresh: bool = False
+        self,
+        table: MRTable,
+        tab_id: str,
+        scope: ReviewScope,
+        label: str,
+        *,
+        fresh: bool = False,
     ) -> None:
+        """Show one Reviews or My MRs read, then fill in its CI per row.
+
+        The list arrives without CI, so each row shows the loading marker
+        until its own lookup lands. A refresh reads CI past the cache too.
+        """
         try:
             page = await self.app.services.list_reviews(
                 scope, repository=self.scoped_repo, fresh=fresh
             )
         except ServiceError as error:
             self.notify(f"{label}: {error.message}", severity="warning", markup=False)
+            # The earlier rows stay, so any still waiting for CI get lookups.
+            self._queue_ci_lookups(tab_id, table, table.pending_ci_mrs())
             return
 
         if page.items or not page.failures:
-            table.clear()
-            for item in page.items:
-                table.add_mr_row(item.summary, self.app.config.ascii_mode)
+            # The new rows replace the old ones, so lookups for those stop.
+            self._stop_ci_lookups(tab_id)
+            summaries = [item.summary for item in page.items]
+            table.merge_mrs(
+                summaries, self.app.config.ascii_mode, replace=True, ci_pending=True
+            )
+            self._queue_ci_lookups(tab_id, table, summaries, fresh=fresh)
+        else:
+            self._queue_ci_lookups(tab_id, table, table.pending_ci_mrs())
         self._notify_failures(label, page.items, page.failures)
 
     def _notify_failures(
@@ -586,12 +639,7 @@ class InboxScreen(Screen):
 
     def _active_table(self) -> MRTable | None:
         tabbed = self.query_one(TabbedContent)
-        tab_map = {
-            "reviews": "#reviews-table",
-            "my-mrs": "#my-mrs-table",
-            "all-open": "#all-open-table",
-        }
-        table_id = tab_map.get(tabbed.active, "#reviews-table")
+        table_id = _TAB_TABLES.get(tabbed.active, "#reviews-table")
         return self.query_one(table_id, MRTable)
 
 

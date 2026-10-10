@@ -696,6 +696,24 @@ def _run(conclusion: str | None, status: str = "completed") -> dict:
     return {"status": status, "conclusion": conclusion}
 
 
+def _no_commit_statuses(handler):
+    """Answer the combined commit status request with no statuses.
+
+    Every other request goes to ``handler``, so check-run tests see only
+    their own requests.
+    """
+
+    def wrapped(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/status"):
+            # GitHub reports "pending" for a commit without any status.
+            return httpx.Response(
+                200, json={"state": "pending", "total_count": 0, "statuses": []}
+            )
+        return handler(request)
+
+    return wrapped
+
+
 class TestCheckRunAggregation:
     @pytest.mark.parametrize(
         ("runs", "expected"),
@@ -757,7 +775,7 @@ class TestCheckRunAggregation:
                 runs[19] = _run("failure")
             return httpx.Response(200, json={"total_count": 150, "check_runs": runs})
 
-        client, http = _make_github_client(handler)
+        client, http = _make_github_client(_no_commit_statuses(handler))
         async with http:
             status = await client._fetch_ci_status("acme", "repo", "abc")
 
@@ -773,7 +791,7 @@ class TestCheckRunAggregation:
             )
             return httpx.Response(200, json={"total_count": 150, "check_runs": runs})
 
-        client, http = _make_github_client(handler)
+        client, http = _make_github_client(_no_commit_statuses(handler))
         async with http:
             status = await client._fetch_ci_status("acme", "repo", "abc")
 
@@ -788,7 +806,7 @@ class TestCheckRunAggregation:
             runs = [_run("success")] * 100
             return httpx.Response(200, json={"total_count": 5000, "check_runs": runs})
 
-        client, http = _make_github_client(handler)
+        client, http = _make_github_client(_no_commit_statuses(handler))
         async with http:
             status = await client._fetch_ci_status("acme", "repo", "abc")
 
@@ -803,12 +821,271 @@ class TestCheckRunAggregation:
             pages.append(request.url.params["page"])
             return httpx.Response(200, json={"check_runs": [_run("success")]})
 
-        client, http = _make_github_client(handler)
+        client, http = _make_github_client(_no_commit_statuses(handler))
         async with http:
             status = await client._fetch_ci_status("acme", "repo", "abc")
 
         assert pages == ["1"]
         assert status == CIStatus.SUCCESS
+
+
+def _commit_status(state: str, context: str = "ci/jenkins") -> dict:
+    return {"state": state, "context": context}
+
+
+def _ci_sources_handler(
+    check_runs: list[dict] | httpx.Response,
+    statuses: list[dict] | httpx.Response,
+    paths: list[str] | None = None,
+):
+    """Answer one commit's check runs and combined status from fixed data.
+
+    A list is one complete page; a response is returned as is, for errors.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if paths is not None:
+            paths.append(request.url.path)
+        if request.url.path == "/repos/acme/repo/commits/abc/check-runs":
+            if isinstance(check_runs, httpx.Response):
+                return check_runs
+            return httpx.Response(
+                200, json={"total_count": len(check_runs), "check_runs": check_runs}
+            )
+        if request.url.path == "/repos/acme/repo/commits/abc/status":
+            if isinstance(statuses, httpx.Response):
+                return statuses
+            # The combined state is "pending" when there are no statuses at
+            # all, so only the individual statuses may count.
+            return httpx.Response(
+                200,
+                json={
+                    "state": "pending",
+                    "total_count": len(statuses),
+                    "statuses": statuses,
+                },
+            )
+        raise AssertionError(request.url.path)
+
+    return handler
+
+
+def _forbidden() -> httpx.Response:
+    return httpx.Response(403, json={"message": "Resource not accessible"})
+
+
+def _bad_gateway() -> httpx.Response:
+    return httpx.Response(502, json={"message": "bad gateway"})
+
+
+class TestCommitStatuses:
+    """Check runs and legacy commit statuses combine into one CI state (#385).
+
+    Any failure wins, then running and pending work, then success; a commit
+    with neither stays unknown.
+    """
+
+    @pytest.mark.parametrize(
+        ("runs", "statuses", "expected"),
+        [
+            # A pull request that only reports through commit statuses.
+            ([], [_commit_status("success")], CIStatus.SUCCESS),
+            ([], [_commit_status("failure")], CIStatus.FAILED),
+            ([], [_commit_status("error")], CIStatus.FAILED),
+            ([], [_commit_status("pending")], CIStatus.PENDING),
+            (
+                [],
+                [_commit_status("success", "a"), _commit_status("pending", "b")],
+                CIStatus.PENDING,
+            ),
+            # Both sources: any failure wins.
+            ([_run("success")], [_commit_status("failure")], CIStatus.FAILED),
+            ([_run("failure")], [_commit_status("success")], CIStatus.FAILED),
+            ([_run("failure")], [_commit_status("pending")], CIStatus.FAILED),
+            # Then pending work, whichever source reports it.
+            ([_run("success")], [_commit_status("pending")], CIStatus.PENDING),
+            (
+                [_run(None, "in_progress")],
+                [_commit_status("success")],
+                CIStatus.RUNNING,
+            ),
+            ([_run(None, "queued")], [_commit_status("success")], CIStatus.PENDING),
+            # Then success.
+            ([_run("success")], [_commit_status("success")], CIStatus.SUCCESS),
+            ([_run("skipped")], [_commit_status("success")], CIStatus.SUCCESS),
+            # Check runs alone keep their own aggregate.
+            ([_run("success")], [], CIStatus.SUCCESS),
+            ([_run("skipped")], [], CIStatus.SKIPPED),
+            ([_run("cancelled")], [], CIStatus.CANCELED),
+            # Nothing at all stays unknown, despite the combined "pending".
+            ([], [], CIStatus.UNKNOWN),
+            # A state GitHub may add later is not read as success.
+            ([], [_commit_status("something_new")], CIStatus.UNKNOWN),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_merge_rule(
+        self, runs: list[dict], statuses: list[dict], expected: CIStatus
+    ) -> None:
+        client, http = _make_github_client(_ci_sources_handler(runs, statuses))
+        async with http:
+            assert await client.get_mr_ci_status("acme/repo", 10, "abc") is expected
+
+    @pytest.mark.asyncio
+    async def test_a_lookup_is_two_requests(self) -> None:
+        paths: list[str] = []
+        client, http = _make_github_client(
+            _ci_sources_handler([], [_commit_status("success")], paths)
+        )
+        async with http:
+            status = await client.get_mr_ci_status("acme/repo", 10, "abc")
+
+        assert status is CIStatus.SUCCESS
+        assert sorted(paths) == [
+            "/repos/acme/repo/commits/abc/check-runs",
+            "/repos/acme/repo/commits/abc/status",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_status_only_pull_request_shows_its_status_in_lists(
+        self,
+    ) -> None:
+        """All Open with CI and the detail read use the same combined state."""
+        statuses = _ci_sources_handler([], [_commit_status("failure")])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/repos/acme/repo/pulls":
+                return httpx.Response(
+                    200, json=[_pr_api_json({"head": {"ref": "x", "sha": "abc"}})]
+                )
+            if request.url.path == "/repos/acme/repo/pulls/10":
+                return httpx.Response(
+                    200, json=_pr_api_json({"head": {"ref": "x", "sha": "abc"}})
+                )
+            if request.url.path == "/repos/acme/repo/pulls/10/reviews":
+                return httpx.Response(200, json=[])
+            return statuses(request)
+
+        client, http = _make_github_client(handler)
+        async with http:
+            page = await client.list_mrs_page("acme/repo")
+            detail = await client.get_mr("acme/repo", 10)
+
+        assert [item.ci_status for item in page.items] == [CIStatus.FAILED]
+        assert detail.ci_status is CIStatus.FAILED
+
+    @pytest.mark.parametrize(
+        ("runs", "statuses", "expected"),
+        [
+            # A token without the commit statuses permission still shows its
+            # check runs, and the reverse.
+            ([_run("success")], _forbidden(), CIStatus.SUCCESS),
+            (_forbidden(), [_commit_status("pending")], CIStatus.PENDING),
+            (
+                httpx.Response(404, json={"message": "Not Found"}),
+                [_commit_status("success")],
+                CIStatus.SUCCESS,
+            ),
+            # A failure is certain even when the other source failed to read.
+            ([_run("failure")], _bad_gateway(), CIStatus.FAILED),
+            (_bad_gateway(), [_commit_status("error")], CIStatus.FAILED),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_one_unreadable_source(
+        self,
+        runs: list[dict] | httpx.Response,
+        statuses: list[dict] | httpx.Response,
+        expected: CIStatus,
+    ) -> None:
+        client, http = _make_github_client(_ci_sources_handler(runs, statuses))
+        async with http:
+            assert await client.get_mr_ci_status("acme/repo", 10, "abc") is expected
+
+    @pytest.mark.parametrize(
+        ("runs", "statuses"),
+        [
+            # A passing source never hides a source that failed to answer.
+            ([_run("success")], _bad_gateway()),
+            (_bad_gateway(), [_commit_status("success")]),
+            (_forbidden(), _forbidden()),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_failed_read_raises_so_nothing_caches_it(
+        self,
+        runs: list[dict] | httpx.Response,
+        statuses: list[dict] | httpx.Response,
+    ) -> None:
+        client, http = _make_github_client(_ci_sources_handler(runs, statuses))
+        async with http:
+            with pytest.raises(ForgeError):
+                await client.get_mr_ci_status("acme/repo", 10, "abc")
+            # Lists keep reporting a failed read as unknown.
+            assert await client._fetch_ci_status("acme", "repo", "abc") is (
+                CIStatus.UNKNOWN
+            )
+
+    @pytest.mark.asyncio
+    async def test_statuses_page_up_to_total_count(self) -> None:
+        pages: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/check-runs"):
+                return httpx.Response(200, json={"total_count": 0, "check_runs": []})
+            page = int(request.url.params["page"])
+            pages.append(str(page))
+            statuses = [
+                _commit_status("success", f"ci/{page}-{index}")
+                for index in range(100 if page == 1 else 20)
+            ]
+            if page == 2:
+                statuses[5] = _commit_status("failure", "ci/late")
+            return httpx.Response(200, json={"total_count": 120, "statuses": statuses})
+
+        client, http = _make_github_client(handler)
+        async with http:
+            status = await client.get_mr_ci_status("acme/repo", 10, "abc")
+
+        assert pages == ["1", "2"]
+        assert status is CIStatus.FAILED
+
+    @pytest.mark.asyncio
+    async def test_statuses_beyond_the_page_limit_never_claim_success(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/check-runs"):
+                return httpx.Response(
+                    200, json={"total_count": 1, "check_runs": [_run("success")]}
+                )
+            statuses = [_commit_status("success")] * 100
+            return httpx.Response(200, json={"total_count": 5000, "statuses": statuses})
+
+        client, http = _make_github_client(handler)
+        async with http:
+            status = await client.get_mr_ci_status("acme/repo", 10, "abc")
+
+        assert status is CIStatus.UNKNOWN
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_status_response_is_unknown_unless_failed(
+        self,
+    ) -> None:
+        unreadable = httpx.Response(200, json=["not", "an", "object"])
+        client, http = _make_github_client(
+            _ci_sources_handler([_run("success")], unreadable)
+        )
+        async with http:
+            assert await client.get_mr_ci_status("acme/repo", 10, "abc") is (
+                CIStatus.UNKNOWN
+            )
+        unreadable = httpx.Response(200, json=["not", "an", "object"])
+        client, http = _make_github_client(
+            _ci_sources_handler([_run("failure")], unreadable)
+        )
+        async with http:
+            assert await client.get_mr_ci_status("acme/repo", 10, "abc") is (
+                CIStatus.FAILED
+            )
 
 
 def _search_item(number: int) -> dict:
@@ -1241,11 +1518,15 @@ class TestLazyCI:
         assert detail.head_sha == "abc123def456"
 
     @pytest.mark.asyncio
-    async def test_lookup_with_a_head_reads_only_its_check_runs(self) -> None:
+    async def test_lookup_with_a_head_reads_its_check_runs_and_statuses(
+        self,
+    ) -> None:
         paths: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             paths.append(request.url.path)
+            if request.url.path.endswith("/status"):
+                return httpx.Response(200, json={"total_count": 0, "statuses": []})
             return httpx.Response(
                 200,
                 json={
@@ -1262,7 +1543,10 @@ class TestLazyCI:
             status = await client.get_mr_ci_status("acme/repo", 10, "sha-1")
 
         assert status is CIStatus.RUNNING
-        assert paths == ["/repos/acme/repo/commits/sha-1/check-runs"]
+        assert sorted(paths) == [
+            "/repos/acme/repo/commits/sha-1/check-runs",
+            "/repos/acme/repo/commits/sha-1/status",
+        ]
 
     @pytest.mark.asyncio
     async def test_lookup_without_a_head_reads_the_pull_request_first(self) -> None:
@@ -1280,7 +1564,7 @@ class TestLazyCI:
                 },
             )
 
-        client, http = _make_github_client(handler)
+        client, http = _make_github_client(_no_commit_statuses(handler))
         async with http:
             status = await client.get_mr_ci_status("acme/repo", 10)
 

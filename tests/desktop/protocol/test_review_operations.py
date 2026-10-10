@@ -1346,6 +1346,8 @@ async def test_production_ndjson_roundtrip_uses_real_session_and_mock_transport(
             return httpx.Response(200, json=[])
         if request.url.path == "/repos/acme/widgets/commits/head-42/check-runs":
             return httpx.Response(200, json={"check_runs": []})
+        if request.url.path == "/repos/acme/widgets/commits/head-42/status":
+            return httpx.Response(200, json={"total_count": 0, "statuses": []})
         if request.url.path == "/repos/acme/widgets/issues/42/comments":
             assert request.method == "POST"
             assert json.loads(request.content) == {"body": "NDJSON comment"}

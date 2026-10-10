@@ -196,6 +196,9 @@ async def test_first_paint_reads_one_page_per_repository_before_any_ci_request(
                     "check_runs": [{"status": "completed", "conclusion": "failure"}],
                 },
             )
+        if path.endswith("/status"):
+            await release_ci.wait()
+            return httpx.Response(200, json={"total_count": 0, "statuses": []})
         raise AssertionError(path)
 
     http = httpx.AsyncClient(
@@ -234,8 +237,14 @@ async def test_first_paint_reads_one_page_per_repository_before_any_ci_request(
                 (projects[number // 10 - 1], number) for number in loaded
             )
         )
+        status_requests = [
+            (path, rows) for path, rows in requests if path.endswith("/status")
+        ]
+        assert sorted(path for path, _rows in status_requests) == sorted(
+            path.replace("/check-runs", "/status") for path, _rows in ci_requests
+        )
         # Every CI request was sent with rows already on screen.
-        assert all(rows > 0 for _path, rows in ci_requests)
+        assert all(rows > 0 for _path, rows in ci_requests + status_requests)
         assert {mr.ci_status for mr in table._mr_data.values()} == {CIStatus.FAILED}
         assert len(lists) == 3
     await http.aclose()
