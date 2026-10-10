@@ -268,19 +268,40 @@ class InboxScreen(Screen):
                         )
         except ServiceError as error:
             if load == self._all_open_load:
-                status.update("")
+                # Rows that already arrived replaced the earlier list, so say
+                # the list is incomplete rather than clearing the status.
+                status.update(
+                    f"[dim]List incomplete: {_open_count(len(items))} loaded[/]"
+                    if items
+                    else ""
+                )
                 self.notify(
                     f"All Open: {error.message}", severity="warning", markup=False
+                )
+                self._notify_failures(
+                    "All Open", items, self.app.services.deduplicate_failures(failures)
                 )
             return
         if load != self._all_open_load:
             return
         if not items and not failures:
             table.clear()
-        status.update(
-            f"[dim]{_open_count(table.row_count)} across {total} "
-            f"{_repositories(total)}[/]"
-        )
+        if not items and failures:
+            failed = len(
+                {failure.repository or failure.hostname for failure in failures}
+            )
+            unloaded = f"{failed} of {total} {_repositories(total)} could not be loaded"
+            # Nothing new arrived, so any rows on screen are the earlier load's.
+            status.update(
+                f"[dim]Showing earlier results: {unloaded}[/]"
+                if table.row_count
+                else f"[dim]{unloaded[0].upper()}{unloaded[1:]}[/]"
+            )
+        else:
+            status.update(
+                f"[dim]{_open_count(table.row_count)} across {total} "
+                f"{_repositories(total)}[/]"
+            )
         self._notify_failures(
             "All Open", items, self.app.services.deduplicate_failures(failures)
         )
