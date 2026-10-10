@@ -659,30 +659,21 @@ class TUIServiceAdapter:
         )
 
     async def _list_all_open(self, *, fresh: bool = False) -> ReviewPage:
-        refs_by_host: dict[str, list[RepositoryRef]] = {}
-        for ref in dict.fromkeys(self._repository_refs.values()):
-            refs_by_host.setdefault(ref.hostname, []).append(ref)
-        if not refs_by_host:
+        # Each repository is its own read, so one failing repository never
+        # hides the others on its host. The unscoped session read is not used
+        # because it covers every repository the session ever issued.
+        refs = tuple(dict.fromkeys(self._repository_refs.values()))
+        if not refs:
             return ReviewPage((), ())
         semaphore = asyncio.Semaphore(self.session.config.max_parallel)
 
-        async def fetch_host(refs: list[RepositoryRef]) -> ReviewPage:
+        async def fetch_repository(ref: RepositoryRef) -> ReviewPage:
             async with semaphore:
-                items: list[ReviewListItem] = []
-                failures: list[HostFailure] = []
-                for ref in refs:
-                    page = await self.session.list_reviews(
-                        ReviewQuery(ReviewScope.ALL_OPEN, repository=ref, fresh=fresh)
-                    )
-                    items.extend(page.items)
-                    failures.extend(page.failures)
-                    if page.failures:
-                        break
-                return ReviewPage(tuple(items), tuple(failures))
+                return await self.session.list_reviews(
+                    ReviewQuery(ReviewScope.ALL_OPEN, repository=ref, fresh=fresh)
+                )
 
-        pages = await asyncio.gather(
-            *(fetch_host(refs) for refs in refs_by_host.values())
-        )
+        pages = await asyncio.gather(*(fetch_repository(ref) for ref in refs))
         items = [item for page in pages for item in page.items]
         failures = [failure for page in pages for failure in page.failures]
         items.sort(key=lambda item: item.summary.updated_at, reverse=True)
