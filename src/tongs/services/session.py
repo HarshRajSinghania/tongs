@@ -681,9 +681,8 @@ class ApplicationSession:
                     ):
                         # Drop the cached list and first page first: what the
                         # cache holds afterwards was read after this refresh.
-                        await _invalidate_repository_reads(
-                            client, repository.project_path
-                        )
+                        # Cached diffs stay; the refresh does not reread them.
+                        await _invalidate_review_lists(client, repository.project_path)
                     if query.scope == ReviewScope.ALL_OPEN and query.paged:
                         assert repository is not None
                         page = await read_mr_page(
@@ -1010,14 +1009,15 @@ class ApplicationSession:
             return client
 
     async def _invalidate_pipeline_reads(self, pipeline: PipelineRef) -> None:
-        """Drop a repository's cached reads after a CI retry or cancel.
+        """Drop a repository's cached review lists after a CI retry or cancel.
 
         The cached review list carries each review's CI status, so it would
-        otherwise show the state before the action until it expires.
+        otherwise show the state before the action until it expires. No other
+        cached read holds CI status, so cached diffs stay.
         """
         repository = pipeline.repository
         client = await self._client_for_repository(repository, "invalidate_pipeline")
-        await _invalidate_repository_reads(client, repository.project_path)
+        await _invalidate_review_lists(client, repository.project_path)
 
     def _forget_auth_failures(self, hostnames: tuple[str, ...]) -> None:
         forget = getattr(self._registry, "forget_auth_failures", None)
@@ -1323,13 +1323,16 @@ def _page_items(page: object) -> tuple[MRSummary, ...]:
     return page.items
 
 
-async def _invalidate_repository_reads(client: ForgeClient, repo_path: str) -> bool:
-    """Drop a repository's cached reads, including on duck-typed clients.
+async def _invalidate_review_lists(client: ForgeClient, repo_path: str) -> bool:
+    """Drop a repository's cached review lists, including on duck-typed clients.
 
-    A client that does not define ``invalidate_repository_reads`` (a test
+    A client without the narrower ``invalidate_review_list_reads`` drops every
+    cached read of the repository instead. One that defines neither (a test
     double or an older plugin) owns no cache through this interface.
     """
-    invalidate = getattr(client, "invalidate_repository_reads", None)
+    invalidate = getattr(client, "invalidate_review_list_reads", None)
+    if invalidate is None:
+        invalidate = getattr(client, "invalidate_repository_reads", None)
     if invalidate is None:
         return False
     return bool(await invalidate(repo_path))

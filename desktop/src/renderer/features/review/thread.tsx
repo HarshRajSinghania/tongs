@@ -277,7 +277,9 @@ export function threadIsUnresolved(discussion: DiscussionDto): boolean {
  * The old-side threads of one line of a file. Both forges store a comment's
  * new path even when it sits on the old side of a renamed file, so the old
  * side reads the threads stored under either path, the same two paths
- * `threadFileCounts` sums for the header.
+ * `threadFileCounts` sums for the header. When both paths hold threads on the
+ * line, their places are counted again over the combined list, so two threads
+ * are not both named "1 of 1".
  */
 export function threadsOnOldLine(
   slot: DiscussionThreadSlot,
@@ -289,7 +291,16 @@ export function threadsOnOldLine(
   const byNew = threadsOnLine(slot, file.new_path, "old", line);
   if (byNew.length === 0) return byOld;
   if (byOld.length === 0) return byNew;
-  return [...byOld, ...byNew];
+  const combined = [...byOld, ...byNew];
+  return Object.freeze(
+    combined.map((thread, index) =>
+      Object.freeze({
+        ...thread,
+        ordinal: index + 1,
+        total: combined.length,
+      }),
+    ),
+  );
 }
 
 /** The threads anchored to one line of one side, in stored order. */

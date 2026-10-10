@@ -321,3 +321,100 @@ async def test_a_mutation_elsewhere_does_not_stop_a_read_being_stored(
     await read
 
     assert await _cached_keys(store) == {"github.com:acme/repo:mrs:open:page:100:1"}
+
+
+@pytest.mark.asyncio
+async def test_review_list_invalidation_drops_lists_and_keeps_diffs(
+    store: CacheStore,
+) -> None:
+    forge = _Forge()
+    client = _client(forge, store)
+    await client.list_mrs("acme/repo")
+    await client.list_mrs_page("acme/repo", page=1)
+    await client.get_mr_diff("acme/repo", 1)
+
+    assert await client.invalidate_review_list_reads("acme/repo") is True
+
+    assert await _cached_keys(store) == {"github.com:acme/repo:mr:1:diff"}
+    assert client._dirty_review_prefixes == {}
+    await client.get_mr_diff("acme/repo", 1)
+    assert forge.reads == ["list", "page", "diff"]
+
+
+@pytest.mark.asyncio
+async def test_review_list_invalidation_lets_a_diff_read_in_flight_be_stored(
+    store: CacheStore,
+) -> None:
+    forge = _Forge()
+    client = _client(forge, store)
+    forge.hold = asyncio.Event()
+    diff = asyncio.create_task(client.get_mr_diff("acme/repo", 1))
+    page = asyncio.create_task(client.list_mrs_page("acme/repo", page=1))
+    while len(forge.reads) < 2:
+        await asyncio.sleep(0)
+
+    assert await client.invalidate_review_list_reads("acme/repo") is True
+    forge.hold.set()
+    await asyncio.gather(diff, page)
+
+    # The list read may predate the refresh; the diff read is unaffected.
+    assert await _cached_keys(store) == {"github.com:acme/repo:mr:1:diff"}
+
+
+@pytest.mark.asyncio
+async def test_invalidation_marks_stay_bounded_without_reads_in_flight(
+    store: CacheStore,
+) -> None:
+    forge = _Forge()
+    client = _client(forge, store)
+    for number in range(500):
+        assert await client.invalidate_review_reads("acme/repo", number) is True
+        assert await client.invalidate_repository_reads(f"acme/repo-{number}") is True
+        await client.list_mrs("acme/repo")
+
+    assert len(client._marked_generations) == 0
+    assert client._read_generations == {}
+
+
+@pytest.mark.asyncio
+async def test_invalidation_marks_are_kept_only_while_an_older_read_is_in_flight(
+    store: CacheStore,
+) -> None:
+    forge = _Forge()
+    client = _client(forge, store)
+    forge.hold = asyncio.Event()
+    read = asyncio.create_task(client.get_mr_diff("acme/repo", 1))
+    await forge.started.wait()
+
+    for number in range(2, 202):
+        await client.invalidate_review_reads("acme/repo", number)
+    await client.invalidate_review_reads("acme/repo", 1)
+    # One prefix per review plus the shared list prefix, all newer than the
+    # read in flight.
+    assert len(client._marked_generations) == 201 + 1
+    forge.hold.set()
+    await read
+
+    # The read was covered by the invalidation of MR 1, so it was not stored,
+    # and with nothing in flight every mark is gone.
+    assert await _cached_keys(store) == set()
+    assert len(client._marked_generations) == 0
+    assert client._read_generations == {}
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_read_releases_its_generation(store: CacheStore) -> None:
+    forge = _Forge()
+    client = _client(forge, store)
+    forge.hold = asyncio.Event()
+    read = asyncio.create_task(client.list_mrs("acme/repo"))
+    await forge.started.wait()
+    await client.invalidate_repository_reads("acme/repo")
+    assert len(client._marked_generations) == 1
+
+    read.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await read
+
+    assert client._read_generations == {}
+    assert len(client._marked_generations) == 0
