@@ -3,187 +3,111 @@
 Entry point: tongs-mcp
 Tools are high-level only. Destructive actions (merge, close, reopen,
 cancel) are intentionally excluded as a security boundary.
+
+This module is the only one that touches the MCP SDK: it registers the tools,
+owns the server's application session for its lifetime, and turns a
+:class:`~tongs.mcp.tools.ToolFailure` into the SDK's ``ToolError`` so clients
+read the message. The tool logic lives in :mod:`tongs.mcp.tools`.
 """
 
 from __future__ import annotations
 
-import re
-from collections.abc import Iterator
-from contextlib import contextmanager
+import logging
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
-from tongs.config import load_config
-from tongs.errors import ForgeError
-from tongs.forges.base import ForgeClient
-from tongs.forges.models import MRState
-from tongs.forges.registry import ForgeRegistry
-from tongs.scanner.repo import ForgeType
-from tongs.services.errors import translate_error
+from tongs.mcp import tools
+from tongs.mcp.tools import DEFAULT_LIST_LIMIT, SessionHolder, ToolFailure
+from tongs.services.errors import ServiceError
+from tongs.services.session import ApplicationSession
 
-mcp = FastMCP("tongs")
+log = logging.getLogger(__name__)
 
-_registry: ForgeRegistry | None = None
-_REPO_PATH_RE = re.compile(r"^(?!.*\.\.)[\w.-]+(?:/[\w.-]+){2,}$", re.ASCII)
+# The one application session this process uses, started on the first call.
+sessions = SessionHolder()
 
 
-def _get_registry() -> ForgeRegistry:
-    global _registry
-    if _registry is None:
-        config = load_config()
-        _registry = ForgeRegistry(
-            extra_gitlab_hosts=config.extra_gitlab_hosts,
-            extra_github_hosts=config.extra_github_hosts,
-            request_timeout=config.request_timeout,
-            max_parallel=config.max_parallel,
-        )
-    return _registry
-
-
-def _parse_host_repo(repo_path: str) -> tuple[str, str]:
-    """Split 'hostname/owner/repo' into (hostname, 'owner/repo').
-
-    Only github.com, gitlab.com and the hosts configured in config.toml are
-    accepted, the same set the terminal and desktop apps use. Any other host
-    is rejected here, before a client is built, a token is looked up or a
-    request is made.
-    """
-    if not _REPO_PATH_RE.match(repo_path):
-        raise ValueError(f"repo_path must be 'hostname/owner/repo', got: {repo_path}")
-    hostname, path = repo_path.split("/", 1)
-    registry = _get_registry()
-    host = (
-        registry.get_host(hostname) if hostname in registry.active_hostnames() else None
-    )
-    if host is None:
-        raise ValueError(
-            f"Host {hostname!r} is not configured; add it under [hosts.*] in "
-            "config.toml to use it with tongs-mcp"
-        )
-    if host.forge_type == ForgeType.GITHUB and path.count("/") != 1:
-        raise ValueError(
-            f"repo_path for a GitHub host must be 'hostname/owner/repo', got: {repo_path}"
-        )
-    return hostname, path
-
-
-@contextmanager
-def _redacted_forge_errors(operation: str) -> Iterator[None]:
-    """Replace any forge error with a fixed message before it reaches the client.
-
-    Forge error text can quote credentials, config contents or response
-    bodies, so only the category message from :func:`translate_error` is
-    returned and the original exception is not chained.
-    """
+@asynccontextmanager
+async def lifespan(_server: FastMCP) -> AsyncIterator[None]:
+    """Close the application session when the server shuts down."""
     try:
         yield
-    except ForgeError as error:
-        message = translate_error(error, operation=operation).message
-        raise ToolError(f"{operation} failed: {message}") from None
+    finally:
+        with anyio.CancelScope(shield=True):
+            try:
+                await sessions.close()
+            except ServiceError:
+                log.warning("The tongs-mcp application session did not close cleanly")
 
 
-async def _client_for(repo_path: str) -> tuple[ForgeClient, str]:
-    """Return the client for an admitted repo_path and its 'owner/repo' part."""
-    hostname, path = _parse_host_repo(repo_path)
-    client = await _get_registry().get_client(hostname)
-    return client, path
+mcp = FastMCP("tongs", lifespan=lifespan)
 
 
-def _is_github(repo_path: str) -> bool:
-    """Whether an admitted repo_path names a GitHub host."""
-    host = _get_registry().get_host(repo_path.split("/", 1)[0])
-    return host is not None and host.forge_type == ForgeType.GITHUB
+async def _run[ResultT](
+    operation: str,
+    call: Callable[[ApplicationSession], Awaitable[ResultT]],
+) -> ResultT:
+    try:
+        session = await tools.open_session(sessions, operation)
+        return await call(session)
+    except ToolFailure as failure:
+        raise ToolError(failure.message) from None
 
 
 @mcp.tool()
-async def list_mrs(repo_path: str, state: str = "open") -> list[dict]:
-    """List merge requests for a repository.
+async def list_mrs(
+    repo_path: str, state: str = "open", limit: int = DEFAULT_LIST_LIMIT
+) -> list[dict]:
+    """List merge requests for a repository, most recently updated first.
+
+    Reads one page of at most `limit` reviews. Open reviews include their CI
+    status; closed and merged ones report it as unknown when the forge list
+    does not carry it.
 
     Args:
         repo_path: Repository path as 'hostname/owner/repo' (e.g., 'github.com/acme/app')
-        state: MR state filter ('open', 'closed', 'merged')
+        state: MR state filter: 'open' (default), 'closed' or 'merged'
+        limit: Maximum number of reviews to return, 1 to 100 (default 30)
     """
-    with _redacted_forge_errors("list_mrs"):
-        client, path = await _client_for(repo_path)
-        if state == "merged" and _is_github(repo_path):
-            # GitHub has no merged filter: a merged pull request is a closed
-            # one with merged_at set, which the client reads as MERGED.
-            closed = await client.list_mrs(path, state="closed")
-            mrs = [mr for mr in closed if mr.state is MRState.MERGED]
-        else:
-            mrs = await client.list_mrs(path, state=state)
-        return [
-            {
-                "number": mr.number,
-                "title": mr.title,
-                "author": mr.author.username,
-                "source_branch": mr.source_branch,
-                "target_branch": mr.target_branch,
-                "ci_status": mr.ci_status.value,
-                "web_url": mr.web_url,
-            }
-            for mr in mrs
-        ]
+    return await _run(
+        "list_mrs", lambda session: tools.list_mrs(session, repo_path, state, limit)
+    )
 
 
 @mcp.tool()
 async def get_mr(repo_path: str, number: int) -> dict:
     """Get detailed information about a merge request.
 
+    The result includes head_sha, which approve_mr requires.
+
     Args:
         repo_path: Repository path as 'hostname/owner/repo'
         number: MR/PR number
     """
-    with _redacted_forge_errors("get_mr"):
-        client, path = await _client_for(repo_path)
-        mr = await client.get_mr(path, number)
-        return {
-            "number": mr.number,
-            "title": mr.title,
-            "description": mr.description,
-            "author": mr.author.username,
-            "state": mr.state.value,
-            "source_branch": mr.source_branch,
-            "target_branch": mr.target_branch,
-            "ci_status": mr.ci_status.value,
-            "is_draft": mr.is_draft,
-            "has_conflicts": mr.has_conflicts,
-            "additions": mr.additions,
-            "deletions": mr.deletions,
-            "approvals": [u.username for u in mr.approvals],
-            "reviewers": [u.username for u in mr.reviewers],
-            "labels": list(mr.labels),
-            "web_url": mr.web_url,
-        }
+    return await _run(
+        "get_mr", lambda session: tools.get_mr(session, repo_path, number)
+    )
 
 
 @mcp.tool()
 async def get_mr_diff(repo_path: str, number: int) -> str:
     """Get the diff for a merge request as unified diff text.
 
+    Every changed file appears. A file without a patch gets a marker such as
+    [binary], [renamed] or [truncated]. Output stops at 256 KiB with a note
+    naming how many files were left out.
+
     Args:
         repo_path: Repository path as 'hostname/owner/repo'
         number: MR/PR number
     """
-    with _redacted_forge_errors("get_mr_diff"):
-        client, path = await _client_for(repo_path)
-        changes = await client.get_mr_diff(path, number)
-        parts = []
-        for change in changes:
-            old_path = (
-                change.get("old_path")
-                or change.get("previous_filename")
-                or change.get("filename", "")
-            )
-            new_path = change.get("new_path") or change.get("filename", "")
-            diff = (change.get("diff") or change.get("patch") or "").rstrip("\n")
-            if diff:
-                if not diff.lstrip().startswith("--- "):
-                    parts.append(f"--- a/{old_path}")
-                    parts.append(f"+++ b/{new_path}")
-                parts.append(diff)
-        return "\n".join(parts)
+    return await _run(
+        "get_mr_diff", lambda session: tools.get_mr_diff(session, repo_path, number)
+    )
 
 
 @mcp.tool()
@@ -195,49 +119,42 @@ async def post_comment(repo_path: str, number: int, body: str) -> str:
         number: MR/PR number
         body: Comment text (markdown supported)
     """
-    with _redacted_forge_errors("post_comment"):
-        client, path = await _client_for(repo_path)
-        await client.add_comment(path, number, body)
-        return "Comment posted successfully"
+    return await _run(
+        "post_comment",
+        lambda session: tools.post_comment(session, repo_path, number, body),
+    )
 
 
 @mcp.tool()
-async def approve_mr(repo_path: str, number: int) -> str:
-    """Approve a merge request.
+async def approve_mr(repo_path: str, number: int, head_sha: str = "") -> str:
+    """Approve a merge request at the head commit you reviewed.
+
+    head_sha is required: call get_mr first and pass the head_sha it
+    returned. The approval fails if the review has new commits since then.
 
     Args:
         repo_path: Repository path as 'hostname/owner/repo'
         number: MR/PR number
+        head_sha: Required. The head_sha that get_mr returned
     """
-    with _redacted_forge_errors("approve_mr"):
-        client, path = await _client_for(repo_path)
-        await client.approve_mr(path, number)
-        return "MR approved successfully"
+    return await _run(
+        "approve_mr",
+        lambda session: tools.approve_mr(session, repo_path, number, head_sha),
+    )
 
 
 @mcp.tool()
 async def list_pipelines(repo_path: str, number: int) -> list[dict]:
-    """List pipelines/CI runs for a merge request.
+    """List the 20 most recent pipelines/CI runs for a merge request.
 
     Args:
         repo_path: Repository path as 'hostname/owner/repo'
         number: MR/PR number
     """
-    with _redacted_forge_errors("list_pipelines"):
-        client, path = await _client_for(repo_path)
-        pipelines = await client.list_mr_pipelines(path, number)
-        return [
-            {
-                "id": p.id,
-                "status": p.status.value,
-                "ref": p.ref,
-                "sha": p.sha[:7],
-                "source": p.source,
-                "duration_seconds": p.duration_seconds,
-                "web_url": p.web_url,
-            }
-            for p in pipelines
-        ]
+    return await _run(
+        "list_pipelines",
+        lambda session: tools.list_pipelines(session, repo_path, number),
+    )
 
 
 def main() -> None:
