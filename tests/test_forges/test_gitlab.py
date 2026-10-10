@@ -233,6 +233,16 @@ class TestParseMRDetail:
         # wrapper dict, so the username key is not at the top level.
         assert len(detail.approvals) == 1
 
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [("1000+", 1000), (7, 7), (None, 0), ("", 0), ("n/a", 0)],
+    )
+    def test_parse_mr_detail_changes_count_shapes(self, raw: object, expected: int):
+        client = self._client()
+        data = _mr_api_json({"changes_count": raw})
+        detail = client._parse_mr_detail(data, "acme/widgets")
+        assert detail.changes_count == expected
+
 
 class TestParseNote:
     def _client(self) -> GitLabClient:

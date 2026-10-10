@@ -118,6 +118,18 @@ def _parse_mr_state(value: str) -> MRState:
     return mapping.get(value, MRState.OPEN)
 
 
+def _parse_changes_count(value: object) -> int:
+    """Parse GitLab's ``changes_count``, a string such as ``"12"`` or ``"1000+"``.
+
+    GitLab appends ``+`` when the MR overflows its diff limits; the number is
+    then a lower bound. Anything else unparsable counts as zero.
+    """
+    if isinstance(value, int):
+        return value
+    digits = str(value or "").strip().removesuffix("+")
+    return int(digits) if digits.isdecimal() else 0
+
+
 def _parse_user(data: dict | None) -> User:
     if not data:
         return User(username="unknown")
@@ -768,7 +780,7 @@ class GitLabClient(ForgeClient):
             approvals=tuple(approvals),
             reviewers=tuple(reviewers),
             assignees=tuple(assignees),
-            changes_count=int(data.get("changes_count", 0) or 0),
+            changes_count=_parse_changes_count(data.get("changes_count")),
             head_sha=diff_refs.get("head_sha", ""),
             base_sha=diff_refs.get("base_sha", ""),
             start_sha=diff_refs.get("start_sha") or None,
