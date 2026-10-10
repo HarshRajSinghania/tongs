@@ -184,9 +184,9 @@ and the label and cancellation rules.
 pull requests into `main` that match its path filter, on stable `vX.Y.Z` tags,
 and on a manual `workflow_dispatch` dry run from `main`.
 
-`desktop-rpm.yml` (Desktop Fedora RPM), `desktop-python-rpms.yml` (Desktop Python
-companion RPMs) and `desktop-archive.yml` (Reproducible desktop archive) are manual
-only (`workflow_dispatch`); the production gate's `rpm-lifecycle` and `archive` jobs
+`desktop-python-rpms.yml` (Desktop Python companion RPMs) and
+`desktop-archive.yml` (Reproducible desktop archive) are manual only
+(`workflow_dispatch`); the production gate's `rpm-lifecycle` and `archive` jobs
 prove the same source rebuild, companion closure, lifecycle and byte-identical
 rebuild against the receipt-bound fresh archive whenever the `packaging` lane
 is selected; a change to renderer, shared or stylesheet source under

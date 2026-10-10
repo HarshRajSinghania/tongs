@@ -48,11 +48,15 @@ _GH_WRITE_OPTIONS = re.compile(
 )
 
 #: The dispatch-only packaging workflows and the exact read scopes each holds.
+#: The manual Fedora RPM workflow was retired: it downloaded a recorded archive
+#: artifact that has expired, and the production gate's ``rpm-lifecycle`` job
+#: proves the same lifecycle against a fresh archive.
 MANUAL_PACKAGING_WORKFLOWS = {
     "desktop-archive.yml": {"contents": "read"},
-    "desktop-rpm.yml": {"actions": "read", "contents": "read"},
     "desktop-python-rpms.yml": {"contents": "read"},
 }
+#: Workflows that must not come back.
+RETIRED_WORKFLOWS = frozenset({"desktop-rpm.yml"})
 
 
 def _workflow_paths() -> list[Path]:
@@ -158,6 +162,15 @@ def test_manual_packaging_workflows_are_dispatch_only_and_read_only(
                 checkouts += 1
                 assert step["with"]["ref"] == "${{ env.TONGS_HEAD_SHA }}", name
     assert checkouts, name
+
+
+def test_retired_workflows_stay_retired(
+    workflows: dict[str, dict[str, Any]],
+) -> None:
+    assert not RETIRED_WORKFLOWS & set(workflows)
+    # A manual packaging workflow listed here must exist, so the dispatch-only
+    # check above cannot pass vacuously.
+    assert set(MANUAL_PACKAGING_WORKFLOWS) <= set(workflows)
 
 
 def _triggers(document: dict[str, Any]) -> dict[str, Any]:

@@ -176,13 +176,15 @@ One more workflow runs on pull requests:
 |---|---|
 | `release-desktop.yml` (Unpublished desktop candidate attestation) | PRs into `main` matching its path filter; pushes of a stable `vX.Y.Z` tag; and a manual `workflow_dispatch` dry run from `main` (a dispatch from any other ref fails) |
 
-`desktop-rpm.yml` (Desktop Fedora RPM), `desktop-python-rpms.yml` (Desktop Python
-companion RPMs) and `desktop-archive.yml` (Reproducible desktop archive) are manual
-only (`workflow_dispatch`); the production gate's `rpm-lifecycle` and `archive` jobs
+`desktop-python-rpms.yml` (Desktop Python companion RPMs) and
+`desktop-archive.yml` (Reproducible desktop archive) are manual only
+(`workflow_dispatch`); the production gate's `rpm-lifecycle` and `archive` jobs
 prove the same source rebuild, companion closure, lifecycle and byte-identical
 rebuild against the receipt-bound fresh archive on every run that selects the
 `packaging` lane, and the `archive` jobs alone run whenever the `archive` lane
-is selected.
+is selected. The former manual `desktop-rpm.yml` (Desktop Fedora RPM) was
+removed because it downloaded a recorded archive artifact that has expired;
+the `rpm-lifecycle` job proves the same lifecycle against a fresh archive.
 
 `docs.yml` runs that build on Node 22 and deploys `site/dist` to GitHub Pages,
 but only on a push to `main` or a manual `workflow_dispatch`. It also checks
