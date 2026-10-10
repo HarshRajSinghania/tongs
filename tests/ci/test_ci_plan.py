@@ -232,6 +232,7 @@ LAYER_ONE: list[tuple[str, frozenset[str] | None]] = [
     (".github/workflows/ci.yml", None),
     (".github/workflows/docs.yml", None),
     (".github/scripts/verify_desktop_production.py", None),
+    (".github/dependabot.yml", None),
     ("tests/ci/ci_plan.py", None),
     ("tests/ci/test_ci_plan.py", None),
     ("tests/containers/fedora-44/Containerfile", None),

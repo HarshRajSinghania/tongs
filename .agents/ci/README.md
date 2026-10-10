@@ -176,13 +176,15 @@ One more workflow runs on pull requests:
 |---|---|
 | `release-desktop.yml` (Unpublished desktop candidate attestation) | PRs into `main` matching its path filter; pushes of a stable `vX.Y.Z` tag; and a manual `workflow_dispatch` dry run from `main` (a dispatch from any other ref fails) |
 
-`desktop-rpm.yml` (Desktop Fedora RPM), `desktop-python-rpms.yml` (Desktop Python
-companion RPMs) and `desktop-archive.yml` (Reproducible desktop archive) are manual
-only (`workflow_dispatch`); the production gate's `rpm-lifecycle` and `archive` jobs
+`desktop-python-rpms.yml` (Desktop Python companion RPMs) and
+`desktop-archive.yml` (Reproducible desktop archive) are manual only
+(`workflow_dispatch`); the production gate's `rpm-lifecycle` and `archive` jobs
 prove the same source rebuild, companion closure, lifecycle and byte-identical
 rebuild against the receipt-bound fresh archive on every run that selects the
 `packaging` lane, and the `archive` jobs alone run whenever the `archive` lane
-is selected.
+is selected. The former manual `desktop-rpm.yml` (Desktop Fedora RPM) was
+removed because it downloaded a recorded archive artifact that has expired;
+the `rpm-lifecycle` job proves the same lifecycle against a fresh archive.
 
 `docs.yml` runs that build on Node 22 and deploys `site/dist` to GitHub Pages,
 but only on a push to `main` or a manual `workflow_dispatch`. It also checks
@@ -275,9 +277,12 @@ job- and step-level reference in every workflow, with no exceptions. The
 documentation toolchain is pinned by `site/package-lock.json`, which `npm ci`
 installs exactly, and every direct dependency in `site/package.json`, Astro and
 Starlight included, is an exact version rather than a range; a test in the same
-module enforces both. Other tools a workflow installs ad hoc, such as
-`ruff` and the `build` the installed-core job uses, are not yet pinned and
-are tracked by #162.
+module enforces both. The lint job installs Ruff from the `lint` extra in
+`pyproject.toml`, which pins it exactly, and `build` comes from the release
+lock. `tests/ci/test_workflow_hygiene.py` requires every package a workflow
+`pip install`s by name to pin one exact version, and rejects `npx`,
+`npm install`, `pipx`, `uvx` and `uv tool` in workflow steps, so a tool comes
+from a lockfile or a pinned extra.
 
 Jobs that hold a signing or write token install nothing that resolves fresh.
 In `release-desktop.yml`, `candidate-attestation` (`id-token: write`) and
@@ -299,8 +304,13 @@ that build job. `tests/ci/test_workflow_hygiene.py` shares its install scanner
 and allows a follow-up `--no-deps` install without hashes only for local wheels
 and local source trees built with `--no-build-isolation`.
 
-Updates to these pins, the release lock included, will arrive as Dependabot
-pull requests once #162 (v1.1.0) lands; until then, bump them by hand.
+`.github/dependabot.yml` proposes weekly updates to the action pins,
+`pyproject.toml` (the lint extra included) and the `desktop`, `site` and
+`.github/linters` npm lockfiles. Minor and patch updates are grouped per
+ecosystem and directory, majors arrive alone, and Electron always gets its own
+pull request. Dependabot cannot regenerate the uv-compiled hash locks in
+`requirements/`, so their inputs are excluded; regenerate those locks by hand
+with the command at the top of each.
 
 ## Re-running a hosted check
 

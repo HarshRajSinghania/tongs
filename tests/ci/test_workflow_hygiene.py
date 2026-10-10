@@ -17,6 +17,12 @@ that apply to every file, not only to the release workflows:
   publish, with read scopes only, and the token reaches only the gate's
   read-only ``gh api`` fetch.
 
+* every package a workflow ``pip install``s by name is pinned to one exact
+  version, and the tools CI runs come from a pinned extra in
+  ``pyproject.toml``, so Dependabot can see and bump them; no workflow
+  fetches a tool through ``npx``, ``npm install``, ``pipx``, ``uvx`` or
+  ``uv tool``, so ``npm ci`` from a lockfile is the only Node install.
+
 ``test_release_lock.py`` holds every install under a write token to the
 hash-locked release lock.
 """
@@ -24,13 +30,20 @@ hash-locked release lock.
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
+from packaging.requirements import InvalidRequirement, Requirement
 
 from tests.ci.verify_desktop_production_gate import ROOT
+from tests.ci.workflow_installs import (
+    COMMAND_SEPARATORS,
+    install_commands,
+    shell_tokens,
+)
 
 WORKFLOW_DIRECTORY = ROOT / ".github/workflows"
 RELEASE_GATE = ".github/scripts/release_gate.py"
@@ -48,11 +61,15 @@ _GH_WRITE_OPTIONS = re.compile(
 )
 
 #: The dispatch-only packaging workflows and the exact read scopes each holds.
+#: The manual Fedora RPM workflow was retired: it downloaded a recorded archive
+#: artifact that has expired, and the production gate's ``rpm-lifecycle`` job
+#: proves the same lifecycle against a fresh archive.
 MANUAL_PACKAGING_WORKFLOWS = {
     "desktop-archive.yml": {"contents": "read"},
-    "desktop-rpm.yml": {"actions": "read", "contents": "read"},
     "desktop-python-rpms.yml": {"contents": "read"},
 }
+#: Workflows that must not come back.
+RETIRED_WORKFLOWS = frozenset({"desktop-rpm.yml"})
 
 
 def _workflow_paths() -> list[Path]:
@@ -158,6 +175,15 @@ def test_manual_packaging_workflows_are_dispatch_only_and_read_only(
                 checkouts += 1
                 assert step["with"]["ref"] == "${{ env.TONGS_HEAD_SHA }}", name
     assert checkouts, name
+
+
+def test_retired_workflows_stay_retired(
+    workflows: dict[str, dict[str, Any]],
+) -> None:
+    assert not RETIRED_WORKFLOWS & set(workflows)
+    # A manual packaging workflow listed here must exist, so the dispatch-only
+    # check above cannot pass vacuously.
+    assert set(MANUAL_PACKAGING_WORKFLOWS) <= set(workflows)
 
 
 def _triggers(document: dict[str, Any]) -> dict[str, Any]:
@@ -281,3 +307,253 @@ def test_the_release_gate_token_is_read_only_and_reaches_only_its_fetch(
             assert fetches == 1, label
     # publish.yml build and release-desktop.yml candidate-archive.
     assert gate_jobs == 2
+
+
+#: ``pip install`` options that take the next word as their value.
+_PIP_VALUE_OPTIONS = frozenset(
+    {
+        "-r",
+        "--requirement",
+        "-c",
+        "--constraint",
+        "-e",
+        "--editable",
+        "-i",
+        "--index-url",
+        "--extra-index-url",
+        "-f",
+        "--find-links",
+        "-t",
+        "--target",
+        "--prefix",
+        "--root",
+        "--src",
+        "--platform",
+        "--python-version",
+        "--implementation",
+        "--abi",
+        "--only-binary",
+        "--no-binary",
+        "--upgrade-strategy",
+        "-C",
+        "--config-settings",
+        "--progress-bar",
+        "--report",
+        "--python",
+        "--cache-dir",
+        "--log",
+    }
+)
+#: The extra the lint job installs Ruff from.
+LINT_EXTRA = "lint"
+#: Tool runners that fetch a package outside any lockfile or declared extra.
+_AD_HOC_RUNNERS = re.compile(
+    r"^(npx|pipx|uvx)$|^(npm|pnpm|yarn) (install|i|add)$|^uv (tool|pip)$"
+)
+_AD_HOC_WORD = re.compile(r"\b(npx|pipx|uvx|npm|pnpm|yarn|uv)\b")
+_ENVIRONMENT_REFERENCE = re.compile(r"\$\{(\w+)\}|\$(\w+)")
+
+
+def _is_local_path(word: str) -> bool:
+    return word.startswith((".", "/")) and "://" not in word
+
+
+def _expand(word: str, environment: dict[str, str]) -> str:
+    return _ENVIRONMENT_REFERENCE.sub(
+        lambda match: environment.get(match.group(1) or match.group(2), match.group()),
+        word,
+    )
+
+
+def unpinned_install_targets(
+    tokens: list[str], environment: dict[str, str]
+) -> list[str]:
+    """Return what one ``pip install`` command installs without an exact pin.
+
+    Requirement files, constraints and local paths are allowed: a requirement
+    file holds its own pins, and a local path is this repository, whose
+    dependencies are declared in its ``pyproject.toml``.  A package named on
+    the command line must pin exactly one version with ``==``, after the
+    workflow's environment variables are expanded.
+    """
+
+    words = tokens[tokens.index("install") + 1 :]
+    unpinned: list[str] = []
+    index = 0
+    while index < len(words):
+        word = words[index]
+        index += 1
+        if word.startswith("-"):
+            if word in _PIP_VALUE_OPTIONS:
+                value = words[index] if index < len(words) else ""
+                index += 1
+                if word in {"-e", "--editable"} and not _is_local_path(value):
+                    unpinned.append(value)
+            continue
+        if _is_local_path(word):
+            continue
+        try:
+            requirement = Requirement(_expand(word, environment))
+        except InvalidRequirement:
+            unpinned.append(word)
+            continue
+        specifiers = list(requirement.specifier)
+        if (
+            requirement.url
+            or len(specifiers) != 1
+            or specifiers[0].operator != "=="
+            or "*" in specifiers[0].version
+        ):
+            unpinned.append(word)
+    return unpinned
+
+
+@pytest.mark.parametrize(
+    ("command", "unpinned"),
+    [
+        ("python -m pip install ruff", ["ruff"]),
+        ("pip3 install 'ruff>=0.17'", ["ruff>=0.17"]),
+        ("pip install ruff==0.17.* build==1.3.0", ["ruff==0.17.*"]),
+        (
+            "pip install git+https://example.invalid/ruff.git",
+            ["git+https://example.invalid/ruff.git"],
+        ),
+        (
+            "pip install -e git+https://example.invalid/x.git",
+            ["git+https://example.invalid/x.git"],
+        ),
+        ('pip install "sigstore==${SIGSTORE_VERSION}"', []),
+        ("pip install sigstore==$UNSET_VERSION", ["sigstore==$UNSET_VERSION"]),
+        ('python -m pip install -e ".[dev,lint]" ./examples/desktop-plugin', []),
+        ("pip install --require-hashes --only-binary=:all: -r x.lock -c y.txt", []),
+        ("pip install --no-deps --target out ruff==0.17.0", []),
+    ],
+)
+def test_the_pin_check_names_every_unpinned_target(
+    command: str, unpinned: list[str]
+) -> None:
+    (tokens,) = install_commands({"steps": [{"run": command}]})
+    assert unpinned_install_targets(tokens, {"SIGSTORE_VERSION": "4.5.0"}) == unpinned
+
+
+def test_every_tool_a_workflow_installs_by_name_is_pinned(
+    workflows: dict[str, dict[str, Any]],
+) -> None:
+    installs = 0
+    for name, job_id, job in _jobs(workflows):
+        environment = {
+            **(workflows[name].get("env") or {}),
+            **(job.get("env") or {}),
+        }
+        for step in job.get("steps", []):
+            scope = {**environment, **(step.get("env") or {})}
+            scope = {key: str(value) for key, value in scope.items()}
+            for tokens in install_commands({"steps": [step]}):
+                installs += 1
+                unpinned = unpinned_install_targets(tokens, scope)
+                assert not unpinned, f"{name}:{job_id} installs {unpinned} unpinned"
+    assert installs
+
+
+def ad_hoc_tool_fetches(script: str) -> list[str]:
+    """Return each command in ``script`` that fetches a tool by name."""
+
+    found = []
+    for line in script.replace("\\\n", " ").splitlines():
+        if not _AD_HOC_WORD.search(line):
+            continue
+        command: list[str] = []
+        for token in [*shell_tokens(line), ";"]:
+            if token not in COMMAND_SEPARATORS:
+                command.append(token)
+                continue
+            words = [Path(word).name for word in command[:2]]
+            if any(
+                _AD_HOC_RUNNERS.match(" ".join(words[:length])) for length in (1, 2)
+            ):
+                found.append(" ".join(command))
+            command = []
+    return found
+
+
+@pytest.mark.parametrize(
+    ("script", "found"),
+    [
+        ("npx markdownlint-cli2 docs", ["npx markdownlint-cli2 docs"]),
+        ("cd site && npm install astro", ["npm install astro"]),
+        ("/usr/bin/pipx run build", ["/usr/bin/pipx run build"]),
+        ("uvx ruff check", ["uvx ruff check"]),
+        ("uv tool install ruff", ["uv tool install ruff"]),
+        ("npm ci --prefix site\nnpm run build --prefix site", []),
+        ("echo 'use npx here'  # npx is not run", []),
+    ],
+)
+def test_the_fetch_check_finds_every_ad_hoc_runner(
+    script: str, found: list[str]
+) -> None:
+    assert ad_hoc_tool_fetches(script) == found
+
+
+def test_no_workflow_fetches_a_tool_outside_a_lockfile(
+    workflows: dict[str, dict[str, Any]],
+) -> None:
+    for name, job_id, job in _jobs(workflows):
+        for step in job.get("steps", []):
+            found = ad_hoc_tool_fetches(step.get("run") or "")
+            assert not found, (
+                f"{name}:{job_id} runs {found}; install the tool from a lockfile "
+                "or a pinned extra instead"
+            )
+
+
+def test_the_lint_extra_pins_every_tool_exactly() -> None:
+    extras = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"][
+        "optional-dependencies"
+    ]
+    requirements = [Requirement(item) for item in extras[LINT_EXTRA]]
+    assert "ruff" in {requirement.name for requirement in requirements}
+    for requirement in requirements:
+        (specifier,) = requirement.specifier
+        assert specifier.operator == "==", str(requirement)
+        assert "*" not in specifier.version, str(requirement)
+
+
+def test_the_lint_job_installs_ruff_from_the_pinned_extra(
+    workflows: dict[str, dict[str, Any]],
+) -> None:
+    job = workflows["ci.yml"]["jobs"]["lint-and-format"]
+    extras = []
+    for tokens in install_commands(job):
+        for word in tokens[tokens.index("install") + 1 :]:
+            if word.startswith(".["):
+                extras.extend(word[2:].rstrip("]").split(","))
+    assert LINT_EXTRA in extras
+
+
+def test_dependabot_proposes_grouped_weekly_updates() -> None:
+    config = yaml.safe_load((ROOT / ".github/dependabot.yml").read_text())
+    assert config["version"] == 2
+    updates = {entry["package-ecosystem"]: entry for entry in config["updates"]}
+    assert set(updates) == {"github-actions", "pip", "npm"}
+    for ecosystem, entry in updates.items():
+        assert entry["schedule"]["interval"] == "weekly", ecosystem
+        grouped = [
+            group
+            for group in entry["groups"].values()
+            if sorted(group.get("update-types", [])) == ["minor", "patch"]
+        ]
+        assert len(grouped) == 1, ecosystem
+    assert updates["github-actions"]["directory"] == "/"
+    assert updates["pip"]["directory"] == "/"
+    # The uv-compiled hash locks cannot be regenerated by Dependabot.
+    assert updates["pip"]["exclude-paths"] == ["requirements/**"]
+    npm = updates["npm"]
+    assert npm["directories"] == ["/desktop", "/site", "/.github/linters"]
+    for directory in npm["directories"]:
+        assert (ROOT / directory.lstrip("/") / "package-lock.json").is_file()
+    # Every direct npm dependency is exact; "increase" keeps it exact.
+    assert npm["versioning-strategy"] == "increase"
+    # Electron gets its own group, listed first so it matches before the
+    # minor and patch group does.
+    groups = list(npm["groups"].items())
+    assert groups[0] == ("electron", {"patterns": ["electron"]})
