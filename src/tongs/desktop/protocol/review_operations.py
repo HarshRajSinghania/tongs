@@ -48,12 +48,14 @@ from tongs.services import (
 )
 from tongs.services import DiffSide as MutationDiffSide
 from tongs.state.drafts import (
+    MAX_DRAFT_COMMENTS,
     DiffSide,
     DraftAttemptOwnedError,
     DraftComment,
     DraftConflictError,
     DraftContent,
     DraftCorruptionError,
+    DraftLimitError,
     DraftNotFoundError,
     DraftNotOpenError,
     DraftPermissionError,
@@ -69,6 +71,7 @@ from tongs.state.drafts import (
     InlineDraftComment,
     ReconciliationResolution,
     ReplyDraftComment,
+    draft_text_problem,
 )
 
 REVIEW_CAPABILITY = "review_mutations"
@@ -99,8 +102,6 @@ REVIEW_METHODS = (
 
 _OPERATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
-_MAX_BODY_BYTES = 65_536
-_MAX_COMMENTS = 200
 _DEFAULT_PAGE_ITEMS = 50
 _MAX_PAGE_ITEMS = 100
 
@@ -318,7 +319,10 @@ class ReviewOperations:
         except ValueError:
             raise _invalid("The verdict parameter is invalid.") from None
         inline_values = params.get("inline_comments", [])
-        if not isinstance(inline_values, list) or len(inline_values) > _MAX_COMMENTS:
+        if (
+            not isinstance(inline_values, list)
+            or len(inline_values) > MAX_DRAFT_COMMENTS
+        ):
             raise _invalid("The inline_comments parameter is invalid.")
         inline_comments = tuple(_inline_draft(item) for item in inline_values)
         body = _body(params, "body", allow_empty=True, default="")
@@ -569,7 +573,14 @@ class ReviewOperations:
             )
         except DraftStoreError as error:
             raise _draft_service_error(error) from None
-        admitted = tuple(item for item in attempts if item.snapshot.review == review)
+        # An attempt a service call is still working on is in progress, not
+        # one that needs recovery, so the drawer is never offered it.
+        running = self._session.review_submissions.is_running
+        admitted = tuple(
+            item
+            for item in attempts
+            if item.snapshot.review == review and not running(item.id)
+        )
         page, next_cursor = _slice(admitted, cursor, max_items)
         progress: list[JsonObject] = []
         for attempt in page:
@@ -961,7 +972,7 @@ def _draft_content(value: object, revision: ReviewRevision) -> DraftContent:
         except ValueError:
             raise _invalid("The verdict parameter is invalid.") from None
     comments_value = params.get("comments", [])
-    if not isinstance(comments_value, list) or len(comments_value) > _MAX_COMMENTS:
+    if not isinstance(comments_value, list) or len(comments_value) > MAX_DRAFT_COMMENTS:
         raise _invalid("The draft comments parameter is invalid.")
     comments = tuple(_draft_comment(item, revision) for item in comments_value)
     try:
@@ -1264,13 +1275,8 @@ def _body(
     value = params.get(key, default)
     if not isinstance(value, str) or (not allow_empty and not value):
         raise _invalid(f"The {key} parameter is invalid.")
-    if any(ord(character) < 32 and character not in "\t\n" for character in value):
-        raise _invalid(f"The {key} parameter is invalid.")
-    try:
-        size = len(value.encode("utf-8"))
-    except UnicodeEncodeError:
-        raise _invalid(f"The {key} parameter is invalid.") from None
-    if size > _MAX_BODY_BYTES:
+    # The draft store enforces the same body limits on every draft write.
+    if draft_text_problem(value) is not None:
         raise _invalid(f"The {key} parameter is invalid.")
     return value
 
@@ -1336,6 +1342,8 @@ def _redact_service_error(error: ServiceError) -> ServiceError:
 
 
 def _draft_service_error(error: DraftStoreError) -> ServiceError:
+    if isinstance(error, DraftLimitError):
+        return ServiceError(ServiceErrorCode.INVALID_INPUT, str(error))
     if isinstance(error, DraftNotFoundError):
         return ServiceError(
             ServiceErrorCode.NOT_FOUND, "The draft record was not found."

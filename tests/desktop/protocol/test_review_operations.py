@@ -72,12 +72,16 @@ from tongs.services import review_mutations as review_mutations_module
 from tongs.services import review_submission as review_submission_module
 from tongs.services import session as session_module
 from tongs.state.drafts import (
+    MAX_DRAFT_BODY_BYTES,
+    MAX_DRAFT_COMMENTS,
     DraftContent,
+    DraftLimitError,
     DraftStore,
     DraftVerdict,
     GeneralDraftComment,
     ReconciliationResolution,
     context_fingerprint,
+    draft_text_problem,
 )
 
 REPOSITORY = RepositoryRef("github.com", "acme/widgets")
@@ -1096,6 +1100,55 @@ async def test_submission_list_includes_an_owned_paused_attempt(setup) -> None:
 
 
 @pytest.mark.asyncio
+async def test_submission_list_leaves_out_an_attempt_still_being_sent(
+    setup,
+) -> None:
+    operations, session, handles = setup
+    draft = await session.drafts.create_draft(
+        REVIEW, REVISION, DraftContent(body="summary", verdict=DraftVerdict.APPROVE)
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def held_review(*_args: object, **_kwargs: object) -> object:
+        entered.set()
+        await release.wait()
+        raise ValidationError("Validation failed: 422")
+
+    session.client.submit_review.side_effect = held_review
+    # The fixture bounds forge calls at 0.1 s; this one is held on purpose.
+    session.review_mutations._timeout = 5.0
+    started = asyncio.create_task(
+        operations.start_submission(
+            {
+                "review": handles["review"],
+                "draft_id": str(draft.id),
+                "expected_version": draft.version,
+            },
+            _context(),
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 2)
+
+    # A drawer reopened mid-submit must not offer recovery for work in
+    # progress, even though this process owns the attempt.
+    during = await operations.list_submissions(
+        {"review": handles["review"], "max_items": 10}, _context()
+    )
+    release.set()
+    paused = await asyncio.wait_for(started, 2)
+    after = await operations.list_submissions(
+        {"review": handles["review"], "max_items": 10}, _context()
+    )
+
+    assert during["attempts"] == []
+    assert during["next_cursor"] is None
+    assert paused["outcome"] == "paused"
+    assert [item["attempt_id"] for item in after["attempts"]] == [paused["attempt_id"]]
+    assert session.client.submit_review.await_count == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("payload", "message"),
     [
@@ -1137,6 +1190,81 @@ async def test_malformed_nested_drafts_fail_before_storage(
 
     assert message in caught.value.message
     assert await session.drafts.list_drafts(review=REVIEW) == ()
+
+
+def test_desktop_draft_limits_reuse_the_draft_store_limits() -> None:
+    assert review_operations_module.MAX_DRAFT_COMMENTS is MAX_DRAFT_COMMENTS
+    assert review_operations_module.draft_text_problem is draft_text_problem
+    assert not hasattr(review_operations_module, "_MAX_BODY_BYTES")
+    assert not hasattr(review_operations_module, "_MAX_COMMENTS")
+
+
+@pytest.mark.asyncio
+async def test_desktop_input_limits_match_the_draft_store(setup) -> None:
+    operations, session, handles = setup
+
+    def general(body: str) -> JsonObject:
+        return {"id": str(uuid4()), "kind": "general", "body": body}
+
+    accepted = await operations.create_draft(
+        {
+            "review": handles["review"],
+            "revision": _revision_wire(),
+            "content": {
+                "body": "x" * MAX_DRAFT_BODY_BYTES,
+                "comments": [
+                    general("tab\tnewline\n"),
+                    *(general("note") for _ in range(MAX_DRAFT_COMMENTS - 1)),
+                ],
+            },
+        },
+        _context(),
+    )
+    assert len(accepted["comments"]) == MAX_DRAFT_COMMENTS
+
+    for content, message in (
+        (
+            {"comments": [general("note") for _ in range(MAX_DRAFT_COMMENTS + 1)]},
+            "The draft comments parameter is invalid.",
+        ),
+        ({"body": "x" * (MAX_DRAFT_BODY_BYTES + 1)}, "The body parameter is invalid."),
+        ({"comments": [general("x" * 70_000)]}, "The body parameter is invalid."),
+        ({"body": "carriage\rreturn"}, "The body parameter is invalid."),
+    ):
+        with pytest.raises(ProtocolError) as caught:
+            await operations.create_draft(
+                {
+                    "review": handles["review"],
+                    "revision": _revision_wire(),
+                    "content": content,
+                },
+                _context(),
+            )
+        assert caught.value.message == message
+    assert len(await session.drafts.list_drafts(review=REVIEW)) == 1
+
+
+@pytest.mark.asyncio
+async def test_store_limit_refusal_is_a_plain_invalid_input_error(
+    setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    operations, session, handles = setup
+    refusal = DraftLimitError("A comment is over the 65,536-byte limit.")
+    monkeypatch.setattr(session.drafts, "create_draft", AsyncMock(side_effect=refusal))
+
+    with pytest.raises(ServiceError) as caught:
+        await operations.create_draft(
+            {
+                "review": handles["review"],
+                "revision": _revision_wire(),
+                "content": {"body": "summary"},
+            },
+            _context(),
+        )
+
+    assert caught.value.code is ServiceErrorCode.INVALID_INPUT
+    assert caught.value.message == "A comment is over the 65,536-byte limit."
+    assert caught.value.retryable is False
 
 
 class _WireWriter:

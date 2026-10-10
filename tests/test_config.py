@@ -1,8 +1,12 @@
 """Tests for configuration loader."""
 
+import logging
+from datetime import timedelta
 from pathlib import Path
 
-from tongs.config import Config, HostConfig, config_dir, load_config
+import pytest
+
+from tongs.config import Config, HostConfig, config_dir, load_config, parse_retention
 
 
 class TestLoadConfig:
@@ -136,3 +140,83 @@ def test_config_dir_uses_platform_user_config_dir(monkeypatch) -> None:
         "tongs.config.platformdirs.user_config_dir", lambda name: "/tmp/config/tongs"
     )
     assert config_dir() == Path("/tmp/config/tongs")
+
+
+class TestSubmittedRetention:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("24h", timedelta(hours=24)),
+            ("7d", timedelta(days=7)),
+            ("1h", timedelta(hours=1)),
+            ("365d", timedelta(days=365)),
+            ("8760h", timedelta(days=365)),
+        ],
+    )
+    def test_accepts_hours_and_days(self, value: str, expected: timedelta) -> None:
+        assert parse_retention(value) == expected
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "0h",
+            "0d",
+            "24",
+            "24H",
+            "7D",
+            "1w",
+            "-1d",
+            "366d",
+            "8761h",
+            "",
+            " 24h",
+            "24h\n",
+            "07d",
+            "1.5d",
+            "١h",
+            24,
+            1.5,
+            True,
+            None,
+            ["24h"],
+        ],
+    )
+    def test_rejects_other_values(self, value: object) -> None:
+        with pytest.raises(ValueError):
+            parse_retention(value)
+
+    def test_default_is_24_hours(self, tmp_path: Path) -> None:
+        assert Config().submitted_draft_retention == timedelta(hours=24)
+        assert load_config(tmp_path / "missing.toml").submitted_draft_retention == (
+            timedelta(hours=24)
+        )
+        toml_file = tmp_path / "config.toml"
+        toml_file.write_text("[general]\nscan_depth = 2\n")
+        assert load_config(toml_file).submitted_draft_retention == timedelta(hours=24)
+
+    def test_reads_the_drafts_table(self, tmp_path: Path) -> None:
+        toml_file = tmp_path / "config.toml"
+        toml_file.write_text('[drafts]\nsubmitted_retention = "7d"\n')
+        assert load_config(toml_file).submitted_draft_retention == timedelta(days=7)
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            '[drafts]\nsubmitted_retention = "1w"\n',
+            "[drafts]\nsubmitted_retention = 24\n",
+            '[drafts]\nsubmitted_retention = ""\n',
+            'drafts = "24h"\n',
+        ],
+    )
+    def test_invalid_value_falls_back_with_one_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, body: str
+    ) -> None:
+        toml_file = tmp_path / "config.toml"
+        toml_file.write_text(body)
+        with caplog.at_level(logging.WARNING, logger="tongs.config"):
+            cfg = load_config(toml_file)
+        assert cfg.submitted_draft_retention == timedelta(hours=24)
+        warnings = [r.getMessage() for r in caplog.records if r.name == "tongs.config"]
+        assert len(warnings) == 1
+        assert "submitted_retention" in warnings[0]
+        assert "Xh" in warnings[0] and "Xd" in warnings[0]

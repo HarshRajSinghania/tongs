@@ -184,6 +184,11 @@ export function assertReviewParams<M extends ReviewRpcMethod>(
   }
 }
 
+/**
+ * Validates a sidecar review result. A `drafts.list` page is the one exception
+ * to all-or-nothing: an invalid draft is removed from the page and counted in
+ * one log line, so the review's other drafts still load.
+ */
 export function assertReviewResult<M extends ReviewRpcMethod>(
   method: M,
   value: unknown,
@@ -232,7 +237,11 @@ export function assertReviewResult<M extends ReviewRpcMethod>(
       const result = record(value);
       keys(result, ["cursor", "next_cursor", "drafts"]);
       page(result);
-      array(result.drafts, MAX_PAGE_ITEMS).forEach(draftSnapshot);
+      const skipped = dropInvalidDrafts(array(result.drafts, MAX_PAGE_ITEMS));
+      if (skipped > 0)
+        console.warn(
+          `Review draft list: skipped ${skipped} stored draft(s) the desktop cannot show.`,
+        );
       return;
     }
     case "review_submissions.start":
@@ -546,6 +555,29 @@ function actionReceipt(value: unknown, expected?: ReviewAction): void {
   ) {
     throw new Error("Unknown review action receipt cannot claim remote results");
   }
+}
+
+/**
+ * Removes, in place, each listed draft that fails validation and returns how
+ * many were removed. The terminal app writes drafts too, and a draft stored
+ * before both apps shared the draft limits can break one. Skipping it keeps
+ * the review's other drafts visible; the page shape does not change.
+ */
+function dropInvalidDrafts(drafts: readonly unknown[]): number {
+  const items = drafts as unknown[];
+  let kept = 0;
+  items.forEach((item, index) => {
+    try {
+      draftSnapshot(item);
+    } catch {
+      return;
+    }
+    if (index !== kept) items[kept] = item;
+    kept += 1;
+  });
+  const skipped = items.length - kept;
+  if (skipped > 0) items.length = kept;
+  return skipped;
 }
 
 function draftSnapshot(value: unknown): void {

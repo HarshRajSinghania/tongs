@@ -11,7 +11,7 @@ from textual.widgets import Static, TextArea
 from tests.test_tui_mr_services import _app, _wait_until
 from tests.test_tui_review_mode import _open_detail
 from tongs.errors import ValidationError
-from tongs.state.drafts import DraftState, DraftVerdict
+from tongs.state.drafts import DraftState, DraftStoreError, DraftVerdict
 from tongs.tui_services import TUIDraftTarget
 from tongs.views.mr_detail import MRDetailScreen
 from tongs.views.review_submit import ReviewSubmitScreen
@@ -139,4 +139,91 @@ async def test_partially_confirmed_paused_review_keeps_only_unconfirmed_content(
         await _reload_drafts(app, screen)
         assert screen._review_draft.state is DraftState.EDITABLE
         assert len([call for call in forge.calls if call[0] == "comment"]) == 1
+        assert len([call for call in forge.calls if call[0] == "verdict"]) == 1
+
+
+def _fail_draft_reloads(app, calls: list[str]) -> None:
+    """Make every later draft list read fail, as a broken database would."""
+
+    async def failing(*_args: object, **_kwargs: object) -> object:
+        calls.append("list_drafts")
+        raise DraftStoreError("draft database read failed")
+
+    app.services.list_drafts = failing
+
+
+def _messages(app) -> list[str]:
+    return [str(notification.message) for notification in app._notifications]
+
+
+@pytest.mark.asyncio
+async def test_failed_reload_after_a_paused_submission_is_a_separate_warning(
+    tmp_path: Path,
+) -> None:
+    app, forge = _app(tmp_path)
+    forge.verdict_error = SELF_APPROVAL
+
+    async with app.run_test(size=(160, 40), notifications=True) as pilot:
+        screen = await _open_detail(app, pilot)
+        screen.action_review_draft()
+        await _wait_until(app, lambda: screen._review_draft is not None)
+        start = app.services.start_draft_submission
+        calls: list[str] = []
+
+        async def start_then_break_reloads(*args: object) -> object:
+            progress = await start(*args)
+            _fail_draft_reloads(app, calls)
+            return progress
+
+        app.services.start_draft_submission = start_then_break_reloads
+        app.clear_notifications()
+
+        await _submit_approval(app, pilot, screen)
+
+        messages = _messages(app)
+        assert calls
+        assert not any("Review submission stopped" in item for item in messages)
+        assert any("review drafts could not be reloaded" in item for item in messages)
+        assert screen._review_progress.outcome.value == "paused"
+        assert len([call for call in forge.calls if call[0] == "verdict"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_reload_after_return_to_editing_is_a_separate_warning(
+    tmp_path: Path,
+) -> None:
+    app, forge = _app(tmp_path)
+    forge.verdict_error = SELF_APPROVAL
+
+    async with app.run_test(size=(160, 40), notifications=True) as pilot:
+        screen = await _open_detail(app, pilot)
+        screen.action_review_draft()
+        await _wait_until(app, lambda: screen._review_draft is not None)
+        draft_id = screen._review_draft.id
+        await _submit_approval(app, pilot, screen)
+        attempt_id = screen._review_progress.attempt_id
+
+        screen.action_review_draft()
+        await _wait_until(app, lambda: isinstance(app.screen, ReviewSubmitScreen))
+        await pilot.pause()
+        calls: list[str] = []
+        _fail_draft_reloads(app, calls)
+        app.clear_notifications()
+        await pilot.press("2")
+        await pilot.press("2")
+        await _wait_until(
+            app,
+            lambda: (
+                screen._review_progress is None
+                and not screen._draft_busy
+                and bool(calls)
+            ),
+        )
+
+        messages = _messages(app)
+        assert not any("Review recovery stopped" in item for item in messages)
+        assert any("review drafts could not be reloaded" in item for item in messages)
+        assert not app.session.drafts.holds_attempt(attempt_id)
+        draft = await app.session.drafts.get_draft(draft_id)
+        assert draft.state is DraftState.EDITABLE
         assert len([call for call in forge.calls if call[0] == "verdict"]) == 1

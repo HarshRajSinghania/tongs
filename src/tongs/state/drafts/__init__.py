@@ -15,9 +15,12 @@ from tongs.state.drafts.errors import (
     DraftStoreError,
 )
 from tongs.state.drafts.models import (
+    MAX_DRAFT_BODY_BYTES,
+    MAX_DRAFT_COMMENTS,
     DiffSide,
     DraftComment,
     DraftContent,
+    DraftLimitError,
     DraftSnapshot,
     DraftState,
     DraftVerdict,
@@ -36,19 +39,24 @@ from tongs.state.drafts.models import (
     SubmissionRetryAuthorization,
     UnknownSubmissionOutcome,
     context_fingerprint,
+    draft_text_problem,
     new_general_comment,
     new_inline_comment,
     new_reply_comment,
+    validate_draft_content,
 )
 from tongs.state.drafts.store import DraftStore, default_draft_db_path
 
 __all__ = [
+    "MAX_DRAFT_BODY_BYTES",
+    "MAX_DRAFT_COMMENTS",
     "DiffSide",
     "DraftAttemptOwnedError",
     "DraftComment",
     "DraftConflictError",
     "DraftContent",
     "DraftCorruptionError",
+    "DraftLimitError",
     "DraftNotFoundError",
     "DraftNotOpenError",
     "DraftPermissionError",
@@ -76,7 +84,9 @@ __all__ = [
     "UnknownSubmissionOutcome",
     "context_fingerprint",
     "default_draft_db_path",
+    "draft_text_problem",
     "new_general_comment",
     "new_inline_comment",
     "new_reply_comment",
+    "validate_draft_content",
 ]
