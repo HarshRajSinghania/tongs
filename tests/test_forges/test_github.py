@@ -1710,8 +1710,8 @@ class TestBatchedCI:
                 )
             )
 
-        # 120 reads over three repositories: ceil(120 / 50) queries.
-        assert [len(batch) for batch in batches] == [50, 50, 20]
+        # 120 reads over three repositories: queries of 15 pull requests.
+        assert [len(batch) for batch in batches] == [15] * 8
         assert sorted(pull for batch in batches for pull in batch) == sorted(
             ("acme", repo, number) for repo, number in reads
         )
@@ -1898,7 +1898,7 @@ class TestBatchedCI:
         client, http = _make_github_client(handler)
         async with http:
             first = await client.get_mr_ci_status("acme/repo", 10, "abc")
-            assert client.batched_ci_lookups == 50
+            assert client.batched_ci_lookups == 60
             second = await client.get_mr_ci_status("acme/repo", 10, "abc")
 
         # The refused batch read REST; the next read used GraphQL again.
@@ -1943,7 +1943,7 @@ class TestBatchedCI:
             # After ten minutes GraphQL is tried again.
             clock.now += 1
             refuse[0] = False
-            assert client.batched_ci_lookups == 50
+            assert client.batched_ci_lookups == 60
             assert await client.get_mr_ci_status("acme/repo", 10, "abc") is (
                 CIStatus.FAILED
             )
@@ -1982,7 +1982,7 @@ class TestBatchedCI:
             CIStatus.SUCCESS,
         ]
         assert paths.count("/graphql") == 4
-        assert client.batched_ci_lookups == 50
+        assert client.batched_ci_lookups == 60
 
     @pytest.mark.asyncio
     async def test_a_server_error_falls_back_for_that_batch_only(self) -> None:

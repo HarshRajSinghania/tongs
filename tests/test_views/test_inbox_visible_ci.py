@@ -4,7 +4,7 @@ One All Open load lists every repository's newest page, but only the rows in
 view, plus about one screen above and below, get a CI lookup. Scrolling looks
 up the rows it brings into view and drops queued lookups for rows that left
 before they started. On GitHub the lookups that run together become one
-GraphQL query per 50 rows. A rate limit stops new lookups for its host until
+GraphQL query per 15 rows. A rate limit stops new lookups for its host until
 the reset and says so once.
 """
 
@@ -312,16 +312,17 @@ async def test_github_all_open_cost_is_one_query_per_fifty_rows_in_view(
         await settle(app)
 
         # First paint: one list page per repository. Then one screen of CI
-        # (the rows in view and one screen below): one GraphQL query per 50
-        # rows and no REST CI request.
-        assert paths.count("/graphql") == math.ceil(len(window) / 50)
+        # (the rows in view and one screen below): one GraphQL query per 15
+        # rows, give or take a batch split by timing, and no REST CI request.
+        queries = paths.count("/graphql")
+        assert math.ceil(len(window) / 15) <= queries <= math.ceil(len(window) / 15) + 1
         assert sorted(path for path in paths if path != "/graphql") == sorted(
             f"/repos/{project}/pulls" for project in projects
         )
         assert sorted(number for batch in batches for _o, _r, number in batch) == (
             sorted(window)
         )
-        assert all(len(batch) <= 50 for batch in batches)
+        assert all(len(batch) <= 15 for batch in batches)
         assert not any(path.endswith(("/check-runs", "/status")) for path in paths)
     await http.aclose()
 

@@ -81,10 +81,13 @@ _UNREADABLE_CI_SOURCE = (ForgePermissionError, NotFoundError)
 # Per-pull-request CI reads share one GraphQL query of up to this many pull
 # requests, across repositories. A batch goes out once no read arrived for
 # the window, at most the longest wait after its first read, or at once when
-# it is full.
+# it is full. Each pull request reads up to 100 checks, so a large query is
+# slow (about 14 s for 50 on busy repositories); smaller batches sent side by
+# side fill a screen sooner for the same number of requests per row.
 _CI_BATCH_WINDOW_SECONDS = 0.015
 _CI_BATCH_MAX_WAIT_SECONDS = 0.06
-_CI_BATCH_SIZE = 50
+_CI_BATCH_SIZE = 15
+_CI_BATCHES_IN_FLIGHT = 4
 # A head commit with more checks than one query reads (the ``contexts(first:
 # 100)`` of the fragment below) is read over REST.
 _CI_ROLLUP_PAGE_SIZE = 100
@@ -1319,11 +1322,12 @@ class GitHubClient(ForgeClient):
     def batched_ci_lookups(self) -> int:
         """How many per-pull-request CI lookups share one request right now.
 
-        While GraphQL batching is on, up to ``_CI_BATCH_SIZE`` lookups that
-        are in flight together become one query; otherwise each lookup is
-        its own REST read and this is 1.
+        While GraphQL batching is on, lookups in flight together become
+        queries of up to ``_CI_BATCH_SIZE`` pull requests, and enough may be in
+        flight for ``_CI_BATCHES_IN_FLIGHT`` queries at once; otherwise each
+        lookup is its own REST read and this is 1.
         """
-        return _CI_BATCH_SIZE if self._ci_batching() else 1
+        return _CI_BATCH_SIZE * _CI_BATCHES_IN_FLIGHT if self._ci_batching() else 1
 
     async def close(self) -> None:
         self._cancel_ci_batches()

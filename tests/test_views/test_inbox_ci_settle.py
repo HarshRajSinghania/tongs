@@ -271,9 +271,10 @@ async def test_each_host_has_its_own_lookup_limit(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("max_parallel", "graphql", "expected"),
     [
-        (8, True, 50),
+        (8, True, 60),
         (8, False, 8),
         (64, True, 64),
+        (100, True, 100),
     ],
 )
 @pytest.mark.asyncio

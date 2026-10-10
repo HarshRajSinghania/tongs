@@ -198,11 +198,13 @@ class MRTable(DataTable):
         ``replace`` drops the current rows first. Otherwise only the incoming
         rows are built and the existing rows are moved into place, so adding
         one repository at a time stays cheap however many rows are shown. The
-        highlighted MR keeps the cursor when it is still listed.
+        highlighted MR keeps the cursor when it is still listed, except on the
+        first row: a cursor at the top stays at the top, so newer rows that
+        arrive while a list streams in do not push it down the list.
         ``ci_pending`` marks incoming rows with an unknown CI status as still
         loading, for ``set_ci_status`` to fill in.
         """
-        selected = self._selected_row_key()
+        selected = None if self.cursor_row == 0 else self._selected_row_key()
         incoming = {mr_row_key(mr): mr for mr in mrs}
         if replace:
             self.clear()
@@ -218,7 +220,11 @@ class MRTable(DataTable):
                 ci_pending=ci_pending and mr.ci_status is CIStatus.UNKNOWN,
             )
         self._order_rows(self._sorted())
-        self._keep_cursor_on(selected)
+        if selected is None:
+            if self.row_count:
+                self.move_cursor(row=0)
+        else:
+            self._keep_cursor_on(selected)
 
     def _sorted(self) -> list[MRSummary]:
         return sort_mrs(list(self._mr_data.values()), self._sort_key, self._ci_pending)

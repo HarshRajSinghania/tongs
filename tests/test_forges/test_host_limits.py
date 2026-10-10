@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 from collections import defaultdict
 from collections.abc import Callable
@@ -173,10 +174,10 @@ async def test_fifty_mrs_stay_within_the_bound_across_list_ci_graphql_and_logs(
     assert len(results[0]) == _MR_COUNT
     github_paths = forge.paths["api.github.com"]
     assert github_paths.count("/repos/acme/repo/pulls") == 1
-    # The fifty pull requests' CI is one batched GraphQL query, which takes
-    # one slot like any other request; no REST CI read is sent.
+    # The fifty pull requests' CI is batched into GraphQL queries of 15, each
+    # taking one slot like any other request; no REST CI read is sent.
     assert not any(path.endswith(("/check-runs", "/status")) for path in github_paths)
-    assert github_paths.count("/graphql") == 10 + 1
+    assert github_paths.count("/graphql") == 10 + math.ceil(_MR_COUNT / 15)
     assert {mr.ci_status for mr in results[0]} == {CIStatus.SUCCESS}
     assert sum(path.endswith("/logs") for path in github_paths) == 10
     assert sum(path.endswith("/trace") for path in forge.paths["gitlab.com"]) == 10
