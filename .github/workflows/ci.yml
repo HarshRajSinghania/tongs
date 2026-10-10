@@ -114,7 +114,7 @@ jobs:
         run: >-
           .github/linters/node_modules/.bin/markdownlint-cli2
           --config .github/linters/.markdownlint-cli2.jsonc
-          "docs/**/*.md" "*.md"
+          "docs/**/*.md" "*.md" ".agents/**/*.md" ".github/*.md" "site/README.md"
 
   # Also runs the CI and container harness suites, which read only the
   # repository and its workflows.  Every path under tests/ci and
@@ -139,9 +139,9 @@ jobs:
       - name: Install Ruff
         run: python -m pip install ruff
       - name: Lint source and tests
-        run: ruff check src/ tests/ packaging/ scripts/release-evidence/ examples/
+        run: ruff check src/ tests/ packaging/ scripts/ .github/scripts/ examples/
       - name: Check source and test formatting
-        run: ruff format --check src/ tests/ packaging/ scripts/release-evidence/ examples/
+        run: ruff format --check src/ tests/ packaging/ scripts/ .github/scripts/ examples/
       - name: Install core and development dependencies
         run: python -m pip install -e ".[dev]"
       - name: Run the CI and container harness tests with a machine-readable report

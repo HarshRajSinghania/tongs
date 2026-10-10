@@ -49,8 +49,8 @@ npm ci --prefix desktop
 
    ```bash
    pytest
-   ruff check src/ tests/
-   ruff format --check src/ tests/
+   ruff check src/ tests/ packaging/ scripts/ .github/scripts/ examples/
+   ruff format --check src/ tests/ packaging/ scripts/ .github/scripts/ examples/
    ```
 
    Run `ruff format <file>` to fix formatting.

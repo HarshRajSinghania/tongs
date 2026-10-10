@@ -36,12 +36,14 @@ Both formats are supported in a single diff string (mixed is fine).
 ### Two Parse Paths
 
 **Git format** (`_parse_git_diff_file`):
+
 1. Reads `diff --git a/{old} b/{new}` to get file paths
 2. Scans metadata lines: `new file`, `deleted file`, `rename from/to`, `similarity index`, `index`, `Binary files`
-3. When `--- ` is found, delegates to `_parse_hunks_from()` for hunk content
+3. When the `---` file header line is found, delegates to `_parse_hunks_from()` for hunk content
 4. Falls through to create a headerless DiffFile for binary/metadata-only entries
 
 **Plain format** (`_parse_plain_diff_file`):
+
 1. Reads `--- {old_path}` and `+++ {new_path}` directly
 2. Strips `a/`/`b/` prefixes via `_strip_prefix()`
 3. Detects added (`/dev/null` as old) and deleted (`/dev/null` as new) files
@@ -52,16 +54,17 @@ Both formats are supported in a single diff string (mixed is fine).
 `_parse_hunks_from()` skips `---`/`+++` lines, then loops looking for `@@ -old_start,old_count +new_start,new_count @@ context_text` headers.
 
 `_parse_single_hunk()` processes one hunk:
+
 - Tracks `old_line` and `new_line` counters starting from the hunk header values
 - `+` lines: addition (new_lineno set, old_lineno None), increment new_line
 - `-` lines: deletion (old_lineno set, new_lineno None), increment old_line
 - ` ` lines or empty lines: context (both linenos set), increment both
 - `\` lines: no-newline marker (both linenos None)
-- Stops at the next `@@ ` or `diff --git ` line, at an empty line once the declared counts are consumed, at an unrecognized line, or at a `---`/`+++` pair that `_is_file_header_boundary()` accepts
+- Stops at the next `@@` hunk header or `diff --git` file header line, at an empty line once the declared counts are consumed, at an unrecognized line, or at a `---`/`+++` pair that `_is_file_header_boundary()` accepts
 
 ### Boundary Detection
 
-The parser treats `diff --git ` as a new git-format file. It treats `--- ` followed by `+++ ` as a new plain-format file only when `_is_file_header_boundary()` accepts it: always once the current hunk has consumed its declared old and new counts, never while both sides still fit the hunk, and otherwise only when a hunk header follows the pair. Inside a hunk that still has room, the pair stays a deletion and an addition, so content such as SQL comments (`-- DROP TABLE`) is not taken for a header.
+The parser treats a `diff --git` line as a new git-format file. It treats a `---` line followed by a `+++` line as a new plain-format file only when `_is_file_header_boundary()` accepts it: always once the current hunk has consumed its declared old and new counts, never while both sides still fit the hunk, and otherwise only when a hunk header follows the pair. Inside a hunk that still has room, the pair stays a deletion and an addition, so content such as SQL comments (`-- DROP TABLE`) is not taken for a header.
 
 ### Hunk Header Regex
 
@@ -76,18 +79,21 @@ Groups: (1) old_start, (2) old_count (optional, defaults to "1"), (3) new_start,
 `src/tongs/diff/models.py` defines four frozen dataclasses:
 
 **DiffLine:**
+
 - `old_lineno: int | None`: line number in old file (None for additions)
 - `new_lineno: int | None`: line number in new file (None for deletions)
 - `content: str`: line content (prefix character stripped)
 - `line_type: LineType`: CONTEXT, ADDITION, DELETION, HUNK_HEADER, NO_NEWLINE
 
 **DiffHunk:**
+
 - `header: str`: raw `@@ ... @@` line
 - `old_start`, `old_count`, `new_start`, `new_count`: from hunk header
 - `lines: tuple[DiffLine, ...]`: parsed lines in this hunk
 - `context_text: str`: function name from hunk header (after `@@`)
 
 **DiffFile:**
+
 - `old_path`, `new_path`: file paths (no `a/`/`b/` prefixes)
 - `status: FileStatus`: MODIFIED, ADDED, DELETED, RENAMED
 - `hunks: tuple[DiffHunk, ...]`
@@ -105,6 +111,7 @@ Groups: (1) old_start, (2) old_count (optional, defaults to "1"), (3) new_start,
   rename-only, or unavailable files
 
 **SplitDiffRow:**
+
 - `old: DiffLine | None`, `new: DiffLine | None`: independent references to
   the original `DiffLine` objects; a missing cell is `None`
 - `old_anchor`, `new_anchor`: properties returning the respective `DiffLine`
@@ -138,6 +145,7 @@ Used by the terminal renderer to select Rich syntax highlighting.
 ## Test Fixtures
 
 Real diff files for testing are in `tests/fixtures/`:
+
 - `builder_mr_3113.diff`: real MR diff from the builder project
 - `fromager_pr_1258.diff`: real PR diff from fromager
 
@@ -190,6 +198,7 @@ The `create_inline_comment` ABC accepts optional `start_line`/`start_side` to su
 ## Comment Anchors in Gutter
 
 The `DiffRenderer._gutter()` method renders a comment marker `*` in the gutter for lines that have discussions:
+
 - Yellow bold `*` for lines with unresolved discussions
 - Dim `*` for lines where all discussions are resolved
 
@@ -198,6 +207,7 @@ The gutter lookup uses a `comment_lines: dict[tuple[int | None, int | None], boo
 ## Cross-Tab Navigation
 
 `DiffPanel.jump_to_discussion(file_path, line, discussion_id)` supports cross-tab navigation from the Discussion tab to the Diff tab. When invoked:
+
 1. Finds the file by matching `new_path` or `old_path` against the file list
 2. Switches to the file via `_show_file(index)`
 3. Picks `DiffSide.OLD` for a discussion anchored only on the old side, otherwise `DiffSide.NEW`

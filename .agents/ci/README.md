@@ -7,7 +7,6 @@ to do when a hosted check fails.
 
 ## Full local check set
 
-
 Run Python tools through the checkout-local environment:
 
 ```bash
@@ -16,8 +15,8 @@ pytest tests/ --ignore=tests/test_mcp -v
 pytest tests/test_mcp -v --junitxml="/tmp/tongs-mcp-$$.junit.xml"
 python tests/ci/verify_desktop_ci.py mcp-report \
   --path "/tmp/tongs-mcp-$$.junit.xml"
-ruff check src/ tests/ packaging/ scripts/release-evidence/ examples/
-ruff format --check src/ tests/ packaging/ scripts/release-evidence/ examples/
+ruff check src/ tests/ packaging/ scripts/ .github/scripts/ examples/
+ruff format --check src/ tests/ packaging/ scripts/ .github/scripts/ examples/
 ```
 
 The MCP extra is required so MCP tests execute rather than skip on import. The
@@ -175,7 +174,7 @@ One more workflow runs on pull requests:
 
 | Workflow | Trigger |
 |---|---|
-| `release-desktop.yml` (Unpublished desktop candidate attestation) | PRs into `main` matching its path filter; pushes to its named branches; pushes of a stable `vX.Y.Z` tag; and a manual `workflow_dispatch` dry run |
+| `release-desktop.yml` (Unpublished desktop candidate attestation) | PRs into `main` matching its path filter; pushes of a stable `vX.Y.Z` tag; and a manual `workflow_dispatch` dry run from `main` (a dispatch from any other ref fails) |
 
 `desktop-rpm.yml` (Desktop Fedora RPM), `desktop-python-rpms.yml` (Desktop Python
 companion RPMs) and `desktop-archive.yml` (Reproducible desktop archive) are manual
@@ -210,7 +209,8 @@ that state and asks for a retry.
 A `workflow_dispatch` of `release-desktop.yml` from `main` with `dry_run` set
 runs the build, signing, verification and RPM rebuild and publishes nothing.
 It is the rehearsal to run before pushing a tag:
-`gh workflow run release-desktop.yml --ref main -f dry_run=true`. The publish
+`gh workflow run release-desktop.yml --ref main -f dry_run=true`. A dispatch
+from any other ref fails in its first step. The publish
 job, including the draft-release lookup, only runs on the tag itself. `tests/ci/test_release_publication_workflow.py`
 pins the trigger, permission and step-order contract.
 
@@ -220,6 +220,51 @@ pins the trigger, permission and step-order contract.
 `gh release create --notes-file`. Write the prose so it reads on GitHub too:
 absolute `https://www.tongs.tools/...` links, inline code such as
 `` `Ctrl+G` `` instead of `++key++` markup.
+
+### Release gate
+
+On a tag push, both workflows run `.github/scripts/release_gate.py` right
+after checkout, in `publish.yml` `build` and `release-desktop.yml`
+`candidate-archive`, before anything is installed, built or uploaded. Every
+publishing job depends on those two, so a tag publishes nothing to PyPI or the
+GitHub Release unless all three checks pass for the tagged commit:
+
+1. It is on `main`: the compare `<sha>...main` reports `ahead` or `identical`.
+   Any commit `main` contains passes, not only its tip.
+2. `docs/releases/<tag>.md` exists in the tagged tree and has a body after
+   any leading front matter, the same text the GitHub Release uses.
+3. The newest `ci.yml` run for a push to `main` of exactly that commit, from
+   this repository and not a fork, completed with conclusion `success`. A run reports its latest
+   attempt, so a partial re-run that turned green counts.
+
+The gate is a hard failure and never polls; each failed check prints its own
+line. One step before it is the only step that sees `GH_TOKEN`, and it only
+reads the two API responses into `$RUNNER_TEMP`; the jobs hold
+`contents: read` and `actions: read`. `tests/ci/test_release_gate.py` covers
+the checks against recorded API responses in `tests/ci/fixtures/release_gate/`,
+and `tests/ci/test_workflow_hygiene.py` holds every tag workflow to the gate.
+
+The gate catches release mistakes, not a deliberately bad tag: on a tag push
+both the workflow and the gate script come from the tagged commit. Who can
+push tags, and the PyPI publisher settings, remain the security boundary.
+
+### Pre-tag checklist
+
+1. Merge the release notes pull request, the last change of the release.
+2. Wait for the `ci.yml` push run on `main` for that merge commit to finish
+   green. Its full graph includes the RPM lifecycle and takes about two hours.
+3. Run the dry run from `main`:
+   `gh workflow run release-desktop.yml --ref main -f dry_run=true`, and wait
+   for it to pass.
+4. Get the maintainer's go to tag. Tags are never delegated.
+5. Push the signed `vX.Y.Z` tag on that merge commit.
+6. If the gate fails because `main` CI was still running, wait for it to turn
+   green, then re-run the failed jobs of whichever tag workflow failed
+   (`publish.yml` or `release-desktop.yml`). The two gates run separately, so
+   one may already have passed and published. Never delete, move or recreate
+   the tag. Any other gate failure means that workflow cannot publish: check
+   whether the other one already did, then stop and raise it with the
+   maintainer rather than retagging.
 
 ## Pinned actions and tools
 

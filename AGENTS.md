@@ -53,8 +53,8 @@ source .venv/bin/activate
 pytest
 
 # Lint and check formatting
-ruff check src/ tests/
-ruff format --check src/ tests/
+ruff check src/ tests/ packaging/ scripts/ .github/scripts/ examples/
+ruff format --check src/ tests/ packaging/ scripts/ .github/scripts/ examples/
 
 # Apply formatting to changed Python files when needed
 # ruff format path/to/changed_file.py

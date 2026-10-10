@@ -7,11 +7,17 @@ other side: the tag filter admits only stable tags, the signing job runs on
 those tags, the publish job is the only job holding ``contents: write`` and
 runs only for a tag push, every step that can create anything is preceded by
 the installer-path verification, and a dry run can never reach publication.
+Both tag workflows run the release gate (``.github/scripts/release_gate.py``)
+right after checkout, before any install, build or upload, and only its fetch
+step sees the token; a manual dispatch from a ref other than main fails.
 """
 
 from __future__ import annotations
 
+import importlib.util
+import os
 import re
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -27,6 +33,26 @@ PUBLISH_WORKFLOW = ROOT / ".github/workflows/publish.yml"
 RELEASE_TAG_FILTER = "v[0-9]+.[0-9]+.[0-9]+"
 PUBLICATION_PROGRAM = "tests/integration/desktop/release_publication.py"
 PAYLOAD_CONTRACT_PROGRAM = "tests/integration/desktop/rpm_payload_contract.py"
+GATE_PROGRAM = ".github/scripts/release_gate.py"
+TAG_PUSH = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
+#: The first job of each tag workflow; every publishing job depends on it.
+GATE_JOBS = (("publish.yml", "build"), ("release-desktop.yml", "candidate-archive"))
+GATE_FETCHES = [
+    (
+        'gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...main" '
+        '> "$RUNNER_TEMP/release-gate-compare.json"'
+    ),
+    (
+        'gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs'
+        '?event=push&branch=main&head_sha=$GITHUB_SHA&per_page=100" '
+        '> "$RUNNER_TEMP/release-gate-runs.json"'
+    ),
+]
+#: Steps that install, build, sign or upload; none may run before the gate.
+_GATED_WORK = re.compile(
+    r"pip3?\s+install|-m\s+build|run_hosted\.sh|candidate_attestation\.py"
+    r"|git\s+archive|-m\s+venv|gh\s+release"
+)
 
 
 @pytest.fixture(scope="module")
@@ -107,8 +133,12 @@ def test_only_the_publish_job_can_write_contents(
     }
     assert writers == {"release-publish"}
     assert jobs["release-publish"]["permissions"] == {"contents": "write"}
-    # The unprivileged archive build must not mint or attest anything.
-    assert jobs["candidate-archive"]["permissions"] == {"contents": "read"}
+    # The unprivileged archive build must not mint or attest anything.  It
+    # reads main's ci.yml runs for the release gate and nothing more.
+    assert jobs["candidate-archive"]["permissions"] == {
+        "contents": "read",
+        "actions": "read",
+    }
     # The signing job mints the OIDC token; it must not also be able to write.
     assert jobs["candidate-attestation"]["permissions"] == {
         "contents": "read",
@@ -357,3 +387,164 @@ def test_attestations_stay_off_the_package_registry(
     for step in attest_steps:
         assert step["with"]["push-to-registry"] is False, step.get("name")
         assert step["with"]["create-storage-record"] is False, step.get("name")
+
+
+def _gate_job(name: str, job_id: str) -> dict[str, Any]:
+    document = yaml.safe_load((ROOT / ".github/workflows" / name).read_text())
+    return document["jobs"][job_id]
+
+
+def _shell_commands(run: str) -> list[str]:
+    joined = run.replace("\\\n", " ")
+    return [" ".join(line.split()) for line in joined.splitlines() if line.strip()]
+
+
+def _load_gate() -> Any:
+    specification = importlib.util.spec_from_file_location(
+        "release_gate_for_workflow_test", ROOT / GATE_PROGRAM
+    )
+    assert specification is not None and specification.loader is not None
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(("name", "job_id"), GATE_JOBS)
+def test_the_release_gate_runs_right_after_checkout_before_any_work(
+    name: str, job_id: str
+) -> None:
+    job = _gate_job(name, job_id)
+    steps = job["steps"]
+    assert str(steps[0]["uses"]).startswith("actions/checkout@")
+    fetch, check = steps[1], steps[2]
+    assert [
+        line for line in _shell_commands(fetch["run"]) if line.startswith("gh ")
+    ] == GATE_FETCHES
+    commands = _shell_commands(check["run"])
+    assert 'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"' in commands
+    (gate,) = [line for line in commands if GATE_PROGRAM in line]
+    assert gate.startswith(f"python3 -I {GATE_PROGRAM} ")
+    # Every later step that installs, builds, signs or uploads runs after it.
+    later_work = [
+        index
+        for index, step in enumerate(steps)
+        if _GATED_WORK.search(" ".join((step.get("run") or "").split()))
+        or str(step.get("uses", "")).startswith(
+            ("actions/setup-python@", "actions/upload-artifact@")
+        )
+    ]
+    assert later_work and min(later_work) > 2, later_work
+    # The job holds read scopes only, actions: read for the runs list.
+    assert job["permissions"] == {"contents": "read", "actions": "read"}
+    if name == "publish.yml":
+        # This workflow runs on a release tag push alone, so the gate always runs.
+        assert "if" not in fetch and "if" not in check
+    else:
+        assert " ".join(fetch["if"].split()) == TAG_PUSH
+        assert " ".join(check["if"].split()) == TAG_PUSH
+
+
+@pytest.mark.parametrize(("name", "job_id"), GATE_JOBS)
+def test_only_the_gate_fetch_step_sees_the_token(name: str, job_id: str) -> None:
+    document = yaml.safe_load((ROOT / ".github/workflows" / name).read_text())
+    job = document["jobs"][job_id]
+    assert "GH_TOKEN" not in (document.get("env") or {})
+    assert "GH_TOKEN" not in (job.get("env") or {})
+    with_token = [
+        index
+        for index, step in enumerate(job["steps"])
+        if "env" in step and "GH_TOKEN" in step["env"]
+    ]
+    assert with_token == [1]
+    assert job["steps"][1]["env"] == {"GH_TOKEN": "${{ github.token }}"}
+    callers = [
+        index
+        for index, step in enumerate(job["steps"])
+        if re.search(r"(^|[\s;&|(])gh\s", step.get("run") or "")
+    ]
+    assert callers == [1]
+    # The gate program itself reads files and holds no credential.
+    assert "env" not in job["steps"][2]
+
+
+@pytest.mark.parametrize(("name", "job_id"), GATE_JOBS)
+def test_the_workflow_passes_the_gate_exactly_its_arguments(
+    name: str, job_id: str
+) -> None:
+    check = _gate_job(name, job_id)["steps"][2]
+    (gate,) = [line for line in _shell_commands(check["run"]) if GATE_PROGRAM in line]
+    tokens = shlex.split(gate)
+    assert tokens[:3] == ["python3", "-I", GATE_PROGRAM]
+    parser = _load_gate().build_parser()
+    arguments = vars(parser.parse_args(tokens[3:]))
+    assert arguments["tag"] == "$GITHUB_REF_NAME"
+    assert str(arguments["notes"]) == "docs/releases/$GITHUB_REF_NAME.md"
+    assert arguments["sha"] == "$GITHUB_SHA"
+    assert arguments["repository_id"] == "$GITHUB_REPOSITORY_ID"
+    assert str(arguments["compare"]) == "$RUNNER_TEMP/release-gate-compare.json"
+    assert str(arguments["runs"]) == "$RUNNER_TEMP/release-gate-runs.json"
+    flags = {token for token in tokens if token.startswith("--")}
+    accepted = {
+        option
+        for action in parser._actions
+        for option in action.option_strings
+        if option.startswith("--") and option != "--help"
+    }
+    assert flags == accepted
+
+
+def test_every_publishing_job_depends_on_the_gate_job(
+    jobs: dict[str, dict[str, Any]],
+) -> None:
+    for name in ("candidate-attestation", "release-rpm", "release-publish"):
+        assert "candidate-archive" in jobs[name]["needs"], name
+        condition = " ".join(jobs[name]["if"].split())
+        assert "needs.candidate-archive.result == 'success'" in condition, name
+        assert "always()" not in condition, name
+    publish = yaml.safe_load(PUBLISH_WORKFLOW.read_text())
+    assert set(publish[True]) == {"push"}
+    assert set(publish[True]["push"]) == {"tags"}
+    assert publish["jobs"]["publish"]["needs"] == "build"
+    # No condition, so the upload runs only when the gated build succeeded.
+    assert "if" not in publish["jobs"]["publish"]
+
+
+def _dispatch_guard(jobs: dict[str, dict[str, Any]]) -> str:
+    step = jobs["no-signing-validation"]["steps"][0]
+    assert "if" not in step
+    assert "env" not in step
+    return step["run"]
+
+
+@pytest.mark.parametrize(
+    ("event", "ref", "allowed"),
+    [
+        ("workflow_dispatch", "refs/heads/main", True),
+        ("workflow_dispatch", "refs/heads/claude/patch-train-R1", False),
+        ("workflow_dispatch", "refs/heads/main-backport", False),
+        ("workflow_dispatch", "refs/tags/v1.0.4", False),
+        ("push", "refs/tags/v1.0.4", True),
+        ("pull_request", "refs/pull/388/merge", True),
+    ],
+)
+def test_a_manual_dispatch_from_any_ref_but_main_fails(
+    jobs: dict[str, dict[str, Any]], event: str, ref: str, allowed: bool
+) -> None:
+    # The guard is the first step of the one job that runs for every event, so
+    # a dispatch from a branch fails instead of skipping every candidate job.
+    script = _dispatch_guard(jobs)
+    completed = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "GITHUB_EVENT_NAME": event,
+            "GITHUB_REF": ref,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert (completed.returncode == 0) is allowed, completed.stderr
+    if not allowed:
+        assert f"not {ref}" in completed.stderr

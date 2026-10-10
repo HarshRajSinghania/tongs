@@ -498,7 +498,7 @@ class ReviewOperations:
             )
         except DraftStoreError as error:
             raise _draft_service_error(error) from None
-        return _draft_wire(saved.assessed_against(current_revision), review_handle)
+        return _draft_wire(saved, review_handle)
 
     async def discard_draft(
         self, params: JsonObject, context: OperationContext
