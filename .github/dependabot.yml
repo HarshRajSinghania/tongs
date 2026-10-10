@@ -1,7 +1,11 @@
-# Weekly, grouped dependency update pull requests, tested by CI like any
-# other change.  Minor and patch updates arrive as one pull request per
-# ecosystem and directory; a major update arrives on its own.  Electron always
-# gets its own pull request, because a new Electron needs native checks.
+# Monthly, grouped dependency update pull requests, tested by CI like any
+# other change.  Per ecosystem, minor and patch updates arrive as one pull
+# request and major updates as another, so a month brings at most two pull
+# requests per ecosystem.
+#
+# No labels: ci.yml reruns on the labeled event (for ci:full), so the labels
+# Dependabot adds after opening a pull request would start CI again and
+# cancel the first run.
 version: 2
 updates:
   # Every action is pinned by commit SHA with a trailing "# vX.Y.Z" comment.
@@ -10,10 +14,13 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+    labels: []
     groups:
       github-actions:
         update-types: [minor, patch]
+      github-actions-major:
+        update-types: [major]
 
   # pyproject.toml: the runtime ranges and the extras, including the exactly
   # pinned lint extra the CI lint job installs Ruff from.  The hash locks in
@@ -25,14 +32,20 @@ updates:
     exclude-paths:
       - requirements/**
     schedule:
-      interval: weekly
+      interval: monthly
+    labels: []
     groups:
       python:
         update-types: [minor, patch]
+      python-major:
+        update-types: [major]
 
   # The desktop shell, the documentation site and the pinned Markdown linter
   # each install exactly from their own package-lock.json with npm ci.  Every
   # direct dependency is an exact version, and "increase" keeps it exact.
+  # Electron is updated by hand: the reproducible desktop archive pins its
+  # exact version and file digests in packaging/desktop/archive, which have to
+  # be refreshed in the same change.
   - package-ecosystem: npm
     directories:
       - /desktop
@@ -40,11 +53,12 @@ updates:
       - /.github/linters
     versioning-strategy: increase
     schedule:
-      interval: weekly
+      interval: monthly
+    labels: []
+    ignore:
+      - dependency-name: electron
     groups:
-      # Listed first: Dependabot puts a dependency in the first group that
-      # matches it, so Electron never joins the minor and patch group.
-      electron:
-        patterns: [electron]
       npm:
         update-types: [minor, patch]
+      npm-major:
+        update-types: [major]
