@@ -187,9 +187,11 @@ fault-containment tools, not a sandbox for hostile installed code. See the
 
 ## MCP process
 
-`tongs-mcp` is a separate FastMCP stdio process. It creates its own
-`ForgeRegistry` lazily and exposes the small tool surface in
-`src/tongs/mcp/server.py`. It does not share the TUI or desktop process lifecycle.
+`tongs-mcp` is a separate FastMCP stdio process. On its first tool call it
+starts one `ApplicationSession`, like the desktop sidecar, and closes it on
+shutdown. The tool logic lives in `src/tongs/mcp/tools.py` as plain async
+functions over that session; `src/tongs/mcp/server.py` only registers the tools
+with the SDK. It does not share the TUI or desktop process lifecycle.
 MCP input validation and its excluded destructive operations are part of that
 server's authority boundary.
 

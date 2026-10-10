@@ -932,7 +932,12 @@ class ApplicationSession:
                     "The forge returned invalid diff data.",
                 )
             copied = tuple(self._freeze_mapping(change) for change in changes)
-            return RawDiffSnapshot(ref, before, copied)
+            return RawDiffSnapshot(
+                ref,
+                before,
+                copied,
+                changes_overflow=after_detail.changes_overflow is True,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as error:

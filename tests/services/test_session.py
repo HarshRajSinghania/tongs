@@ -1864,6 +1864,19 @@ class TestRevisionBoundDiff:
             result.changes[0]["filename"] = "changed.py"  # type: ignore[index]
         assert client.get_mr_fresh_calls == 2
         assert client.get_mr_diff_fresh_calls == 1
+        assert result.changes_overflow is False
+        await session.close()
+
+    @pytest.mark.asyncio
+    async def test_forge_capped_file_list_is_reported(self) -> None:
+        client = FakeClient(
+            replace(make_detail(start="start-1"), changes_overflow=True)
+        )
+        registry = FakeRegistry({"github.com": client})
+        session = await start_session(registry)
+        repo = await session.open_repository("github.com", "acme/widgets")
+        result = await session.get_raw_diff(ReviewRef(repo.ref, 7))
+        assert result.changes_overflow is True
         await session.close()
 
     @pytest.mark.asyncio
