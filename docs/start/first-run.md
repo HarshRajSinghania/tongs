@@ -100,7 +100,7 @@ expired credential. See [If sign-in fails](/getting-started/#if-sign-in-fails).
 
 - Lower `scan_depth` if tongs walks too many directories.
 - Lower `max_parallel` in `[concurrency]` if you hit forge rate limits. It
-  defaults to 8 requests at a time.
+  defaults to 8 requests at a time to each forge host.
 
 ## Next
 

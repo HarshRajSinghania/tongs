@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from email.utils import formatdate
 
 import httpx
 import pytest
@@ -17,7 +19,10 @@ from tongs.errors import (
     RateLimitError,
     ValidationError,
 )
+from tongs.forges import http
 from tongs.forges.http import (
+    MAX_RETRY_AFTER_SECONDS,
+    HostRequestLimiter,
     RefreshingTokenAuth,
     create_client,
     map_http_error,
@@ -93,6 +98,65 @@ class TestMapHttpError:
         err = map_http_error(resp)
         assert isinstance(err, RateLimitError)
         assert err.retry_after is None
+
+    @pytest.mark.parametrize(
+        ("headers", "expected"),
+        [
+            ({"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1030"}, 30),
+            ({"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "999"}, 0),
+            ({"x-ratelimit-remaining": "0"}, None),
+            ({"Retry-After": "45"}, 45),
+            ({"Retry-After": "Thu, 01 Jan 1970 00:17:00 GMT"}, 20),
+            ({"Retry-After": "not a date"}, None),
+        ],
+    )
+    def test_403_with_rate_limit_headers_returns_rate_limit(self, headers, expected):
+        resp = httpx.Response(
+            403, json={"message": "API rate limit exceeded"}, headers=headers
+        )
+        err = map_http_error(resp, now=lambda: 1000.0)
+        assert isinstance(err, RateLimitError)
+        assert err.retry_after == expected
+        assert "API rate limit exceeded" in str(err)
+
+    @pytest.mark.parametrize(
+        "headers",
+        [{}, {"x-ratelimit-remaining": "4999"}, {"x-ratelimit-remaining": ""}],
+    )
+    def test_403_without_rate_limit_signal_is_permission_denied(self, headers):
+        resp = httpx.Response(403, json={"message": "Forbidden"}, headers=headers)
+        err = map_http_error(resp)
+        assert isinstance(err, ForgePermissionError)
+        assert not isinstance(err, RateLimitError)
+
+    def test_429_with_http_date_retry_after(self):
+        resp = httpx.Response(
+            429,
+            json={"message": "Too Many Requests"},
+            headers={"Retry-After": "Thu, 01 Jan 1970 00:16:52 GMT"},
+        )
+        err = map_http_error(resp, now=lambda: 1000.0)
+        assert isinstance(err, RateLimitError)
+        assert err.retry_after == 12
+
+    def test_past_http_date_retry_after_waits_zero(self):
+        resp = httpx.Response(
+            429, headers={"Retry-After": "Thu, 01 Jan 1970 00:00:01 GMT"}
+        )
+        err = map_http_error(resp, now=lambda: 1000.0)
+        assert isinstance(err, RateLimitError)
+        assert err.retry_after == 0
+
+    def test_rate_limit_body_is_redacted(self):
+        resp = httpx.Response(
+            403,
+            json={"message": "limit for ghp_abcdefghijklmnopqrstuvwxyz0123456789"},
+            headers={"x-ratelimit-remaining": "0"},
+        )
+        err = map_http_error(resp)
+        assert isinstance(err, RateLimitError)
+        assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in str(err)
+        assert "[REDACTED]" in str(err)
 
     def test_500_returns_generic_forge_error(self):
         resp = _FakeResponse(500, '{"error": "Internal Server Error"}')
@@ -227,7 +291,205 @@ class TestRateLimitRetry:
                 await request(client, "GET", "/projects/1")
 
 
+@pytest.fixture
+def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record retry sleeps instead of waiting."""
+    recorded: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        recorded.append(delay)
+
+    monkeypatch.setattr(http, "_sleep", fake_sleep)
+    return recorded
+
+
+class TestRateLimitWaits:
+    @pytest.mark.asyncio
+    async def test_http_date_retry_after_is_honored(self, sleeps):
+        calls = 0
+        retry_at = formatdate(time.time() + 30, usegmt=True)
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(429, headers={"Retry-After": retry_at})
+            return httpx.Response(200, json={"ok": True})
+
+        async with _make_async_client(handler) as client:
+            result = await request(client, "GET", "/projects/1")
+        assert result == {"ok": True}
+        assert calls == 2
+        assert len(sleeps) == 1
+        assert 28 <= sleeps[0] <= 31
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_403_retries_once(self, sleeps):
+        calls = 0
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(
+                    403,
+                    json={"message": "You have exceeded a secondary rate limit"},
+                    headers={"Retry-After": "3"},
+                )
+            return httpx.Response(200, json=[])
+
+        async with _make_async_client(handler) as client:
+            assert await request(client, "GET", "/projects") == []
+        assert calls == 2
+        assert sleeps == [3]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {"Retry-After": "120"},
+            {"Retry-After": str(MAX_RETRY_AFTER_SECONDS + 1)},
+        ],
+    )
+    async def test_long_wait_fails_without_sleeping(self, sleeps, headers):
+        calls = 0
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(429, json={"message": "slow down"}, headers=headers)
+
+        async with _make_async_client(handler) as client:
+            with pytest.raises(RateLimitError) as caught:
+                await request(client, "GET", "/projects/1")
+        assert caught.value.retry_after == int(headers["Retry-After"])
+        assert calls == 1
+        assert sleeps == []
+
+    @pytest.mark.asyncio
+    async def test_exhausted_primary_limit_with_distant_reset_fails_at_once(
+        self, sleeps
+    ):
+        reset = str(int(time.time()) + 3600)
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                403,
+                json={"message": "API rate limit exceeded"},
+                headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": reset},
+            )
+
+        async with _make_async_client(handler) as client:
+            with pytest.raises(RateLimitError) as caught:
+                await request(client, "GET", "/projects/1")
+        assert caught.value.retry_after is not None
+        assert caught.value.retry_after > MAX_RETRY_AFTER_SECONDS
+        assert sleeps == []
+
+    @pytest.mark.asyncio
+    async def test_wait_at_the_cap_still_sleeps_and_retries(self, sleeps):
+        calls = 0
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(
+                    429, headers={"Retry-After": str(MAX_RETRY_AFTER_SECONDS)}
+                )
+            return httpx.Response(200, json={})
+
+        async with _make_async_client(handler) as client:
+            await request(client, "GET", "/projects/1")
+        assert sleeps == [MAX_RETRY_AFTER_SECONDS]
+        assert calls == 2
+
+    @pytest.mark.asyncio
+    async def test_missing_wait_uses_the_default_delay(self, sleeps):
+        calls = 0
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(429)
+            return httpx.Response(200, json={})
+
+        async with _make_async_client(handler) as client:
+            await request(client, "GET", "/projects/1")
+        assert sleeps == [http.DEFAULT_RETRY_AFTER_SECONDS]
+
+    @pytest.mark.asyncio
+    async def test_timeout_is_never_retried(self, sleeps):
+        calls = 0
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            raise httpx.ReadTimeout("read timed out")
+
+        async with _make_async_client(handler) as client:
+            with pytest.raises(NetworkError, match="timed out"):
+                await request(client, "GET", "/projects/1")
+        assert calls == 1
+        assert sleeps == []
+
+    @pytest.mark.asyncio
+    async def test_retry_sleep_holds_no_host_request_slot(self, monkeypatch):
+        """While one request waits out a rate limit, another can use the slot."""
+        limiter = HostRequestLimiter(1)
+        sent: list[str] = []
+        sleeping = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def fake_sleep(_delay: float) -> None:
+            sleeping.set()
+            await resume.wait()
+
+        monkeypatch.setattr(http, "_sleep", fake_sleep)
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            sent.append(req.url.path)
+            if req.url.path.endswith("/limited") and sent.count(req.url.path) == 1:
+                return httpx.Response(429, headers={"Retry-After": "1"})
+            return httpx.Response(200, json={})
+
+        async with httpx.AsyncClient(
+            transport=limiter.wrap(httpx.MockTransport(handler)),
+            base_url="https://gitlab.example.com/api/v4",
+        ) as client:
+            limited = asyncio.create_task(request(client, "GET", "/limited"))
+            await asyncio.wait_for(sleeping.wait(), 5)
+            assert await asyncio.wait_for(request(client, "GET", "/other"), 5) == {}
+            resume.set()
+            assert await asyncio.wait_for(limited, 5) == {}
+        assert sent == [
+            "/api/v4/limited",
+            "/api/v4/other",
+            "/api/v4/limited",
+        ]
+
+
 class TestPaginate:
+    @pytest.mark.asyncio
+    async def test_paginate_defaults_to_one_hundred_per_page(self):
+        seen: list[dict[str, str]] = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen.append(dict(req.url.params))
+            page = int(req.url.params["page"])
+            return httpx.Response(
+                200, json=[{"id": i} for i in range(100 if page == 1 else 3)]
+            )
+
+        async with _make_async_client(handler) as client:
+            result = await paginate(client, "/items", params={"state": "open"})
+        assert len(result) == 103
+        assert seen == [
+            {"state": "open", "per_page": "100", "page": "1"},
+            {"state": "open", "per_page": "100", "page": "2"},
+        ]
+
     @pytest.mark.asyncio
     async def test_paginate_multi_page_collects_all(self):
         pages = {
@@ -399,6 +661,16 @@ class TestRefreshingTokenAuth:
 
 
 class TestCreateClient:
+    def test_no_limiter_leaves_the_default_transport(self):
+        client = create_client("https://gitlab.example.com/api/v4", "tok")
+        assert type(client._transport).__name__ == "AsyncHTTPTransport"
+
+    def test_limiter_wraps_the_client_transport(self):
+        client = create_client(
+            "https://gitlab.example.com/api/v4", "tok", limiter=HostRequestLimiter(3)
+        )
+        assert type(client._transport).__name__ == "_LimitedTransport"
+
     def test_static_token_header_without_refresh(self):
         client = create_client("https://gitlab.example.com/api/v4", "tok")
         assert client.headers["Authorization"] == "Bearer tok"

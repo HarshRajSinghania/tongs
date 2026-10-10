@@ -1,6 +1,7 @@
 """Tests for forge registry."""
 
 import asyncio
+import threading
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -163,3 +164,35 @@ async def test_cache_wraps_created_client() -> None:
         client = await registry.get_client("github.com")
     assert isinstance(client, CachedForgeClient)
     await registry.close_all()
+
+
+@pytest.mark.asyncio
+async def test_token_lookup_runs_off_the_event_loop_thread() -> None:
+    loop_thread = threading.get_ident()
+    lookup_threads: list[int] = []
+
+    def resolve(_hostname: str, _forge_type: ForgeType) -> str:
+        lookup_threads.append(threading.get_ident())
+        return "tok"
+
+    registry = ForgeRegistry()
+    with patch("tongs.forges.registry.resolve_token", side_effect=resolve):
+        await registry.get_client("github.com")
+    assert len(lookup_threads) == 1
+    assert lookup_threads[0] != loop_thread
+    await registry.close_all()
+
+
+@pytest.mark.asyncio
+async def test_bounded_registry_installs_its_host_limiter() -> None:
+    registry = ForgeRegistry(max_parallel=2)
+    with patch("tongs.forges.registry.resolve_token", return_value="tok"):
+        client = await registry.get_client("gitlab.com")
+    assert type(client._http._transport).__name__ == "_LimitedTransport"
+    assert registry._limiters["gitlab.com"].max_parallel == 2
+    await registry.close_all()
+
+
+def test_max_parallel_is_keyword_only() -> None:
+    with pytest.raises(TypeError):
+        ForgeRegistry(frozenset(), frozenset(), 30.0, None, 60, 300, 4)  # type: ignore[misc]
