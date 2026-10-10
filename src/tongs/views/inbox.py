@@ -14,7 +14,7 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, TabbedContent, TabPane
 
 from tongs.scanner.repo import Repo
-from tongs.services.errors import ServiceError
+from tongs.services.errors import ServiceError, ServiceErrorCode
 from tongs.services.models import HostFailure, ReviewScope
 from tongs.widgets.mr_table import MRTable
 
@@ -255,6 +255,43 @@ class InboxScreen(Screen):
         return self.query_one(table_id, MRTable)
 
 
+# Codes that describe the whole host rather than one repository, so every
+# repository on that host fails the same way and is reported once.
+_HOST_WIDE_CODES = frozenset(
+    {
+        ServiceErrorCode.AUTHENTICATION_FAILED,
+        ServiceErrorCode.RATE_LIMITED,
+        ServiceErrorCode.NETWORK_UNAVAILABLE,
+        ServiceErrorCode.CONFIGURATION_INVALID,
+    }
+)
+
+
 def _failure_details(failures: list[HostFailure]) -> str:
-    """Join failures as host and message pairs for one notification."""
-    return "; ".join(f"{failure.hostname}: {failure.message}" for failure in failures)
+    """Join failures into one notification, one entry per repository or host.
+
+    A failure names its repository when it has one. Repository failures that
+    share a host-wide code collapse into one entry for the host with a count.
+    """
+    groups: dict[tuple[str, ServiceErrorCode | int], list[HostFailure]] = {}
+    for index, failure in enumerate(failures):
+        if failure.repository is not None and failure.code in _HOST_WIDE_CODES:
+            key: tuple[str, ServiceErrorCode | int] = (failure.hostname, failure.code)
+        else:
+            key = (failure.hostname, index)
+        groups.setdefault(key, []).append(failure)
+    entries: list[str] = []
+    for group in groups.values():
+        first = group[0]
+        repositories = {failure.repository for failure in group}
+        if len(repositories) > 1:
+            entries.append(
+                f"{first.hostname}: {first.message} ({len(repositories)} repositories)"
+            )
+        elif first.repository is not None:
+            entries.append(
+                f"{first.hostname}/{first.repository.project_path}: {first.message}"
+            )
+        else:
+            entries.append(f"{first.hostname}: {first.message}")
+    return "; ".join(entries)
