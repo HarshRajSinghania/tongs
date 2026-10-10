@@ -1,37 +1,66 @@
-"""Tests for MCP server helpers."""
+"""Tests for the registered tongs-mcp tools and the server lifecycle.
 
-import asyncio
-from unittest.mock import AsyncMock, patch
+This file runs in the Fedora installed-wheel smoke subset, so it imports only
+tongs and the MCP SDK. The tool logic, with a fake forge, is tested through
+the plain functions in ``test_tools.py``.
+"""
 
-import httpx
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import NoReturn
+from unittest.mock import patch
+
 import pytest
+import pytest_asyncio
 
-from tongs.config import Config
-from tongs.errors import AuthError, NetworkError
-from tongs.forges.models import CIStatus, Pipeline
-from tongs.forges.registry import ForgeRegistry
+from tongs.config import Config, HostConfig
+from tongs.errors import AuthError
+from tongs.forges.models import MRPage
+from tongs.mcp import tools
+from tongs.mcp.tools import SessionHolder
+from tongs.services.errors import ServiceError, ServiceErrorCode
+from tongs.services.session import ApplicationSession
 
 mcp_available = True
 try:
+    from mcp.shared.memory import create_connected_server_and_client_session
+
     from tongs.mcp import server
-    from tongs.mcp.server import _parse_host_repo
 except ImportError:
     mcp_available = False
 
 pytestmark = pytest.mark.skipif(not mcp_available, reason="mcp not installed")
 
 UNCONFIGURED_HOST = "evil-gitlab.example"
+REPO = "github.com/acme/repo"
+HEAD_1 = "1" * 40
 
 
-@pytest.fixture(autouse=True)
-def configured_registry(monkeypatch):
-    """Use a registry with one extra host per forge instead of the user's config."""
-    registry = ForgeRegistry(
-        extra_gitlab_hosts=frozenset({"git.lab.corp"}),
-        extra_github_hosts=frozenset({"git.hub.corp"}),
+def make_session(tmp_path: Path) -> ApplicationSession:
+    """A session with one extra host per forge and storage under ``tmp_path``."""
+    return ApplicationSession(
+        config=Config(
+            extra_hosts={
+                "lab": HostConfig("git.lab.corp", "gitlab"),
+                "hub": HostConfig("git.hub.corp", "github"),
+            }
+        ),
+        cache_path=tmp_path / "cache.db",
+        draft_db_path=tmp_path / "drafts.db",
     )
-    monkeypatch.setattr(server, "_registry", registry)
-    return registry
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def holder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> AsyncIterator[SessionHolder]:
+    """Give the server a session with one extra host per forge."""
+    sessions = SessionHolder(lambda: make_session(tmp_path))
+    monkeypatch.setattr(server, "sessions", sessions)
+    yield sessions
+    await sessions.close()
 
 
 @pytest.fixture
@@ -43,54 +72,43 @@ def forbid_token_lookup():
         yield resolve
 
 
-class TestParseHostRepo:
-    def test_valid_github(self):
-        """Standard github.com/owner/repo parses correctly."""
-        host, repo = _parse_host_repo("github.com/owner/repo")
-        assert host == "github.com"
-        assert repo == "owner/repo"
+class TestHostAdmission:
+    @pytest.mark.asyncio
+    async def test_valid_paths(self, holder) -> None:
+        session = await holder.get()
+        parse = tools.parse_repo_path
+        assert parse(session, "github.com/owner/repo").project_path == "owner/repo"
+        nested = parse(session, "gitlab.com/group/subgroup/repo")
+        assert (nested.hostname, nested.project_path) == (
+            "gitlab.com",
+            "group/subgroup/repo",
+        )
+        assert parse(session, "git.lab.corp/a/b/c").hostname == "git.lab.corp"
+        assert parse(session, "git.hub.corp/a/b").project_path == "a/b"
 
-    def test_nested_gitlab(self):
-        """Nested GitLab group path is kept intact after the hostname."""
-        host, repo = _parse_host_repo("gitlab.com/group/subgroup/repo")
-        assert host == "gitlab.com"
-        assert repo == "group/subgroup/repo"
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("repo_path", "message"),
+        [
+            ("github.com/owner/repo/extra", "GitHub host"),
+            ("git.hub.corp/owner/repo/extra", "GitHub host"),
+            ("noslash", "repo_path must be"),
+            ("", "repo_path must be"),
+            ("../foo/bar", "repo_path must be"),
+            ("github.com/a/../b", "repo_path must be"),
+            ("github.com/a/.", "repo_path must be"),
+            ("github.com/оwner/repo", "repo_path must be"),
+            ("github.com/owner/repo\n", "repo_path must be"),
+            ("GitHub.com/owner/repo", "not configured"),
+            (f"{UNCONFIGURED_HOST}/owner/repo", "not configured"),
+            ("github.com.evil.example/owner/repo", "not configured"),
+        ],
+    )
+    async def test_rejected_paths(self, holder, repo_path, message) -> None:
+        session = await holder.get()
+        with pytest.raises(tools.ToolFailure, match=message):
+            tools.parse_repo_path(session, repo_path)
 
-    def test_configured_extra_hosts(self):
-        """Hosts from config.toml are accepted for both forges."""
-        assert _parse_host_repo("git.lab.corp/a/b/c") == ("git.lab.corp", "a/b/c")
-        assert _parse_host_repo("git.hub.corp/a/b") == ("git.hub.corp", "a/b")
-
-    def test_github_requires_exactly_owner_repo(self):
-        """GitHub has no nested groups, so extra segments are rejected."""
-        with pytest.raises(ValueError, match="GitHub host"):
-            _parse_host_repo("github.com/owner/repo/extra")
-        with pytest.raises(ValueError, match="GitHub host"):
-            _parse_host_repo("git.hub.corp/owner/repo/extra")
-
-    @pytest.mark.parametrize("repo_path", ["noslash", ""])
-    def test_malformed_input_raises(self, repo_path):
-        """Input without a host and path is rejected."""
-        with pytest.raises(ValueError, match="repo_path must be"):
-            _parse_host_repo(repo_path)
-
-    def test_path_traversal_rejected(self):
-        """Path traversal segments (..) are rejected by the regex."""
-        with pytest.raises(ValueError, match="repo_path must be"):
-            _parse_host_repo("../foo/bar")
-
-    def test_non_ascii_segment_rejected(self):
-        """Unicode word characters do not pass the ASCII-only path pattern."""
-        with pytest.raises(ValueError, match="repo_path must be"):
-            _parse_host_repo("github.com/оwner/repo")
-
-    def test_unconfigured_host_rejected(self):
-        """A host outside the configured set is rejected."""
-        with pytest.raises(ValueError, match="not configured"):
-            _parse_host_repo(f"{UNCONFIGURED_HOST}/owner/repo")
-
-
-class TestToolsRejectUnconfiguredHosts:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("tool", "args"),
@@ -99,39 +117,40 @@ class TestToolsRejectUnconfiguredHosts:
             ("get_mr", (1,)),
             ("get_mr_diff", (1,)),
             ("post_comment", (1, "hi")),
-            ("approve_mr", (1,)),
+            ("approve_mr", (1, HEAD_1)),
             ("list_pipelines", (1,)),
         ],
     )
     async def test_rejects_before_token_lookup(
-        self, forbid_token_lookup, configured_registry, tool, args
-    ):
+        self, forbid_token_lookup, holder, tool, args
+    ) -> None:
         """Every tool, including the write tools, rejects before credentials."""
         with (
             patch(
                 "tongs.forges.registry.create_client",
                 side_effect=AssertionError("no HTTP client may be built"),
             ),
-            pytest.raises(ValueError),
+            pytest.raises(server.ToolError, match="not configured"),
         ):
             await getattr(server, tool)(f"{UNCONFIGURED_HOST}/owner/repo", *args)
         forbid_token_lookup.assert_not_called()
-        assert configured_registry._clients == {}
+        session = holder.current
+        assert session is not None
+        assert session.forge_registry._clients == {}
 
     @pytest.mark.asyncio
-    async def test_configured_extra_host_reaches_client(self, configured_registry):
+    async def test_configured_extra_host_reaches_client(self) -> None:
         """A configured self-hosted GitLab still gets a client and a request."""
         with (
             patch("tongs.forges.registry.resolve_token", return_value="tok"),
             patch(
-                "tongs.forges.gitlab.GitLabClient.list_mrs", return_value=[]
-            ) as list_mrs,
+                "tongs.forges.gitlab.GitLabClient.list_mrs_page",
+                return_value=MRPage((), has_next=False),
+            ) as list_page,
         ):
             result = await server.list_mrs("git.lab.corp/group/sub/app")
         assert result == []
-        list_mrs.assert_awaited_once()
-        assert list_mrs.await_args.args[0] == "group/sub/app"
-        await configured_registry.close_all()
+        assert {call.args[0] for call in list_page.await_args_list} == {"group/sub/app"}
 
 
 TOOL_CALLS = [
@@ -139,16 +158,16 @@ TOOL_CALLS = [
     ("get_mr", {"number": 1}),
     ("get_mr_diff", {"number": 1}),
     ("post_comment", {"number": 1, "body": "hi"}),
-    ("approve_mr", {"number": 1}),
+    ("approve_mr", {"number": 1, "head_sha": HEAD_1}),
     ("list_pipelines", {"number": 1}),
 ]
 
 
-class TestToolsRedactForgeErrors:
+class TestErrors:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(("tool", "args"), TOOL_CALLS)
-    async def test_forge_error_text_never_reaches_client(self, tool, args):
-        """Every tool replaces forge error text with a fixed message."""
+    async def test_forge_error_text_never_reaches_client(self, tool, args) -> None:
+        """Every tool replaces forge error text with the shared message."""
         secret = "https://user:zqSECRETzq@git.lab.corp token zqSECRETzq"
         with (
             patch(
@@ -165,22 +184,19 @@ class TestToolsRedactForgeErrors:
         assert excinfo.value.__suppress_context__ is True
 
     @pytest.mark.asyncio
-    async def test_request_error_is_redacted(self, configured_registry):
-        with (
-            patch("tongs.forges.registry.resolve_token", return_value="tok"),
-            patch(
-                "tongs.forges.gitlab.GitLabClient.list_mrs",
-                side_effect=NetworkError("connect to zqSECRETzq failed"),
-            ),
-            pytest.raises(server.ToolError) as excinfo,
-        ):
-            await server.list_mrs("git.lab.corp/group/app")
-        assert "SECRET" not in str(excinfo.value)
-        assert "could not be reached" in str(excinfo.value)
-        await configured_registry.close_all()
+    async def test_validation_failures_are_tool_errors(
+        self, forbid_token_lookup
+    ) -> None:
+        with pytest.raises(server.ToolError) as excinfo:
+            await server.mcp.call_tool("list_mrs", {"repo_path": REPO, "state": "all"})
+        assert "state must be one of: open, closed, merged." in str(excinfo.value)
+        with pytest.raises(server.ToolError) as excinfo:
+            await server.mcp.call_tool("approve_mr", {"repo_path": REPO, "number": 7})
+        assert tools.HEAD_SHA_MISSING in str(excinfo.value)
+        forbid_token_lookup.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_malformed_netrc_through_mcp_call(self, tmp_path):
+    async def test_malformed_netrc_through_mcp_call(self, tmp_path) -> None:
         """A malformed .netrc reaches an MCP client without its contents."""
         netrc_file = tmp_path / ".netrc"
         netrc_file.write_text("machine git.lab.corp login x zqSECRETzq-value\n")
@@ -198,150 +214,118 @@ class TestToolsRedactForgeErrors:
         assert "SECRET" not in message
         assert "Forge authentication is unavailable" in message
 
+    @pytest.mark.asyncio
+    async def test_session_start_failure_is_sanitised(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        def broken() -> NoReturn:
+            raise ServiceError(
+                ServiceErrorCode.CONFIGURATION_INVALID,
+                "The Tongs configuration is invalid.",
+            )
 
-@pytest.mark.asyncio
-async def test_get_mr_diff_synthesizes_only_missing_headers(monkeypatch) -> None:
-    client = AsyncMock()
-    client.get_mr_diff.return_value = [
-        {"old_path": "old.py", "new_path": "new.py", "diff": "@@ -1 +1 @@\n-old\n+new"},
-        {
-            "old_path": "same.py",
-            "new_path": "same.py",
-            "diff": "--- a/same.py\n+++ b/same.py\n@@ -1 +1 @@\n-a\n+b",
-        },
-    ]
-    monkeypatch.setattr(
-        server, "_client_for", AsyncMock(return_value=(client, "org/repo"))
-    )
-    result = await server.get_mr_diff("github.com/org/repo", 1)
-    assert result.startswith("--- a/old.py\n+++ b/new.py\n@@")
-    assert result.count("--- a/same.py") == 1
-
-
-@pytest.mark.asyncio
-async def test_list_pipelines_shortens_sha(monkeypatch) -> None:
-    client = AsyncMock()
-    client.list_mr_pipelines.return_value = [
-        Pipeline(1, CIStatus.SUCCESS, "main", "1234567890abcdef", "https://ci")
-    ]
-    monkeypatch.setattr(
-        server, "_client_for", AsyncMock(return_value=(client, "org/repo"))
-    )
-    result = await server.list_pipelines("github.com/org/repo", 1)
-    assert result[0]["sha"] == "1234567"
-
-
-def _pull(number: int) -> dict[str, object]:
-    return {
-        "number": number,
-        "title": f"PR {number}",
-        "state": "open",
-        "user": {"login": "alice"},
-        "head": {"ref": "feature", "sha": f"sha-{number}"},
-        "base": {"ref": "main"},
-        "created_at": "2026-09-01T00:00:00Z",
-        "updated_at": "2026-09-02T00:00:00Z",
-        "html_url": f"https://github.com/acme/repo/pull/{number}",
-        "labels": [],
-    }
-
-
-@pytest.mark.asyncio
-async def test_mcp_registry_bounds_requests_per_host(monkeypatch) -> None:
-    """tongs-mcp builds its registry with max_parallel from config.toml."""
-    active = 0
-    peak = 0
-    paths: list[str] = []
-
-    async def handle_async_request(
-        _transport: httpx.AsyncHTTPTransport, request: httpx.Request
-    ) -> httpx.Response:
-        nonlocal active, peak
-        paths.append(request.url.path)
-        active += 1
-        peak = max(peak, active)
-        try:
-            for _ in range(3):
-                await asyncio.sleep(0)
-            await asyncio.sleep(0.002)
-            if request.url.path == "/repos/acme/repo/pulls":
-                return httpx.Response(200, json=[_pull(n) for n in range(1, 51)])
-            return httpx.Response(200, json={"check_runs": []})
-        finally:
-            active -= 1
-
-    monkeypatch.setattr(
-        httpx.AsyncHTTPTransport, "handle_async_request", handle_async_request
-    )
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
-        monkeypatch.delenv(name, raising=False)
-        monkeypatch.delenv(name.lower(), raising=False)
-    monkeypatch.setattr(server, "_registry", None)
-    monkeypatch.setattr(server, "load_config", lambda: Config(max_parallel=4))
-
-    with patch("tongs.forges.registry.resolve_token", return_value="tok"):
-        results = await asyncio.gather(
-            server.list_mrs("github.com/acme/repo"),
-            server.list_mrs("github.com/acme/repo"),
+        monkeypatch.setattr(server, "sessions", SessionHolder(broken))
+        with pytest.raises(server.ToolError) as excinfo:
+            await server.get_mr(REPO, 7)
+        assert (
+            str(excinfo.value) == "get_mr failed: The Tongs configuration is invalid."
         )
-    registry = server._registry
-    assert registry is not None
-    assert registry.max_parallel == 4
-    await registry.close_all()
-
-    assert [len(result) for result in results] == [50, 50]
-    assert sum(path.endswith("/check-runs") for path in paths) == 100
-    assert peak == 4
 
 
-def _merged_pull(number: int) -> dict[str, object]:
-    return {
-        **_pull(number),
-        "state": "closed",
-        "merged_at": "2026-09-03T00:00:00Z",
-    }
+class TestRegisteredTools:
+    @pytest.mark.asyncio
+    async def test_tool_names_and_arguments(self) -> None:
+        listed = {tool.name: tool for tool in await server.mcp.list_tools()}
+        assert sorted(listed) == [
+            "approve_mr",
+            "get_mr",
+            "get_mr_diff",
+            "list_mrs",
+            "list_pipelines",
+            "post_comment",
+        ]
+        assert list(listed["list_mrs"].inputSchema["properties"]) == [
+            "repo_path",
+            "state",
+            "limit",
+        ]
+        assert list(listed["approve_mr"].inputSchema["properties"]) == [
+            "repo_path",
+            "number",
+            "head_sha",
+        ]
+        assert "get_mr" in (listed["approve_mr"].description or "")
 
-
-def _closed_pull(number: int) -> dict[str, object]:
-    return {**_pull(number), "state": "closed", "merged_at": None}
-
-
-@pytest.mark.asyncio
-async def test_github_merged_filter_lists_merged_pulls(monkeypatch) -> None:
-    """GitHub has no merged filter, so state=merged reads closed and keeps merged."""
-    pull_params: list[dict[str, str]] = []
-
-    async def handle_async_request(
-        _transport: httpx.AsyncHTTPTransport, request: httpx.Request
-    ) -> httpx.Response:
-        if request.url.path == "/repos/acme/repo/pulls":
-            pull_params.append(dict(request.url.params))
-            return httpx.Response(200, json=[_merged_pull(1), _closed_pull(2)])
-        return httpx.Response(200, json={"check_runs": [], "total_count": 0})
-
-    monkeypatch.setattr(
-        httpx.AsyncHTTPTransport, "handle_async_request", handle_async_request
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("tool", "args"),
+        [
+            ("list_mrs", (REPO, "closed", 7)),
+            ("get_mr", (REPO, 7)),
+            ("get_mr_diff", (REPO, 7)),
+            ("post_comment", (REPO, 7, "hi")),
+            ("approve_mr", (REPO, 7, HEAD_1)),
+            ("list_pipelines", (REPO, 7)),
+        ],
     )
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
-        monkeypatch.delenv(name, raising=False)
-        monkeypatch.delenv(name.lower(), raising=False)
+    async def test_tools_run_the_plain_functions_on_the_server_session(
+        self, monkeypatch, holder, tool, args
+    ) -> None:
+        calls: list[tuple[object, ...]] = []
 
-    with patch("tongs.forges.registry.resolve_token", return_value="tok"):
-        merged = await server.list_mrs("github.com/acme/repo", state="merged")
-        closed = await server.list_mrs("github.com/acme/repo", state="closed")
-    await server._registry.close_all()
+        async def recorded(session: ApplicationSession, *rest: object) -> str:
+            calls.append((session, *rest))
+            return "result"
 
-    assert [mr["number"] for mr in merged] == [1]
-    assert [mr["number"] for mr in closed] == [1, 2]
-    assert [params["state"] for params in pull_params] == ["closed", "closed"]
+        monkeypatch.setattr(tools, tool, recorded)
+        assert await getattr(server, tool)(*args) == "result"
+        assert calls == [(holder.current, *args)]
+
+    @pytest.mark.asyncio
+    async def test_list_mrs_defaults(self, monkeypatch, holder) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        async def recorded(session: ApplicationSession, *rest: object) -> list:
+            calls.append(rest)
+            return []
+
+        monkeypatch.setattr(tools, "list_mrs", recorded)
+        await server.mcp.call_tool("list_mrs", {"repo_path": REPO})
+        assert calls == [(REPO, "open", 30)]
 
 
-@pytest.mark.asyncio
-async def test_gitlab_merged_filter_is_passed_through(configured_registry) -> None:
-    with (
-        patch("tongs.forges.registry.resolve_token", return_value="tok"),
-        patch("tongs.forges.gitlab.GitLabClient.list_mrs", return_value=[]) as list_mrs,
-    ):
-        await server.list_mrs("git.lab.corp/group/app", state="merged")
-    assert list_mrs.await_args.kwargs["state"] == "merged"
-    await configured_registry.close_all()
+class TestLifecycle:
+    @pytest.mark.asyncio
+    async def test_one_session_for_every_call(self, holder) -> None:
+        with pytest.raises(server.ToolError):
+            await server.list_mrs(REPO, "all")
+        session = holder.current
+        assert session is not None
+        with pytest.raises(server.ToolError):
+            await server.get_mr(REPO, 0)
+        assert holder.current is session
+
+    @pytest.mark.asyncio
+    async def test_session_closed_on_shutdown(self, holder) -> None:
+        async with create_connected_server_and_client_session(server.mcp) as client:
+            result = await client.call_tool(
+                "list_mrs", {"repo_path": REPO, "state": "all"}
+            )
+            assert result.isError is True
+            session = holder.current
+            assert session is not None
+        assert holder.current is None
+        with pytest.raises(ServiceError) as caught:
+            session.issued_repositories  # noqa: B018
+        assert caught.value.code is ServiceErrorCode.CLOSED
+
+    @pytest.mark.asyncio
+    async def test_client_reads_tool_errors(self, holder, forbid_token_lookup) -> None:
+        async with create_connected_server_and_client_session(server.mcp) as client:
+            result = await client.call_tool(
+                "approve_mr",
+                {"repo_path": REPO, "number": 7, "head_sha": "abc1234"},
+            )
+        assert result.isError is True
+        assert tools.HEAD_SHA_MALFORMED in result.content[0].text
+        forbid_token_lookup.assert_not_called()

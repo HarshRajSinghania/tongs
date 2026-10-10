@@ -267,6 +267,9 @@ class RawDiffSnapshot:
     review: ReviewRef
     revision: ReviewRevision
     changes: tuple[Mapping[str, object], ...]
+    # True when the forge capped the changed-file list, so ``changes`` is
+    # partial. Appended with a default for positional compatibility.
+    changes_overflow: bool = False
 
 
 @dataclass(frozen=True, slots=True)
