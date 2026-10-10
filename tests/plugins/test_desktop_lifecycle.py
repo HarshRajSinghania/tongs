@@ -124,6 +124,13 @@ async def test_start_call_lookup_and_stop_use_frozen_scoped_contracts(
         ("Fixture started", DesktopNotificationSeverity.INFORMATION)
     ]
     assert facade.events == [("refreshed", {"ready": True})]
+    providers = importlib.import_module("fixture_desktop_good").GoodProvider.instances
+    assert providers[-1].context is not None
+    assert providers[-1].context.config == {
+        "nested": {"ready": True},
+        "publish_on_start": True,
+    }
+    assert "enabled" not in providers[-1].context.config
     with pytest.raises(DesktopPluginContractError):
         registry.asset("good", "other")
 
@@ -259,7 +266,7 @@ async def test_timed_out_call_retains_id_until_provider_task_finishes(
 
     assert timed_out.error.code is DesktopPluginErrorCode.CALL_TIMEOUT  # type: ignore[union-attr]
     assert duplicate.error.code is DesktopPluginErrorCode.INVALID_DATA  # type: ignore[union-attr]
-    await asyncio.sleep(0.06)
+    await asyncio.sleep(0.12)
     recovery = await registry.call(
         "good",
         "echo",
@@ -579,6 +586,52 @@ async def test_provider_cancelled_stop_does_not_skip_other_providers(
     assert states["dual"].state is DesktopPluginState.STOPPED
     assert states["good"].state is DesktopPluginState.FAILED
     assert states["good"].error.code is DesktopPluginErrorCode.STOP_FAILED  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_stopping_registry_signals_plugin_cancellation_token(
+    installed_entry_point_source: Callable[[str], Sequence[EntryPoint]],
+) -> None:
+    registry = DesktopPluginRegistry(
+        entry_point_source=only_good(installed_entry_point_source),
+        host_version="1.0",
+    )
+    providers = importlib.import_module("fixture_desktop_good").GoodProvider.instances
+    already_created = len(providers)
+    registry.discover()
+    await registry.start_all(lambda _plugin_id, _manifest: RecordingFacade())
+    (provider,) = providers[already_created:]
+    assert provider.context is not None
+    assert not provider.context.cancellation.cancelled
+
+    await registry.stop_all()
+
+    assert provider.context.cancellation.cancelled
+
+
+@pytest.mark.asyncio
+async def test_cancelling_outer_task_during_call_signals_cancellation_token(
+    installed_entry_point_source: Callable[[str], Sequence[EntryPoint]],
+) -> None:
+    registry = DesktopPluginRegistry(
+        entry_point_source=only_good(installed_entry_point_source),
+        host_version="1.0",
+    )
+    registry.discover()
+    await registry.start_all(lambda _plugin_id, _manifest: RecordingFacade())
+
+    cancellation = DesktopCancellation()
+    call_context = DesktopCallContext("c-outer-cancel", cancellation)
+
+    call_task = asyncio.create_task(registry.call("good", "wait", {}, call_context))
+    await asyncio.sleep(0.01)
+    assert not cancellation.cancelled
+
+    call_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call_task
+
+    assert cancellation.cancelled
 
 
 def test_facade_protocol_has_no_concrete_host_or_tui_capabilities() -> None:

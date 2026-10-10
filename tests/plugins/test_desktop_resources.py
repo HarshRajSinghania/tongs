@@ -201,3 +201,99 @@ def test_find_asset_rejects_unknown_asset(
 
     with pytest.raises(LookupError, match="Unknown or ambiguous"):
         find_asset(assets, "resource", "missing")
+
+
+def test_bundle_total_size_limit_across_multiple_files_is_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = make_package(tmp_path, "total_size_fixture")
+    (package / "assets" / "main.mjs").write_text("x" * 600, encoding="utf-8")
+    (package / "assets" / "second.mjs").write_text("y" * 600, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    base = resource_manifest("total_size_fixture")
+    bundle = base.asset_bundles[0]
+    limited = DesktopPluginManifest(
+        plugin_id=base.plugin_id,
+        title=base.title,
+        version=base.version,
+        compatibility=base.compatibility,
+        modules=base.modules,
+        asset_bundles=(
+            DesktopAssetBundle(
+                bundle.id,
+                bundle.package,
+                bundle.root,
+                (
+                    *bundle.assets,
+                    DesktopAsset("second", "second.mjs", DesktopAssetKind.MODULE),
+                ),
+                max_file_bytes=1000,
+                max_total_bytes=1000,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="exceeds total size limit"):
+        validate_asset_resources(limited)
+
+
+def test_directory_declared_as_asset_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = make_package(tmp_path, "dir_asset_fixture")
+    (package / "assets" / "subdir.mjs").mkdir()
+    monkeypatch.syspath_prepend(str(tmp_path))
+    base = resource_manifest("dir_asset_fixture")
+    bundle = base.asset_bundles[0]
+    manifest = DesktopPluginManifest(
+        plugin_id=base.plugin_id,
+        title=base.title,
+        version=base.version,
+        compatibility=base.compatibility,
+        modules=base.modules,
+        asset_bundles=(
+            DesktopAssetBundle(
+                bundle.id,
+                bundle.package,
+                bundle.root,
+                (
+                    *bundle.assets,
+                    DesktopAsset("subdir", "subdir.mjs", DesktopAssetKind.MODULE),
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="not a regular file"):
+        validate_asset_resources(manifest)
+
+
+def test_file_size_accumulated_across_chunks_is_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = make_package(tmp_path, "chunk_size_fixture")
+    large_content = "x" * (70 * 1024)
+    (package / "assets" / "main.mjs").write_text(large_content, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    base = resource_manifest("chunk_size_fixture")
+    bundle = base.asset_bundles[0]
+    limited = DesktopPluginManifest(
+        plugin_id=base.plugin_id,
+        title=base.title,
+        version=base.version,
+        compatibility=base.compatibility,
+        modules=base.modules,
+        asset_bundles=(
+            DesktopAssetBundle(
+                bundle.id,
+                bundle.package,
+                bundle.root,
+                bundle.assets,
+                max_file_bytes=65 * 1024,
+                max_total_bytes=100 * 1024,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="per-file size limit"):
+        validate_asset_resources(limited)
