@@ -28,6 +28,7 @@ from tongs.views.review_submit import ReviewSubmitScreen
 from tongs.widgets.comment_editor import CommentEditor
 from tongs.widgets.diff_panel import CommentRequested, DiffOptionList, DiffPanel
 from tongs.widgets.discussion_list import DiscussionReplyRequested
+from tongs.widgets.pipeline_panel import PipelinePanel
 from tongs.widgets.review_draft import ReviewDraftBar
 from tongs.widgets.split_diff import (
     DiffSelection,
@@ -1240,6 +1241,176 @@ async def test_escape_mid_submission_is_refused_until_the_write_finishes(
         await pilot.press("escape")
         await _wait_until(app, lambda: screen not in app.screen_stack)
         assert not isinstance(app.screen, MRDetailScreen)
+
+
+async def _pause_until(pilot, predicate) -> None:
+    """Poll the message pump without waiting on a deliberately held worker."""
+    for _ in range(200):
+        if predicate():
+            return
+        await pilot.pause()
+    assert predicate()
+
+
+@pytest.mark.asyncio
+async def test_back_drills_out_of_a_pipeline_job_during_a_submission(
+    tmp_path: Path,
+) -> None:
+    """Back inside a pipeline job drills out even while a submission runs.
+
+    Drilling out stays on the MR screen, so it never cancels the submission
+    worker. Only leaving the screen is refused until the write finishes.
+    """
+    app, forge = _app(tmp_path)
+    release = _gate_verdict(forge)
+
+    async with app.run_test(size=(160, 40), notifications=True) as pilot:
+        screen = await _open_detail(app, pilot)
+        await _draft_with_comment(app, screen, "note before drilling")
+
+        screen.action_review_draft()
+        await _wait_until(app, lambda: isinstance(app.screen, ReviewSubmitScreen))
+        await pilot.press("v")
+        await pilot.press("ctrl+s")
+        await asyncio.wait_for(forge.mutation_started.wait(), timeout=2)
+        await pilot.pause()
+        assert app.screen is screen
+        assert screen._draft_busy
+
+        await pilot.press("5")
+        panel = screen.query_one("#pipeline-panel", PipelinePanel)
+        screen._load_pipeline_jobs(forge.pipeline)
+        await _pause_until(pilot, lambda: panel._view_level == 1)
+        panel.focus()
+        await pilot.pause()
+
+        app.clear_notifications()
+        await pilot.press("q")
+        await _pause_until(pilot, lambda: panel._view_level == 0)
+        assert app.screen is screen
+        assert _messages(app) == []
+
+        screen.action_go_back()
+        await pilot.pause()
+        assert app.screen is screen
+        assert screen in app.screen_stack
+        assert _messages(app) == [
+            "Submission in progress. Wait for it to finish before leaving."
+        ]
+
+        release.set()
+        await _wait_until(
+            app,
+            lambda: screen._review_progress is None and not screen._draft_busy,
+        )
+        assert app._exception is None
+
+
+@pytest.mark.asyncio
+async def test_back_is_refused_while_a_draft_change_is_in_progress(
+    tmp_path: Path,
+) -> None:
+    app, _forge = _app(tmp_path)
+
+    async with app.run_test(size=(160, 40), notifications=True) as pilot:
+        screen = await _open_detail(app, pilot)
+        screen._draft_busy = True
+        app.clear_notifications()
+        screen.action_go_back()
+        await pilot.pause()
+        assert app.screen is screen
+        assert _messages(app) == [
+            (
+                "A review draft change is in progress. Wait for it to finish "
+                "before leaving."
+            )
+        ]
+        screen._draft_busy = False
+
+
+@pytest.mark.asyncio
+async def test_failed_reload_after_a_submission_error_still_reports_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reload that also fails must not hide the notice or exit the TUI."""
+    app, _forge = _app(tmp_path)
+
+    async def failed_start(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("start broke")
+
+    async def failed_reload(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("reload broke")
+
+    async with app.run_test(size=(160, 40), notifications=True) as pilot:
+        screen = await _open_detail(app, pilot)
+        await _draft_with_comment(app, screen, "note before failing")
+        monkeypatch.setattr(app.services, "start_draft_submission", failed_start)
+        monkeypatch.setattr(app.services, "list_draft_recoveries", failed_reload)
+
+        screen.action_review_draft()
+        await _wait_until(app, lambda: isinstance(app.screen, ReviewSubmitScreen))
+        app.clear_notifications()
+        await pilot.press("v")
+        await pilot.press("ctrl+s")
+        await _wait_until(
+            app,
+            lambda: (
+                app._exception is not None
+                or (not screen._draft_busy and bool(_messages(app)))
+            ),
+        )
+
+        assert app._exception is None
+        assert app.is_running
+        assert _messages(app) == [
+            (
+                "Review submission stopped. (start broke) The draft state could "
+                "not be reloaded."
+            )
+        ]
+
+
+@pytest.mark.asyncio
+async def test_failed_reload_after_a_recovery_error_still_reports_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resuming a paused attempt reports its failure even if the reload fails."""
+    app, forge = _app(tmp_path)
+    forge.verdict_error = RateLimitError("controlled rate limit", retry_after=1)
+
+    async def failed_resume(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("resume broke")
+
+    async def failed_reload(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("reload broke")
+
+    async with app.run_test(size=(160, 40), notifications=True) as pilot:
+        screen = await _open_detail(app, pilot)
+        screen.action_review_draft()
+        await _wait_until(app, lambda: screen._review_draft is not None)
+        await _submit_until_paused(app, pilot, screen)
+        await _open_paused_modal(app, pilot, screen)
+        monkeypatch.setattr(app.services, "resume_draft_submission", failed_resume)
+        monkeypatch.setattr(app.services, "list_draft_recoveries", failed_reload)
+
+        app.clear_notifications()
+        await pilot.press("r")
+        await _wait_until(
+            app,
+            lambda: (
+                app._exception is not None
+                or (not screen._draft_busy and bool(_messages(app)))
+            ),
+        )
+
+        assert app._exception is None
+        assert app.is_running
+        assert _messages(app) == [
+            (
+                "Review recovery stopped. (resume broke) The draft state could "
+                "not be reloaded."
+            )
+        ]
 
 
 @pytest.mark.asyncio
