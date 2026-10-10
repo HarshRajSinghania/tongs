@@ -59,6 +59,8 @@ from tongs.services import (
     ServiceErrorCode,
     ServiceEventKind,
 )
+from tongs.services.review_mutations import DiffAnchor, DiffSide
+from tongs.services.review_mutations import InlineComment as InlineCommentCommand
 from tongs.state.drafts import (
     DraftContent,
     DraftState,
@@ -2248,3 +2250,109 @@ class TestEvents:
         await session.close()
         with pytest.raises(StopAsyncIteration):
             await pending
+
+
+class RevisionReadClient(FakeClient):
+    """Count revision-only reads apart from full detail reads."""
+
+    def __init__(self, detail: MRDetail | None = None) -> None:
+        super().__init__(detail)
+        self.get_mr_revision_calls = 0
+
+    async def get_mr_revision(self, repo_path: str, number: int) -> MRDetail:
+        self.get_mr_revision_calls += 1
+        return self.detail_results[0]
+
+
+class TestRevisionOnlyGuards:
+    @pytest.mark.asyncio
+    async def test_github_diff_reads_the_pull_request_twice_before_its_pages(
+        self,
+    ) -> None:
+        paths: list[str] = []
+        pull = {
+            "number": 7,
+            "title": "Review widgets",
+            "state": "open",
+            "draft": False,
+            "html_url": "https://github.com/acme/widgets/pull/7",
+            "created_at": "2026-09-07T00:00:00Z",
+            "updated_at": "2026-09-07T00:00:00Z",
+            "user": {"login": "alice"},
+            "head": {"ref": "feature", "sha": "head-1"},
+            "base": {"ref": "main", "sha": "base-1"},
+            "changed_files": 1,
+        }
+        files = [
+            {
+                "filename": "src/widget.py",
+                "status": "modified",
+                "patch": "@@ -1 +1 @@\n-old\n+new",
+            }
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            if request.url.path == "/repos/acme/widgets/pulls":
+                return httpx.Response(200, json=[])
+            if request.url.path == "/repos/acme/widgets/pulls/7":
+                return httpx.Response(200, json=pull)
+            if request.url.path == "/repos/acme/widgets/pulls/7/files":
+                return httpx.Response(200, json=files)
+            return httpx.Response(500, json={"message": "unexpected request"})
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url=GITHUB_HOST.api_base
+        ) as http:
+            client = GitHubClient(GITHUB_HOST, http)
+            session = await start_session(FakeRegistry({"github.com": client}))
+            repository = await session.open_repository("github.com", "acme/widgets")
+            paths.clear()
+            raw = await session.get_raw_diff(ReviewRef(repository.ref, 7))
+            await session.close()
+
+        first_page = paths.index("/repos/acme/widgets/pulls/7/files")
+        assert paths[:first_page] == ["/repos/acme/widgets/pulls/7"]
+        assert paths == [
+            "/repos/acme/widgets/pulls/7",
+            "/repos/acme/widgets/pulls/7/files",
+            "/repos/acme/widgets/pulls/7",
+        ]
+        assert raw.revision == ReviewRevision("head-1", "base-1", None)
+        assert raw.changes[0]["filename"] == "src/widget.py"
+
+    @pytest.mark.asyncio
+    async def test_mutation_guards_use_revision_reads_and_detail_stays_full(
+        self,
+    ) -> None:
+        client = RevisionReadClient()
+        client.diff = [
+            {
+                "filename": "src/widget.py",
+                "status": "modified",
+                "patch": "@@ -1 +1 @@\n-old\n+new",
+            }
+        ]
+        session = await start_session(FakeRegistry({"github.com": client}))
+        repository = await session.open_repository("github.com", "acme/widgets")
+        review = ReviewRef(repository.ref, 7)
+
+        await session.review_mutations.validate(
+            InlineCommentCommand(
+                "inline-guard",
+                review,
+                ReviewRevision("head-1", "base-1", None),
+                DiffAnchor("src/widget.py", "src/widget.py", 1, DiffSide.RIGHT),
+                "body",
+            )
+        )
+        await session.mr_actions.capabilities(review)
+
+        assert client.get_mr_fresh_calls == 0
+        assert client.get_mr_revision_calls > 0
+        assert client.get_mr_diff_fresh_calls == 1
+
+        snapshot = await session.get_review(review)
+        assert snapshot.detail.ci_status is CIStatus.SUCCESS
+        assert client.get_mr_fresh_calls == 1
+        await session.close()

@@ -772,6 +772,16 @@ class GitHubClient(ForgeClient):
             approvals=approvals,
         )
 
+    async def get_mr_revision(self, repo_path: str, number: int) -> MRDetail:
+        """Read only the pull request, without check runs or review pages."""
+        owner, repo = _split_repo_path(repo_path)
+        data = await request(
+            self._http,
+            "GET",
+            f"/repos/{owner}/{repo}/pulls/{number}",
+        )
+        return self._parse_pr_detail(data, repo_path)
+
     async def get_mr_diff(self, repo_path: str, number: int) -> list[dict]:
         owner, repo = _split_repo_path(repo_path)
         data = await paginate(

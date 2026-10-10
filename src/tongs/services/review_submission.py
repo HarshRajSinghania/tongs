@@ -17,6 +17,7 @@ from tongs.services.errors import ServiceError, ServiceErrorCode
 from tongs.services.models import ReviewRef, ReviewSnapshot
 from tongs.services.review_mutations import (
     DiffAnchor,
+    DiffScope,
     DiffSide,
     GeneralComment,
     InlineComment,
@@ -157,12 +158,13 @@ class ReviewSubmissionService:
                 raise asyncio.CancelledError
             lock = self._attempt_lock(attempt.id)
             async with lock:
+                scope = DiffScope()
                 try:
-                    attempt, plan = await self._preflight(attempt)
+                    attempt, plan = await self._preflight(attempt, scope)
                 except BaseException as error:
                     await self._cancel_before_reraise(attempt.id, error)
                     raise
-                return await self._advance(attempt, plan)
+                return await self._advance(attempt, plan, scope)
         finally:
             self._active_tasks.discard(operation)
 
@@ -180,7 +182,8 @@ class ReviewSubmissionService:
                     )
                 if attempt.state == DraftState.SUBMITTED:
                     return self._progress(attempt, None, SubmissionOutcome.SUBMITTED)
-                attempt, plan = await self._preflight(attempt)
+                scope = DiffScope()
+                attempt, plan = await self._preflight(attempt, scope)
                 remaining = self._remaining_steps(attempt, plan)
                 if not remaining:
                     return await self._complete(attempt, plan)
@@ -189,7 +192,7 @@ class ReviewSubmissionService:
                 )
                 if cancelled:
                     raise asyncio.CancelledError
-                return await self._advance(attempt, plan)
+                return await self._advance(attempt, plan, scope)
         finally:
             self._active_tasks.discard(operation)
 
@@ -257,12 +260,13 @@ class ReviewSubmissionService:
                     with suppress(DraftStoreError):
                         await self._park_unknown(attempt_id, "retry_cancelled")
                     raise asyncio.CancelledError
+                scope = DiffScope()
                 try:
-                    reconciled, plan = await self._preflight(reconciled)
+                    reconciled, plan = await self._preflight(reconciled, scope)
                 except BaseException as error:
                     await self._unknown_before_reraise(attempt_id, error)
                     raise
-                return await self._advance(reconciled, plan)
+                return await self._advance(reconciled, plan, scope)
         finally:
             self._active_tasks.discard(operation)
 
@@ -357,8 +361,13 @@ class ReviewSubmissionService:
         return lock
 
     async def _preflight(
-        self, attempt: SubmissionAttempt
+        self, attempt: SubmissionAttempt, scope: DiffScope
     ) -> tuple[SubmissionAttempt, _SubmissionPlan]:
+        """Check the revision and validate every step against one diff read.
+
+        ``scope`` is passed on to ``_advance`` so that execution reuses the
+        same diff, guarded by each step's revision check.
+        """
         if attempt.plan is None and (
             attempt.receipts
             or attempt.unknown_outcomes
@@ -411,7 +420,9 @@ class ReviewSubmissionService:
                 )
         plan = self._plan(attempt, snapshot)
         for step in plan.steps:
-            await self._mutations.validate(self._command(attempt, step, plan))
+            await self._mutations.validate(
+                self._command(attempt, step, plan), diff_scope=scope
+            )
         recorded = await self._store.record_plan(attempt.id, self._plan_record(plan))
         return recorded, plan
 
@@ -503,7 +514,7 @@ class ReviewSubmissionService:
             raise DraftStoreError("stored submission plan is invalid") from error
 
     async def _advance(
-        self, attempt: SubmissionAttempt, plan: _SubmissionPlan
+        self, attempt: SubmissionAttempt, plan: _SubmissionPlan, scope: DiffScope
     ) -> SubmissionProgress:
         for step in self._remaining_steps(attempt, plan):
             command = self._command(attempt, step, plan)
@@ -530,7 +541,7 @@ class ReviewSubmissionService:
                     ),
                 )
             try:
-                outcome = await self._mutations.execute(command)
+                outcome = await self._mutations.execute(command, diff_scope=scope)
             except asyncio.CancelledError:
                 await self._mark_unknown_cancelled(attempt, step, "cancelled")
                 raise

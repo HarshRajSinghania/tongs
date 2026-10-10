@@ -2079,3 +2079,26 @@ class TestBatchedCI:
 
         assert cancelled.cancelled()
         assert batches == [[("acme", "repo", 11)]]
+
+
+@pytest.mark.asyncio
+async def test_get_mr_revision_reads_only_the_pull_request() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/repos/acme/repo/pulls/10":
+            return httpx.Response(200, json=_pr_api_json({"changed_files": 3}))
+        return httpx.Response(500, json={"message": "unexpected request"})
+
+    client, http = _make_github_client(handler)
+    async with http:
+        detail = await client.get_mr_revision("acme/repo", 10)
+
+    assert paths == ["/repos/acme/repo/pulls/10"]
+    assert detail.number == 10
+    assert detail.head_sha == "abc123def456"
+    assert detail.base_sha == "base123def456"
+    assert detail.start_sha is None
+    assert detail.changes_count == 3
+    assert detail.approvals == ()
