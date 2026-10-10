@@ -723,7 +723,10 @@ class DraftStore:
         *,
         current_revision: ReviewRevision,
     ) -> DraftSnapshot:
-        """Replace editable content using optimistic compare-and-swap."""
+        """Replace editable content using optimistic compare-and-swap.
+
+        The saved snapshot is returned assessed against ``current_revision``.
+        """
         _validate_version(expected_version)
         if not isinstance(content, DraftContent):
             raise TypeError("content must be DraftContent")
@@ -764,7 +767,9 @@ class DraftStore:
                 )
             result = await self._draft_in_transaction(db, draft_id)
             await db.execute("COMMIT")
-            return result
+            # Staleness is derived on read, so the saved snapshot is assessed
+            # against the revision the caller is showing.
+            return result.assessed_against(current_revision)
         except (DraftConflictError, DraftStateError, DraftNotFoundError):
             await self._rollback(db)
             raise
