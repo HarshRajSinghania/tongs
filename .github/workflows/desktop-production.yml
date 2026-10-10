@@ -508,12 +508,22 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+      # The wheel built here is the fixture the installed-core audit trusts,
+      # so the build frontend and backend come from the hash lock, and the
+      # build runs without isolation so pip never resolves a fresh backend.
+      - name: Install the hash-locked build frontend and backend
+        run: >-
+          python -I -m pip install
+          --isolated
+          --disable-pip-version-check
+          --require-hashes
+          --only-binary=:all:
+          -r requirements/release.lock
       - name: Build one ordinary wheel from the exact same source
         id: wheel
         run: |
           set -euo pipefail
-          python -m pip install build
-          python -m build --wheel --outdir "$RUNNER_TEMP/wheel"
+          python -I -m build --no-isolation --wheel --outdir "$RUNNER_TEMP/wheel"
           wheel=$(find "$RUNNER_TEMP/wheel" -maxdepth 1 -name '*.whl' -print)
           test "$(printf '%s\n' "$wheel" | wc -l)" -eq 1
           version=$(basename "$wheel" | cut -d- -f2)

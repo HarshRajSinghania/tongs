@@ -32,6 +32,7 @@ import {
   serviceErrorOf,
 } from "../../core/presentation.js";
 import { QueryCoordinator } from "../../core/query.js";
+import { useRetainedRead } from "../../core/use-read.js";
 import {
   InlineComposer,
   anchorIdentity,
@@ -69,6 +70,7 @@ import {
   threadRowClassName,
   threadRowExpanded,
   threadsOnLine,
+  threadsOnOldLine,
   useDiscussionThreads,
   type AnchoredThread,
   type DiscussionThreadSlot,
@@ -78,6 +80,14 @@ import { ReviewHeader } from "../review-detail/index.js";
 
 const MAX_DIFF_PAGES = 1000;
 const MAX_DIFF_ROWS = 100_000;
+
+/**
+ * Stated above the files while the forge says it capped the changed file list
+ * (a GitLab "1000+" review, or a GitHub pull request past its file limit). The
+ * header's Open on forge is where the reader sees every file.
+ */
+export const CHANGES_OVERFLOW_NOTICE =
+  "The forge returned only part of the changed files, so this list is incomplete. Use Open on forge to see every file.";
 
 /**
  * One in-diff composer is open at a time. It is bound to the anchor it was
@@ -191,6 +201,20 @@ function DiffView({
   const [jumpError, setJumpError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [reload, setReload] = useState(0);
+  // The review detail carries the forge's truncation flag. It is read beside
+  // the diff, and a failed or older read simply shows no banner: the flag is
+  // optional on the wire and absent means a complete list.
+  const beginDetail = useCallback(
+    () => bridge.getReview(route.item.handle),
+    [bridge, route.item.handle],
+  );
+  const detail = useRetainedRead(
+    queries,
+    `diff-detail:${route.item.handle}`,
+    beginDetail,
+    [route.item.handle, reload],
+  );
+  const changesOverflow = detail.value?.detail.changes_overflow === true;
   useEffect(() => {
     let current = true;
     setLoading(true);
@@ -295,6 +319,9 @@ function DiffView({
         </Notice>
       )}
       {jumpError && <Notice kind="warning">{jumpError}</Notice>}
+      {loaded && changesOverflow && (
+        <Notice kind="warning">{CHANGES_OVERFLOW_NOTICE}</Notice>
+      )}
       {loaded && (
         <DiffWorkspace
           bridge={bridge}
@@ -1250,7 +1277,7 @@ function threadsOnUnifiedRow(
 ): readonly AnchoredThread[] {
   if (!file) return EMPTY_THREADS;
   const onNew = threadsOnLine(threads, file.new_path, "new", row.new_line);
-  const onOld = threadsOnLine(threads, file.old_path, "old", row.old_line);
+  const onOld = threadsOnOldLine(threads, file, row.old_line);
   if (onOld.length === 0) return onNew;
   if (onNew.length === 0) return onOld;
   return [...onNew, ...onOld];
@@ -1269,7 +1296,7 @@ function threadsOnSplitRow(
       : EMPTY_THREADS;
   const onOld =
     row.old?.anchor_side === "old"
-      ? threadsOnLine(threads, file.old_path, "old", row.old.old_line)
+      ? threadsOnOldLine(threads, file, row.old.old_line)
       : EMPTY_THREADS;
   if (onOld.length === 0) return onNew;
   if (onNew.length === 0) return onOld;
@@ -2190,13 +2217,17 @@ export function resolveDiscussionTarget(
   target: DiscussionDiffTarget,
 ): InlineAnchorSelection | null {
   if (!Number.isInteger(target.line) || target.line <= 0) return null;
-  const file = loaded.rows.find(
-    (row): row is DiffFileRow =>
-      row.kind === "file" &&
-      (target.side === "new"
-        ? row.new_path === target.path
-        : row.old_path === target.path),
+  const files = loaded.rows.filter(
+    (row): row is DiffFileRow => row.kind === "file",
   );
+  // Both forges store a comment's new path, even on the old side of a renamed
+  // file, so an old-side target also matches the file it was renamed to. The
+  // file whose old path matches still wins, which is what the old side means.
+  const file =
+    target.side === "new"
+      ? files.find((row) => row.new_path === target.path)
+      : (files.find((row) => row.old_path === target.path) ??
+        files.find((row) => row.new_path === target.path));
   if (
     !file ||
     file.is_binary ||

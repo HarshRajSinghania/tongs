@@ -68,23 +68,23 @@ INSTALL_PROVIDES: dict[str, frozenset[str]] = {
     "--disable-pip-version-check --require-hashes --only-binary=:all: "
     "-r requirements/release.lock": (CORE_MODULES - frozenset({"tongs"}))
     | frozenset({"jsonschema"}),
-    # The PyPI build job installs the same hash-locked closure, and no tongs.
-    "python -I -m pip install --isolated --disable-pip-version-check "
-    "--require-hashes --only-binary=:all: -r requirements/release.lock": (
-        CORE_MODULES - frozenset({"tongs"})
-    )
-    | frozenset({"jsonschema"}),
     '"$CANDIDATE_PYTHON" -I -m pip install --isolated '
     "--disable-pip-version-check --no-deps --no-build-isolation -e .": frozenset(
         {"tongs"}
     ),
     '"$CANDIDATE_PYTHON" -I -m pip install --isolated '
-    "--disable-pip-version-check -e . "
-    '"sigstore==${SIGSTORE_VERSION}"': CORE_MODULES,
-    '"$CANDIDATE_PYTHON" -I -m pip install --isolated '
     '--disable-pip-version-check -e ".[dev]" '
     '"sigstore==${SIGSTORE_VERSION}"': CORE_MODULES | DEV_MODULES,
-    "python -m pip install build": frozenset(),
+    # The PyPI build job, the tag-path RPM job and the installed-core fixture
+    # wheel install the same lock into the runner's Python; only the RPM job
+    # then installs tongs, alone.
+    "python -I -m pip install --isolated --disable-pip-version-check "
+    "--require-hashes --only-binary=:all: -r requirements/release.lock": (
+        CORE_MODULES - frozenset({"tongs"})
+    )
+    | frozenset({"jsonschema"}),
+    "python -I -m pip install --isolated --disable-pip-version-check "
+    "--no-deps --no-build-isolation -e .": frozenset({"tongs"}),
     "python -m pip install ruff": frozenset(),
     "python -m pip install ./examples/desktop-plugin": frozenset(),
 }
@@ -143,7 +143,7 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
             "desktop-production.yml:rpm-lifecycle",
             "desktop-production.yml:native-payload",
         ),
-        note="installed-core installs only build, so this must stay stdlib only",
+        note="installed-core installs no tongs, so this must stay stdlib only",
     ),
     EntryPoint(
         program="tests/integration/desktop/installed_core_composition.py",

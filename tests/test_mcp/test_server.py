@@ -292,3 +292,56 @@ async def test_mcp_registry_bounds_requests_per_host(monkeypatch) -> None:
     assert [len(result) for result in results] == [50, 50]
     assert sum(path.endswith("/check-runs") for path in paths) == 100
     assert peak == 4
+
+
+def _merged_pull(number: int) -> dict[str, object]:
+    return {
+        **_pull(number),
+        "state": "closed",
+        "merged_at": "2026-09-03T00:00:00Z",
+    }
+
+
+def _closed_pull(number: int) -> dict[str, object]:
+    return {**_pull(number), "state": "closed", "merged_at": None}
+
+
+@pytest.mark.asyncio
+async def test_github_merged_filter_lists_merged_pulls(monkeypatch) -> None:
+    """GitHub has no merged filter, so state=merged reads closed and keeps merged."""
+    pull_params: list[dict[str, str]] = []
+
+    async def handle_async_request(
+        _transport: httpx.AsyncHTTPTransport, request: httpx.Request
+    ) -> httpx.Response:
+        if request.url.path == "/repos/acme/repo/pulls":
+            pull_params.append(dict(request.url.params))
+            return httpx.Response(200, json=[_merged_pull(1), _closed_pull(2)])
+        return httpx.Response(200, json={"check_runs": [], "total_count": 0})
+
+    monkeypatch.setattr(
+        httpx.AsyncHTTPTransport, "handle_async_request", handle_async_request
+    )
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+
+    with patch("tongs.forges.registry.resolve_token", return_value="tok"):
+        merged = await server.list_mrs("github.com/acme/repo", state="merged")
+        closed = await server.list_mrs("github.com/acme/repo", state="closed")
+    await server._registry.close_all()
+
+    assert [mr["number"] for mr in merged] == [1]
+    assert [mr["number"] for mr in closed] == [1, 2]
+    assert [params["state"] for params in pull_params] == ["closed", "closed"]
+
+
+@pytest.mark.asyncio
+async def test_gitlab_merged_filter_is_passed_through(configured_registry) -> None:
+    with (
+        patch("tongs.forges.registry.resolve_token", return_value="tok"),
+        patch("tongs.forges.gitlab.GitLabClient.list_mrs", return_value=[]) as list_mrs,
+    ):
+        await server.list_mrs("git.lab.corp/group/app", state="merged")
+    assert list_mrs.await_args.kwargs["state"] == "merged"
+    await configured_registry.close_all()

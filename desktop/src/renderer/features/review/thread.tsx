@@ -144,7 +144,14 @@ export function threadSummaryText(discussion: DiscussionDto): string {
   const replies = discussion.root_comment.replies;
   const count = replies.length === 1 ? "1 reply" : `${replies.length} replies`;
   const last = replies.at(-1) ?? discussion.root_comment;
-  return `${count}, ${discussion.is_resolved ? "resolved" : "unresolved"}, last by @${last.author.username}`;
+  // A thread the forge cannot resolve has no state to state, matching the
+  // file header, which does not count it as unresolved.
+  const state = discussion.is_resolved
+    ? "resolved, "
+    : discussion.resolvable
+      ? "unresolved, "
+      : "";
+  return `${count}, ${state}last by @${last.author.username}`;
 }
 
 /** How the file header states its thread totals. */
@@ -258,6 +265,33 @@ export function threadFileCounts(
   });
 }
 
+/**
+ * Whether a thread is still open. A thread the forge cannot resolve, such as a
+ * GitLab individual note, has no open state, so the counts leave it out.
+ */
+export function threadIsUnresolved(discussion: DiscussionDto): boolean {
+  return discussion.resolvable && !discussion.is_resolved;
+}
+
+/**
+ * The old-side threads of one line of a file. Both forges store a comment's
+ * new path even when it sits on the old side of a renamed file, so the old
+ * side reads the threads stored under either path, the same two paths
+ * `threadFileCounts` sums for the header.
+ */
+export function threadsOnOldLine(
+  slot: DiscussionThreadSlot,
+  file: { readonly old_path: string; readonly new_path: string },
+  line: number | null,
+): readonly AnchoredThread[] {
+  const byOld = threadsOnLine(slot, file.old_path, "old", line);
+  if (file.old_path === file.new_path) return byOld;
+  const byNew = threadsOnLine(slot, file.new_path, "old", line);
+  if (byNew.length === 0) return byOld;
+  if (byOld.length === 0) return byNew;
+  return [...byOld, ...byNew];
+}
+
 /** The threads anchored to one line of one side, in stored order. */
 export function threadsOnLine(
   slot: DiscussionThreadSlot,
@@ -352,7 +386,7 @@ export function useDiscussionThreads(
       const counts = byPath.get(target.path) ?? NO_COUNTS;
       byPath.set(target.path, {
         threads: counts.threads + 1,
-        unresolved: counts.unresolved + (discussion.is_resolved ? 0 : 1),
+        unresolved: counts.unresolved + (threadIsUnresolved(discussion) ? 1 : 0),
       });
     }
     // The place inside a group is only known once the group is complete, so it

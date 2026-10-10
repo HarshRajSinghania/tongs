@@ -245,13 +245,25 @@ jobs:
           "python${PYTHON_VERSION}" -I -m venv "$RUNNER_TEMP/tongs-candidate-venv"
           printf 'CANDIDATE_PYTHON=%s/tongs-candidate-venv/bin/python\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
           printf 'PYTHONNOUSERSITE=1\n' >> "$GITHUB_ENV"
-      - name: Install source-built transfer validation dependencies
+      - name: Install the hash-locked transfer validation dependencies
+        # The signing job attests what this job freezes, so nothing installed
+        # here resolves fresh from the index either: the lock supplies the
+        # core, Sigstore and the build backend, by hash and as wheels only.
         run: >-
           "$CANDIDATE_PYTHON" -I -m pip install
           --isolated
           --disable-pip-version-check
+          --require-hashes
+          --only-binary=:all:
+          -r requirements/release.lock
+      - name: Install the source transfer validator without resolving anything
+        run: >-
+          "$CANDIDATE_PYTHON" -I -m pip install
+          --isolated
+          --disable-pip-version-check
+          --no-deps
+          --no-build-isolation
           -e .
-          "sigstore==${SIGSTORE_VERSION}"
       - name: Require the isolated source-bound transfer environment
         run: |
           "$CANDIDATE_PYTHON" -I - "$RUNNER_TEMP/tongs-candidate-venv" "$GITHUB_WORKSPACE" <<'PY'
@@ -582,10 +594,26 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - name: Install the source-built payload contract dependencies
+      - name: Install the hash-locked payload contract dependencies
         # rpm_payload_contract.py loads packaging/rpm/desktop/package_contract.py,
         # which needs packaging.version.  Nothing else in this job installs it.
-        run: python -m pip install -e .
+        # The RPMs built here are published as is, so the lock supplies it and
+        # the build backend by hash, and nothing resolves fresh from the index.
+        run: >-
+          python -I -m pip install
+          --isolated
+          --disable-pip-version-check
+          --require-hashes
+          --only-binary=:all:
+          -r requirements/release.lock
+      - name: Install the source payload contract without resolving anything
+        run: >-
+          python -I -m pip install
+          --isolated
+          --disable-pip-version-check
+          --no-deps
+          --no-build-isolation
+          -e .
       - name: Record the hosted runner, Podman and gh versions
         run: |
           uname -a
