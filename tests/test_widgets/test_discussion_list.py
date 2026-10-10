@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -301,6 +302,13 @@ class TestApplyFilter:
         assert len(result) == 2
         assert all(not d.is_resolved for d in result)
 
+    def test_filter_unresolved_leaves_out_threads_that_cannot_be_resolved(self):
+        panel = self._make_panel("unresolved")
+        note = replace(_make_disc(id="note", is_inline=False), resolvable=False)
+        discs = [_make_disc(id="d1"), note, _make_disc(id="d2", is_resolved=True)]
+        result = panel._apply_filter(discs)
+        assert [d.id for d in result] == ["d1"]
+
     def test_filter_resolved(self):
         panel = self._make_panel("resolved")
         discs = [
@@ -453,3 +461,29 @@ async def test_reply_posts_thread_location_and_root_author() -> None:
         ("d-old", "src/gone.py", 7, "alice"),
         ("d-general", None, None, "testuser"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_next_unresolved_skips_threads_that_cannot_be_resolved() -> None:
+    app = DiscussionPanelApp()
+    # A GitLab individual note sorts with the open threads but is not one.
+    note = replace(
+        _make_disc(id="d-note", file_path="a.py", new_line=1), resolvable=False
+    )
+    discs = [
+        note,
+        _make_disc(id="d-open", file_path="b.py", new_line=1),
+        _make_disc(id="d-done", file_path="a.py", new_line=2, is_resolved=True),
+    ]
+    async with app.run_test() as pilot:
+        panel = app.query_one(DiscussionPanel)
+        panel.set_discussions(discs)
+        await pilot.pause()
+        visited = []
+        for _ in range(3):
+            panel.action_next_unresolved()
+            await pilot.pause()
+            focused = panel._get_focused_discussion()
+            visited.append(focused.id if focused else None)
+
+    assert visited == ["d-open", "d-open", "d-open"]

@@ -15,7 +15,7 @@ from textual.widgets import DataTable, Footer, Header, TabbedContent, TabPane
 
 from tongs.scanner.repo import Repo
 from tongs.services.errors import ServiceError
-from tongs.services.models import ReviewScope
+from tongs.services.models import HostFailure, ReviewScope
 from tongs.widgets.mr_table import MRTable
 
 
@@ -213,15 +213,32 @@ class InboxScreen(Screen):
             for item in page.items:
                 table.add_mr_row(item.summary, self.app.config.ascii_mode)
         if page.failures:
-            details = "; ".join(
-                f"{failure.hostname}: {failure.message}" for failure in page.failures
-            )
+            # A host or repository that still contributed rows returned a
+            # partial page rather than being skipped, so it is reported apart.
+            shown = {item.ref.repository for item in page.items}
+            shown_hosts = {repository.hostname for repository in shown}
+            partial: list[HostFailure] = []
+            skipped: list[HostFailure] = []
+            for failure in page.failures:
+                contributed = (
+                    failure.repository in shown
+                    if failure.repository is not None
+                    else failure.hostname in shown_hosts
+                )
+                (partial if contributed else skipped).append(failure)
             # Failure messages can carry forge text, so show them literally.
-            self.notify(
-                f"{label} skipped: {details}",
-                severity="warning",
-                markup=False,
-            )
+            if partial:
+                self.notify(
+                    f"{label}: {_failure_details(partial)}",
+                    severity="warning",
+                    markup=False,
+                )
+            if skipped:
+                self.notify(
+                    f"{label} skipped: {_failure_details(skipped)}",
+                    severity="warning",
+                    markup=False,
+                )
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         self.action_select_mr()
@@ -235,3 +252,8 @@ class InboxScreen(Screen):
         }
         table_id = tab_map.get(tabbed.active, "#reviews-table")
         return self.query_one(table_id, MRTable)
+
+
+def _failure_details(failures: list[HostFailure]) -> str:
+    """Join failures as host and message pairs for one notification."""
+    return "; ".join(f"{failure.hostname}: {failure.message}" for failure in failures)
