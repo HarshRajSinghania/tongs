@@ -1,13 +1,13 @@
 ---
 title: Known issues
-description: "Defects known in tongs 1.0.3, what you will see, and the release each fix is planned for."
+description: "Defects known in tongs 1.0.4, what you will see, and the release each fix is planned for."
 ---
 
-These defects are known in tongs 1.0.3.
+These defects are known in tongs 1.0.4.
 Each entry links to the issue that tracks the fix and names the milestone it is
 planned for. Milestones can move; the issue always has the current plan.
-Defects fixed in 1.0.3 are listed in the
-[1.0.3 release notes](/releases/v1.0.3/).
+Defects fixed in 1.0.4 are listed in the
+[1.0.4 release notes](/releases/v1.0.4/).
 
 [Troubleshooting](/desktop/troubleshooting/) covers desktop recovery states and
 launch problems that have a workaround today.
@@ -25,7 +25,6 @@ launch problems that have a workaround today.
 
 | Issue | Milestone | What you will see |
 |---|---|---|
-| [#300](https://github.com/andre-motta/tongs/issues/300) | v1.0.4 | A review draft can stay stuck after a failed or interrupted submission. |
 | [#251](https://github.com/andre-motta/tongs/issues/251) | v1.1.0 | Stale per-attempt review submission lock files are never deleted. |
 
 ## Terminal app
