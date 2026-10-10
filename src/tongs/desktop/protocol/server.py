@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import math
 import os
 import secrets
 import sys
@@ -12,6 +13,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Protocol, cast
@@ -109,9 +111,11 @@ from tongs.services import (
     ReviewScope,
     ReviewSnapshot,
     ServiceError,
+    ServiceErrorCode,
     ServiceEvent,
 )
 from tongs.services.models import review_cursor_page
+from tongs.services.session import RATE_LIMIT_UNKNOWN_WAIT
 from tongs.state.drafts.models import RecoveryWarning
 
 _DIFF_SNAPSHOT = "diff"
@@ -165,6 +169,8 @@ _MAX_PROTOCOL_ERRORS = 8
 # Head commits remembered for ``reviews.ci_status``, one per listed review. No
 # more reviews than review handles can be listed, so this only bounds the map.
 _MAX_REVIEW_HEADS = 8192
+# The longest rate-limit wait ``reviews.ci_status`` names, in seconds.
+_MAX_RATE_LIMIT_WAIT_SECONDS = 86_400
 _DEFAULT_SHUTDOWN_TIMEOUT = 5.0
 
 
@@ -829,6 +835,12 @@ class DesktopSidecarServer:
         The lookup uses the head commit the review's last list read named, so
         it costs the forge's CI requests only. An optional boolean ``fresh``
         reads past the service's CI cache, as after an explicit refresh.
+
+        ``retry_after_seconds`` is null unless the review's forge host is rate
+        limited. A lookup on a host that already answered with a rate limit
+        sends no request, and a lookup that meets one is not an error: both
+        answer ``unknown`` with the seconds until the limit resets, so the
+        renderer can tell a rate limit from a failure and wait it out.
         """
         _require_params(
             params,
@@ -837,10 +849,35 @@ class DesktopSidecarServer:
         )
         review = self._handles.resolve(params["review"], HandleKind.REVIEW, ReviewRef)
         fresh = _optional_bool(params, "fresh", False)
-        status = await self._session.get_review_ci_status(
-            review, head_sha=self._review_heads.get(review, ""), fresh=fresh
+        hostname = review.repository.hostname
+        wait = self._rate_limit_wait(hostname)
+        if wait is not None:
+            return {"ci_status": "unknown", "retry_after_seconds": wait}
+        try:
+            status = await self._session.get_review_ci_status(
+                review, head_sha=self._review_heads.get(review, ""), fresh=fresh
+            )
+        except ServiceError as error:
+            if error.code is not ServiceErrorCode.RATE_LIMITED:
+                raise
+            wait = self._rate_limit_wait(hostname)
+            if wait is None:
+                wait = _bounded_wait(
+                    dict(error.details).get("retry_after_seconds"),
+                    RATE_LIMIT_UNKNOWN_WAIT.total_seconds(),
+                )
+            return {"ci_status": "unknown", "retry_after_seconds": wait}
+        return {"ci_status": status.value, "retry_after_seconds": None}
+
+    def _rate_limit_wait(self, hostname: str) -> int | None:
+        """Seconds until a rate-limited host takes reads again, or None."""
+        limit = self._session.host_rate_limit(hostname)
+        if limit is None:
+            return None
+        return _bounded_wait(
+            (limit.until - datetime.now(UTC)).total_seconds(),
+            RATE_LIMIT_UNKNOWN_WAIT.total_seconds(),
         )
-        return {"ci_status": status.value}
 
     async def _reviews_get(
         self, params: JsonObject, _context: RequestContext
@@ -1917,6 +1954,23 @@ def _plugin_record_wire(
         "assets_available": assets_available,
     }
     return result
+
+
+def _bounded_wait(value: object, default: float) -> int:
+    """Whole seconds of a rate-limit wait, from 1 up to a day.
+
+    ``value`` is a number of seconds or the text of one, as a service error
+    detail carries it; anything else takes ``default``.
+    """
+    seconds = default
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        seconds = float(value)
+    elif isinstance(value, str):
+        with suppress(ValueError):
+            seconds = float(value)
+    if not math.isfinite(seconds):
+        seconds = default
+    return min(_MAX_RATE_LIMIT_WAIT_SECONDS, max(1, math.ceil(seconds)))
 
 
 def _service_protocol_error(error: ServiceError) -> ProtocolError:

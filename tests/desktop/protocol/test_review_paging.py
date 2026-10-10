@@ -46,6 +46,7 @@ from tongs.plugins.desktop import (
 from tongs.plugins.desktop_registry import DesktopPluginRegistry
 from tongs.scanner.repo import ForgeType
 from tongs.services import ApplicationSession
+from tongs.services import session as session_module
 from tongs.state.drafts import DraftStore
 
 _HOST = ForgeHost("github.com", ForgeType.GITHUB, "https://api.github.com")
@@ -99,6 +100,8 @@ class _Forge:
         self.conclusion = "success"
         self.rate_limited: dict[str, dict[str, str]] = {}
         self.rate_limited_requests: list[str] = []
+        # Paths that answer with this server error status.
+        self.failing: dict[str, int] = {}
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -106,6 +109,8 @@ class _Forge:
             # Without GraphQL (as on some GitHub Enterprise hosts) the client
             # reads each page's CI over REST, which these tests count.
             return httpx.Response(404, json={"message": "Not Found"})
+        if path in self.failing:
+            return httpx.Response(self.failing[path], json={"message": "Boom"})
         headers = self.rate_limited.get(path)
         if headers is not None:
             self.rate_limited_requests.append(path)
@@ -680,7 +685,7 @@ async def test_ci_status_reads_one_review_at_its_listed_head(
         await wire.call("reviews.ci_status", {"review": items[1]["handle"]})
     )
 
-    assert result == {"ci_status": "success"}
+    assert result == {"ci_status": "success", "retry_after_seconds": None}
     # The head commit comes from the list read: no pull request read, and
     # one check-run and one commit-status request for that commit only.
     assert forge.detail_requests == []
@@ -694,24 +699,24 @@ async def test_ci_status_is_cached_until_a_fresh_lookup(tmp_path: Path) -> None:
         items = await _listed(wire, handles["acme/small"])
         review = items[0]["handle"]
         first = _result(await wire.call("reviews.ci_status", {"review": review}))
-        assert first == {"ci_status": "success"}
+        assert first == {"ci_status": "success", "retry_after_seconds": None}
         assert len(forge.ci_requests) == 1
 
         # The run fails meanwhile; a plain lookup still serves the cached one.
         forge.conclusion = "failure"
         cached = _result(await wire.call("reviews.ci_status", {"review": review}))
-        assert cached == {"ci_status": "success"}
+        assert cached == {"ci_status": "success", "retry_after_seconds": None}
         assert len(forge.ci_requests) == 1
 
         fresh = _result(
             await wire.call("reviews.ci_status", {"review": review, "fresh": True})
         )
-        assert fresh == {"ci_status": "failed"}
+        assert fresh == {"ci_status": "failed", "retry_after_seconds": None}
         assert len(forge.ci_requests) == 2
         after = _result(
             await wire.call("reviews.ci_status", {"review": review, "fresh": False})
         )
-        assert after == {"ci_status": "failed"}
+        assert after == {"ci_status": "failed", "retry_after_seconds": None}
         assert len(forge.ci_requests) == 2
 
 
@@ -728,7 +733,7 @@ async def test_ci_status_follows_the_head_of_the_latest_list_read(
 
         result = _result(await wire.call("reviews.ci_status", {"review": review}))
 
-        assert result == {"ci_status": "success"}
+        assert result == {"ci_status": "success", "retry_after_seconds": None}
         assert forge.ci_requests == ["/repos/acme/small/commits/pushed/check-runs"]
 
 
@@ -749,7 +754,7 @@ async def test_ci_status_without_a_remembered_head_reads_the_review_first(
         await wire.call("reviews.ci_status", {"review": items[2]["handle"]})
     )
 
-    assert oldest == newest == {"ci_status": "success"}
+    assert oldest == newest == {"ci_status": "success", "retry_after_seconds": None}
     assert forge.detail_requests == ["/repos/acme/small/pulls/9000"]
     assert forge.ci_requests == [
         "/repos/acme/small/commits/head-small-9000/check-runs",
@@ -794,3 +799,95 @@ async def test_ci_status_is_an_advertised_read(
     assert "reviews.ci_status" in server_module.SUPPORTED_METHODS
     operation = wire.server._operations["reviews.ci_status"]
     assert operation.mutation is False
+
+
+@pytest.mark.asyncio
+async def test_ci_status_answers_a_rate_limit_with_its_wait(
+    wired: tuple[_Wire, _Forge, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rate limit is a result the renderer can wait out, not a failure."""
+
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(forge_http, "_sleep", fake_sleep)
+    wire, forge, handles = wired
+    items = await _listed(wire, handles["acme/small"])
+    path = "/repos/acme/small/commits/head-small-9000/check-runs"
+    forge.rate_limited[path] = {"x-ratelimit-remaining": "0", "Retry-After": "120"}
+
+    limited = _result(
+        await wire.call("reviews.ci_status", {"review": items[0]["handle"]})
+    )
+
+    assert limited["ci_status"] == "unknown"
+    wait = cast(int, limited["retry_after_seconds"])
+    assert isinstance(wait, int)
+    assert 1 <= wait <= 120
+    assert forge.rate_limited_requests == [path]
+
+    # Another review of the same host waits too, without a forge request.
+    requests = (list(forge.ci_requests), list(forge.status_requests))
+    other = _result(
+        await wire.call("reviews.ci_status", {"review": items[1]["handle"]})
+    )
+    assert other["ci_status"] == "unknown"
+    assert 1 <= cast(int, other["retry_after_seconds"]) <= 120
+    assert (forge.ci_requests, forge.status_requests) == requests
+    assert forge.rate_limited_requests == [path]
+
+    # Once the limit has reset, lookups read the forge again.
+    later = datetime.now(UTC) + timedelta(seconds=200)
+    monkeypatch.setattr(session_module, "_utcnow", lambda: later)
+    resumed = _result(
+        await wire.call("reviews.ci_status", {"review": items[1]["handle"]})
+    )
+    assert resumed == {"ci_status": "success", "retry_after_seconds": None}
+    assert forge.ci_requests[-1] == (
+        "/repos/acme/small/commits/head-small-9001/check-runs"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ci_status_failure_is_an_error_not_a_status(
+    wired: tuple[_Wire, _Forge, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed lookup stays a failure, so it never reads as unknown CI."""
+
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(forge_http, "_sleep", fake_sleep)
+    wire, forge, handles = wired
+    items = await _listed(wire, handles["acme/small"])
+    forge.failing["/repos/acme/small/commits/head-small-9000/check-runs"] = 500
+
+    frame = await wire.call("reviews.ci_status", {"review": items[0]["handle"]})
+
+    error = cast(dict[str, object], frame["error"])
+    assert error["code"] == "service_error"
+    assert "result" not in frame
+    assert "Boom" not in json.dumps(frame)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (120, 120),
+        ("45", 45),
+        (0.2, 1),
+        (-5, 1),
+        (10**9, 86_400),
+        ("soon", 180),
+        (None, 180),
+        (True, 180),
+        (float("nan"), 180),
+        (float("inf"), 180),
+    ],
+)
+def test_rate_limit_waits_are_whole_bounded_seconds(
+    value: object, expected: int
+) -> None:
+    assert server_module._bounded_wait(value, 180.0) == expected

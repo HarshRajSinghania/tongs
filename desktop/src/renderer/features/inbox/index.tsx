@@ -2,6 +2,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type KeyboardEvent,
@@ -22,7 +23,7 @@ import {
 } from "../../core/presentation.js";
 import { StaleQueryError, type CoordinatedRead } from "../../core/query.js";
 import { useRetainedRead } from "../../core/use-read.js";
-import { CILookups } from "./ci.js";
+import { CI_UNAVAILABLE, CILookups, type CIShown } from "./ci.js";
 import {
   appendPage,
   feedFailures,
@@ -36,7 +37,13 @@ import {
   type RepositoryFeed,
 } from "./paging.js";
 
-export { CI_LOOKUP_CONCURRENCY, CILookups } from "./ci.js";
+export {
+  CI_LOOKUP_CONCURRENCY,
+  CI_RETRY_DELAY_MS,
+  CI_UNAVAILABLE,
+  CILookups,
+  type CIShown,
+} from "./ci.js";
 export {
   mergedReviewItems,
   nextRepositoryToLoad,
@@ -162,6 +169,24 @@ const CI_PRIORITY: Readonly<Record<string, number>> = Object.freeze({
 
 /** The CI cell of a row whose lookup has not finished yet. */
 export const CI_LOADING_TEXT = "…";
+
+/** The CI cell of a row whose lookup failed or waits for a rate limit. */
+export const CI_UNAVAILABLE_TEXT = "n/a";
+
+/**
+ * Rows within about one screen above or below the list's scroll area count
+ * as near the viewport, and only those are looked up.
+ */
+export const CI_NEAR_MARGIN = "100% 0px 100% 0px";
+
+/** Without an IntersectionObserver, rows near the top that count as near. */
+export const CI_UNOBSERVED_ROWS = 30;
+
+/**
+ * In CI order, how long the arriving statuses must stay quiet (and no
+ * lookup of a row near the viewport be waiting) before the list re-sorts.
+ */
+export const CI_SORT_SETTLE_MS = 250;
 
 export function createInboxFeature(): FeatureContribution {
   return {
@@ -437,7 +462,7 @@ function InboxResults({
     liveRead.current = live;
     swapFresh.current = fresh;
     if (live) {
-      ci.reset(fresh);
+      ci.reset();
       setFeeds(
         Object.freeze(sources.map((source) => pendingFeed(source.handle))),
       );
@@ -452,6 +477,9 @@ function InboxResults({
       live
         ? (index, feed) => {
             if (generation !== readGeneration.current) return;
+            // Rows of an explicit refresh read past the CI cache; rows that
+            // load more adds later do not.
+            if (fresh) ci.markFresh(feed.items.map((item) => item.handle));
             setFeeds((current) =>
               current && current[index]?.repository === feed.repository
                 ? Object.freeze(
@@ -501,8 +529,15 @@ function InboxResults({
     // A live read already holds these pages and any loaded after them.
     if (!liveRead.current) {
       // The refreshed rows replace the shown ones, so their CI is looked up
-      // again and lookups still running for the old rows land nowhere.
-      ci.reset(swapFresh.current);
+      // again and lookups still running for the old rows land nowhere. Only
+      // the rows this refresh read look CI up past the cache.
+      ci.reset();
+      if (swapFresh.current)
+        ci.markFresh(
+          state.value.feeds.flatMap((feed) =>
+            feed.items.map((item) => item.handle),
+          ),
+        );
       setFeeds(state.value.feeds);
     }
     liveRead.current = false;
@@ -875,14 +910,115 @@ function ReviewList({
   readonly loadMore: (repository: string) => void;
   readonly ci: CILookups;
 }): ReactNode {
-  const presentation = inboxFeedPresentation(feeds, sort, ci);
+  // In CI order the list sorts by the statuses known when lookups last
+  // settled, so rows do not jump on every arriving result.
+  const ciOrder = useRef<ReadonlyMap<string, string> | null>(null);
+  const [, setOrderVersion] = useState(0);
+  if (sort !== "ci") ciOrder.current = null;
+  else if (ciOrder.current === null)
+    ciOrder.current = settledCIOrder(mergedReviewItems(feeds), ci);
+  const order = ciOrder.current;
+  const presentation = inboxFeedPresentation(
+    feeds,
+    sort,
+    order === null ? ci : orderedCI(order),
+  );
   const items = presentation.items;
-  // Only the rows the list shows are looked up, in the order shown. Rows that
-  // update-time order still holds back are looked up once they are shown.
-  useEffect(() => {
-    ci.request(items);
-  });
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
   const listRef = useRef<HTMLDivElement | null>(null);
+  // Rows near the viewport, kept by an IntersectionObserver over the cards.
+  // Only these are looked up, in the order shown; rows that update-time order
+  // still holds back are looked up once they are shown and come near.
+  const nearRows = useRef(new Set<string>());
+  const observed = useRef(new Map<Element, string>());
+  const rowObserver = useRef<IntersectionObserver | null>(null);
+  const syncCI = useCallback(() => {
+    const shown = itemsRef.current;
+    ci.request(
+      rowObserver.current === null
+        ? shown.slice(0, CI_UNOBSERVED_ROWS)
+        : shown.filter((item) => nearRows.current.has(item.handle)),
+    );
+  }, [ci]);
+  useEffect(() => {
+    const Observer = globalThis.IntersectionObserver;
+    const list = listRef.current;
+    if (typeof Observer !== "function" || !list) return;
+    const observer = new Observer(
+      (entries) => {
+        for (const entry of entries) {
+          const handle = observed.current.get(entry.target);
+          if (handle === undefined) continue;
+          if (entry.isIntersecting) nearRows.current.add(handle);
+          else nearRows.current.delete(handle);
+        }
+        syncCI();
+      },
+      { root: scrollRoot(list), rootMargin: CI_NEAR_MARGIN },
+    );
+    rowObserver.current = observer;
+    return () => {
+      observer.disconnect();
+      rowObserver.current = null;
+      observed.current.clear();
+      nearRows.current.clear();
+    };
+  }, [syncCI, presentation.empty]);
+  // After every render, watch the cards that appeared, forget the ones that
+  // went away, and name the rows near the viewport again.
+  useEffect(() => {
+    const observer = rowObserver.current;
+    if (observer !== null) {
+      const cards = [
+        ...(listRef.current?.querySelectorAll<HTMLElement>(
+          "[data-review-handle]",
+        ) ?? []),
+      ];
+      const current = new Set<Element>(cards);
+      for (const [card, handle] of observed.current) {
+        if (current.has(card)) continue;
+        observer.unobserve(card);
+        observed.current.delete(card);
+        nearRows.current.delete(handle);
+      }
+      for (const card of cards) {
+        const handle = card.dataset.reviewHandle;
+        if (handle === undefined || observed.current.has(card)) continue;
+        observed.current.set(card, handle);
+        observer.observe(card);
+      }
+    }
+    syncCI();
+  });
+  // Re-sort once the statuses of the rows near the viewport have settled,
+  // keeping focus on the row that had it.
+  const refocus = useRef<string | null>(null);
+  useEffect(() => {
+    if (sort !== "ci" || ci.waiting > 0) return;
+    const timer = setTimeout(() => {
+      const next = settledCIOrder(itemsRef.current, ci);
+      if (sameOrder(next, ciOrder.current)) return;
+      const active = document.activeElement;
+      refocus.current =
+        active instanceof HTMLElement && listRef.current?.contains(active)
+          ? (active.dataset.reviewHandle ?? null)
+          : null;
+      ciOrder.current = next;
+      setOrderVersion((current) => current + 1);
+    }, CI_SORT_SETTLE_MS);
+    return () => clearTimeout(timer);
+  }, [sort, ci, ci.version, ci.waiting]);
+  useLayoutEffect(() => {
+    const handle = refocus.current;
+    if (handle === null) return;
+    refocus.current = null;
+    const target = [
+      ...(listRef.current?.querySelectorAll<HTMLButtonElement>("button") ?? []),
+    ].find((button) => button.dataset.reviewHandle === handle);
+    if (target && document.activeElement !== target)
+      target.focus({ preventScroll: true });
+  });
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const [nearEnd, setNearEnd] = useState(false);
   const navigateRef = useRef(navigate);
@@ -969,6 +1105,9 @@ function ReviewList({
   };
   return (
     <>
+      {ci.pausedUntil !== null && (
+        <Notice kind="error">{rateLimitText(ci.pausedUntil)}</Notice>
+      )}
       {presentation.partialFailures > 0 && (
         <Notice kind="error">
           {presentation.partialFailures} repository read
@@ -991,6 +1130,7 @@ function ReviewList({
               key={item.handle}
               item={item}
               ci={ci.shown(item)}
+              ciLimited={ci.rateLimited(item)}
               selected={item.handle === selected}
               open={open}
             />
@@ -1033,7 +1173,7 @@ function ReviewList({
 export function inboxFeedPresentation(
   feeds: readonly RepositoryFeed[],
   sort: ReviewSort,
-  ci?: Pick<CILookups, "shown">,
+  ci?: CIOrder,
 ): {
   readonly items: readonly ReviewListItemDto[];
   readonly empty: boolean;
@@ -1055,18 +1195,88 @@ export function inboxFeedPresentation(
   });
 }
 
+/** The CI status a row sorts by, or null while it has none. */
+export type CIOrder = { readonly shown: (item: ReviewListItemDto) => string | null };
+
+/**
+ * The CI statuses lookups have found so far, which the list sorts by until
+ * they settle again. Rows whose status came with the list are left out: they
+ * always sort by their live status, so a refresh that changes one re-sorts it.
+ */
+function settledCIOrder(
+  items: readonly ReviewListItemDto[],
+  ci: CILookups,
+): ReadonlyMap<string, string> {
+  const order = new Map<string, string>();
+  for (const item of items) {
+    if (item.summary.ci_status !== "unknown") continue;
+    const shown = ci.shown(item);
+    if (shown !== null && shown !== CI_UNAVAILABLE) order.set(item.handle, shown);
+  }
+  return order;
+}
+
+function sameOrder(
+  next: ReadonlyMap<string, string>,
+  current: ReadonlyMap<string, string> | null,
+): boolean {
+  if (current === null || current.size !== next.size) return false;
+  for (const [handle, status] of next)
+    if (current.get(handle) !== status) return false;
+  return true;
+}
+
+/**
+ * Sort a row the list knows by its live status, and a row it left unknown by
+ * the status lookups had found when they last settled.
+ */
+function orderedCI(order: ReadonlyMap<string, string>): CIOrder {
+  return {
+    shown: (item) =>
+      item.summary.ci_status !== "unknown"
+        ? item.summary.ci_status
+        : (order.get(item.handle) ?? null),
+  };
+}
+
+/** The nearest scrolling ancestor, which the row observer measures against. */
+function scrollRoot(element: HTMLElement): Element | null {
+  const view = element.ownerDocument.defaultView;
+  if (!view) return null;
+  for (
+    let parent = element.parentElement;
+    parent !== null;
+    parent = parent.parentElement
+  ) {
+    const overflow = view.getComputedStyle(parent).overflowY;
+    if (overflow === "auto" || overflow === "scroll") return parent;
+  }
+  return null;
+}
+
+function rateLimitText(until: number): string {
+  const time = new Date(until).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  return `Forge rate limit reached. CI status lookups resume at ${time}.`;
+}
+
 /**
  * Sort loaded rows. CI order uses the status a lookup found when the list
- * left it unknown; a row still waiting sorts with the unknown ones, so a row
- * moves at most once, when its status arrives.
+ * left it unknown; a row still waiting or unavailable sorts with the unknown
+ * ones.
  */
 export function sortReviewItems(
   items: readonly ReviewListItemDto[],
   sort: ReviewSort,
-  ci?: Pick<CILookups, "shown">,
+  ci?: CIOrder,
 ): readonly ReviewListItemDto[] {
-  const ciOf = (item: ReviewListItemDto): string =>
-    (ci ? ci.shown(item) : item.summary.ci_status) ?? "unknown";
+  const ciOf = (item: ReviewListItemDto): string => {
+    const shown = ci ? ci.shown(item) : item.summary.ci_status;
+    // A row still loading or unavailable sorts with the unknown ones.
+    return shown === null || shown === CI_UNAVAILABLE ? "unknown" : shown;
+  };
   const sorted = [...items];
   sorted.sort((left, right) => {
     const leftSummary = left.summary;
@@ -1115,12 +1325,15 @@ function emptyReviewLabel(
 const ReviewCard = memo(function ReviewCard({
   item,
   ci,
+  ciLimited,
   selected,
   open,
 }: {
   readonly item: ReviewListItemDto;
-  /** The CI status to show, or null while its lookup runs. */
-  readonly ci: string | null;
+  /** The CI status to show, unavailable, or null while its lookup runs. */
+  readonly ci: CIShown;
+  /** Whether an unavailable status waits for a rate limit to reset. */
+  readonly ciLimited: boolean;
   readonly selected: boolean;
   readonly open: (item: ReviewListItemDto) => void;
 }): ReactNode {
@@ -1140,6 +1353,18 @@ const ReviewCard = memo(function ReviewCard({
           title="Loading CI status"
         >
           {CI_LOADING_TEXT}
+        </span>
+      ) : ci === CI_UNAVAILABLE ? (
+        <span
+          className="state state-unavailable"
+          data-ci-unavailable={ciLimited ? "rate_limited" : "failed"}
+          title={
+            ciLimited
+              ? "CI status unavailable until the forge rate limit resets"
+              : "CI status unavailable"
+          }
+        >
+          {CI_UNAVAILABLE_TEXT}
         </span>
       ) : (
         <span className={`state state-${ci}`} data-ci-status={ci}>

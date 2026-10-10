@@ -22,6 +22,8 @@ export const CONTENT_SECURITY_POLICY = [
 
 const MAX_IPC_BYTES = 256 * 1024;
 const MAX_TEXT = 2048;
+// The longest rate-limit wait a CI lookup may name (a day, in seconds).
+const MAX_RATE_LIMIT_WAIT_SECONDS = 86_400;
 
 export function assertAuthorizedSender(event: IpcMainInvokeEvent, owner: WebContents): void {
   if (event.sender !== owner || event.senderFrame !== owner.mainFrame || event.senderFrame.url !== APP_DOCUMENT) {
@@ -107,8 +109,13 @@ function assertResultValue(method: string, value: unknown): asserts value is Jso
     return assertArray(value.failures, (failure) => { assertKeys(failure, ["code", "message", "retryable", "repository"]); text(failure.code); text(failure.message); bool(failure.retryable); nullableText(failure.repository); });
   }
   if (method === "reviews.ci_status") {
-    assertKeys(value, ["ci_status"]);
+    assertKeys(value, ["ci_status", "retry_after_seconds"]);
     if (!(CI_STATUS_VALUES as readonly unknown[]).includes(value.ci_status)) fail("ci_status", "must be a known CI status");
+    if (value.retry_after_seconds === null) return;
+    // A rate-limited lookup knows no status and names a wait of at most a day.
+    integer(value.retry_after_seconds, 1, "retry_after_seconds");
+    if (Number(value.retry_after_seconds) > MAX_RATE_LIMIT_WAIT_SECONDS) fail("retry_after_seconds", `must be at most ${MAX_RATE_LIMIT_WAIT_SECONDS}`);
+    if (value.ci_status !== "unknown") fail("ci_status", "must be unknown while rate limited");
     return;
   }
   if (method === "reviews.get") {
