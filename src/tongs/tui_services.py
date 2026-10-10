@@ -20,7 +20,7 @@ from tongs.forges.models import (
     PipelineJob,
     ReviewDecision,
 )
-from tongs.scanner.repo import Repo
+from tongs.scanner.repo import ForgeType, Repo
 from tongs.services.ci_mutations import (
     CancelJobCommand,
     CancelPipelineCommand,
@@ -69,7 +69,7 @@ from tongs.services.review_submission import (
     SubmissionOutcome,
     SubmissionProgress,
 )
-from tongs.services.session import ApplicationSession
+from tongs.services.session import ApplicationSession, HostRateLimit
 from tongs.state.drafts import (
     DraftContent,
     DraftNotFoundError,
@@ -78,6 +78,9 @@ from tongs.state.drafts import (
 )
 
 _SETTLED_OUTCOMES = frozenset({SubmissionOutcome.SUBMITTED, SubmissionOutcome.EDITABLE})
+
+# The name of each forge in messages, such as a rate-limit notice.
+_FORGE_NAMES = {ForgeType.GITHUB: "GitHub", ForgeType.GITLAB: "GitLab"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +274,18 @@ class TUIServiceAdapter:
             head_sha=summary.head_commit_sha,
             fresh=fresh,
         )
+
+    def rate_limit(self, hostname: str) -> HostRateLimit | None:
+        """Return the rate limit a forge host answered with, while it lasts."""
+        return self.session.host_rate_limit(hostname)
+
+    def forge_name(self, hostname: str) -> str:
+        """Name the forge a host runs, such as GitHub, or the host itself."""
+        for repo in self._repository_refs:
+            remote = repo.primary_remote
+            if remote is not None and remote.hostname == hostname:
+                return _FORGE_NAMES.get(remote.forge_type, hostname)
+        return hostname
 
     async def list_review_pipelines(self, summary: MRSummary) -> tuple[Pipeline, ...]:
         return await self.session.list_review_pipelines(self.review_ref(summary))

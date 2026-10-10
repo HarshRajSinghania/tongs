@@ -74,10 +74,12 @@ _COMMIT_STATUS_STATES = {
 # a token without the commit statuses permission still shows its check runs.
 _UNREADABLE_CI_SOURCE = (ForgePermissionError, NotFoundError)
 
-# Per-pull-request CI reads that arrive within this window share one GraphQL
-# query of up to this many pull requests, across repositories. A full batch
-# is sent at once.
+# Per-pull-request CI reads share one GraphQL query of up to this many pull
+# requests, across repositories. A batch goes out once no read arrived for
+# the window, at most the longest wait after its first read, or at once when
+# it is full.
 _CI_BATCH_WINDOW_SECONDS = 0.015
+_CI_BATCH_MAX_WAIT_SECONDS = 0.06
 _CI_BATCH_SIZE = 50
 # A head commit with more checks than one query reads (the ``contexts(first:
 # 100)`` of the fragment below) is read over REST.
@@ -462,6 +464,7 @@ class GitHubClient(ForgeClient):
         # Per-pull-request CI reads waiting for the next GraphQL batch.
         self._ci_reads: list[_CIRead] = []
         self._ci_timer: asyncio.TimerHandle | None = None
+        self._ci_batch_deadline = 0.0
         self._ci_batches: set[asyncio.Task[None]] = set()
         # False once the host answered that it has no usable GraphQL API.
         self._ci_graphql = True
@@ -1300,9 +1303,10 @@ class GitHubClient(ForgeClient):
     ) -> CIStatus | None:
         """Read one pull request's CI in the next GraphQL batch.
 
-        Reads that arrive within ``_CI_BATCH_WINDOW_SECONDS`` of the first,
-        from any repository, go out as one query of up to ``_CI_BATCH_SIZE``
-        pull requests, which takes one slot of the per-host request limit.
+        Reads that arrive within ``_CI_BATCH_WINDOW_SECONDS`` of each other
+        (and within ``_CI_BATCH_MAX_WAIT_SECONDS`` of the first), from any
+        repository, go out as one query of up to ``_CI_BATCH_SIZE`` pull
+        requests, which takes one slot of the per-host request limit.
         Returns None when this read must use REST instead: GraphQL is
         unavailable on this host, the batch could not answer for this pull
         request, its head moved, or it has more checks than one query reads.
@@ -1315,9 +1319,15 @@ class GitHubClient(ForgeClient):
         self._ci_reads.append(_CIRead(owner, repo, number, head_sha, future))
         if len(self._ci_reads) >= _CI_BATCH_SIZE:
             self._send_ci_batch()
-        elif self._ci_timer is None:
-            self._ci_timer = loop.call_later(
-                _CI_BATCH_WINDOW_SECONDS, self._send_ci_batch
+        else:
+            now = loop.time()
+            if self._ci_timer is None:
+                self._ci_batch_deadline = now + _CI_BATCH_MAX_WAIT_SECONDS
+            else:
+                self._ci_timer.cancel()
+            self._ci_timer = loop.call_at(
+                min(now + _CI_BATCH_WINDOW_SECONDS, self._ci_batch_deadline),
+                self._send_ci_batch,
             )
         # A cancelled caller cancels its future, and the batch skips it.
         return await future

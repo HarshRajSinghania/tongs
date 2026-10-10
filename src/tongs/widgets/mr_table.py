@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import replace as replace_summary
 from typing import ClassVar
 
 from rich.text import Text
+from textual import events
 from textual.binding import Binding
+from textual.message import Message
 from textual.widgets import DataTable
 from textual.widgets.data_table import CellDoesNotExist, RowKey
 
@@ -38,12 +40,24 @@ _CI_PRIORITY = {
 }
 
 
-def sort_mrs(mrs: list[MRSummary], key: str) -> list[MRSummary]:
+def sort_mrs(
+    mrs: list[MRSummary], key: str, pending: Collection[str] = ()
+) -> list[MRSummary]:
+    """Sort merge requests by ``key``.
+
+    ``pending`` holds the row keys whose CI is still being looked up; the CI
+    sort puts them after every row with a known status.
+    """
     if key == "title":
         return sorted(mrs, key=lambda m: m.title.lower())
     if key == "ci":
         return sorted(
-            mrs, key=lambda m: (_CI_PRIORITY.get(m.ci_status, 9), m.title.lower())
+            mrs,
+            key=lambda m: (
+                mr_row_key(m) in pending,
+                _CI_PRIORITY.get(m.ci_status, 9),
+                m.title.lower(),
+            ),
         )
     if key == "author":
         return sorted(mrs, key=lambda m: (m.author.username.lower(), m.title.lower()))
@@ -64,6 +78,17 @@ class MRTable(DataTable):
         Binding("s", "cycle_sort", "Sort", show=True, key_display="s"),
     ]
 
+    class ViewportChanged(Message):
+        """The rows in view may have changed: the table scrolled or resized."""
+
+        def __init__(self, table: MRTable) -> None:
+            super().__init__()
+            self.table = table
+
+        @property
+        def control(self) -> MRTable:
+            return self.table
+
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._mr_data: dict[str, MRSummary] = {}
@@ -72,6 +97,44 @@ class MRTable(DataTable):
         self._ci_pending: set[str] = set()
 
     _show_repo: bool = True
+
+    def on_mount(self) -> None:
+        self.watch(self, "scroll_y", self._scrolled, init=False)
+
+    def on_resize(self, _event: events.Resize) -> None:
+        self.post_message(self.ViewportChanged(self))
+
+    def _scrolled(self, old: float, new: float) -> None:
+        if int(old) != int(new):
+            self.post_message(self.ViewportChanged(self))
+
+    def keys_near_viewport(self) -> list[str] | None:
+        """Return the row keys in view plus one screen above and below.
+
+        Keys come in table order. None means the table is not laid out or not
+        shown, so no row is in view.
+        """
+        height = self.scrollable_content_region.height
+        if self.show_header:
+            height -= self.header_height
+        if height <= 0 or not self.display:
+            return None
+        top = int(self.scroll_y)
+        first = max(0, top - height)
+        rows = self.ordered_rows[first : top + 2 * height]
+        return [row.key.value for row in rows if row.key.value is not None]
+
+    def row_keys(self) -> list[str]:
+        """Return every row key in table order."""
+        return [row.key.value for row in self.ordered_rows if row.key.value]
+
+    def selected_row_key(self) -> str | None:
+        """Return the row key under the cursor, if any."""
+        return self._selected_row_key()
+
+    def is_key_ci_pending(self, key: str) -> bool:
+        """Return whether a row still waits for its CI lookup."""
+        return key in self._ci_pending and key in self._mr_data
 
     def setup_columns(self, show_repo: bool = True) -> None:
         self._show_repo = show_repo
@@ -149,8 +212,11 @@ class MRTable(DataTable):
                 ascii_mode,
                 ci_pending=ci_pending and mr.ci_status is CIStatus.UNKNOWN,
             )
-        self._order_rows(sort_mrs(list(self._mr_data.values()), self._sort_key))
+        self._order_rows(self._sorted())
         self._keep_cursor_on(selected)
+
+    def _sorted(self) -> list[MRSummary]:
+        return sort_mrs(list(self._mr_data.values()), self._sort_key, self._ci_pending)
 
     def get_mr(self, key: str) -> MRSummary | None:
         """Return the merge request a row key shows, if it is listed."""
@@ -190,7 +256,7 @@ class MRTable(DataTable):
         )
         if self._sort_key == "ci":
             selected = self._selected_row_key()
-            self._order_rows(sort_mrs(list(self._mr_data.values()), self._sort_key))
+            self._order_rows(self._sorted())
             self._keep_cursor_on(selected)
         return True
 
@@ -245,8 +311,7 @@ class MRTable(DataTable):
         self.app.notify(f"Sort: {self._sort_key}", timeout=2)
 
     def _rerender_sorted(self) -> None:
-        mrs = list(self._mr_data.values())
-        sorted_mrs = sort_mrs(mrs, self._sort_key)
+        sorted_mrs = self._sorted()
         ascii_mode = getattr(self.app, "config", None) and self.app.config.ascii_mode
         super().clear()
         for mr in sorted_mrs:

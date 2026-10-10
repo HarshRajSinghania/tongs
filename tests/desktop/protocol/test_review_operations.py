@@ -1336,6 +1336,10 @@ async def test_production_ndjson_roundtrip_uses_real_session_and_mock_transport(
     requests: list[tuple[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/graphql":
+            # Without GraphQL (as on some GitHub Enterprise hosts) CI is read
+            # over REST below.
+            return httpx.Response(404, json={"message": "Not Found"})
         requests.append((request.method, request.url.path))
         if request.url.path == "/repos/acme/widgets/pulls":
             page = int(request.url.params.get("page", "1"))
