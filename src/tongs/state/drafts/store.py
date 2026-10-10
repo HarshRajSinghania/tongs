@@ -291,7 +291,8 @@ def _anchor_from_data(data: object) -> InlineAnchor:
         context_fingerprint=cast(str, values["context_fingerprint"]),
         start_line=cast(int | None, values.get("start_line")),
         start_side=DiffSide(cast(str, start_side)) if start_side else None,
-        stale=cast(bool, values.get("stale", False)),
+        # The stored stale flag is ignored: staleness is derived by comparing
+        # revisions, and older tongs versions still read the flag they wrote.
     )
 
 
@@ -722,7 +723,10 @@ class DraftStore:
         *,
         current_revision: ReviewRevision,
     ) -> DraftSnapshot:
-        """Replace editable content using optimistic compare-and-swap."""
+        """Replace editable content using optimistic compare-and-swap.
+
+        The saved snapshot is returned assessed against ``current_revision``.
+        """
         _validate_version(expected_version)
         if not isinstance(content, DraftContent):
             raise TypeError("content must be DraftContent")
@@ -763,7 +767,9 @@ class DraftStore:
                 )
             result = await self._draft_in_transaction(db, draft_id)
             await db.execute("COMMIT")
-            return result
+            # Staleness is derived on read, so the saved snapshot is assessed
+            # against the revision the caller is showing.
+            return result.assessed_against(current_revision)
         except (DraftConflictError, DraftStateError, DraftNotFoundError):
             await self._rollback(db)
             raise
@@ -1530,22 +1536,56 @@ class DraftStore:
             return None
 
     @_serialized
-    async def list_recovery_attempts(self) -> tuple[SubmissionAttempt, ...]:
-        """Return unresolved unknown attempts requiring an explicit user decision."""
+    async def list_recovery_attempts(
+        self, *, include_owned: bool = False
+    ) -> tuple[SubmissionAttempt, ...]:
+        """Return unresolved unknown attempts requiring an explicit user decision.
+
+        With ``include_owned`` the result also holds the active submitting or
+        partial attempts whose ownership lock this process holds, so a caller
+        can offer an owned paused attempt again after it lost its own record
+        of it. Ownership is process-local, so another process's attempts are
+        never included.
+        """
+        owned = (
+            tuple(str(attempt_id) for attempt_id in self._held_attempt_locks)
+            if include_owned
+            else ()
+        )
         db = self._connection()
         try:
             await db.execute("BEGIN")
-            rows = await (
-                await db.execute(
-                    """
+            rows = list(
+                await (
+                    await db.execute(
+                        """
                 SELECT a.id FROM submission_attempts a
                 JOIN drafts d ON d.active_attempt_id = a.id
                 WHERE a.state = ? AND d.state = ?
                 ORDER BY a.updated_at, a.id
                 """,
-                    (DraftState.UNKNOWN.value, DraftState.UNKNOWN.value),
-                )
-            ).fetchall()
+                        (DraftState.UNKNOWN.value, DraftState.UNKNOWN.value),
+                    )
+                ).fetchall()
+            )
+            if owned:
+                placeholders = ", ".join("?" for _ in owned)
+                rows += await (
+                    await db.execute(
+                        f"""
+                    SELECT a.id FROM submission_attempts a
+                    JOIN drafts d ON d.active_attempt_id = a.id
+                    WHERE a.state IN (?, ?) AND d.state = a.state
+                    AND a.id IN ({placeholders})
+                    ORDER BY a.updated_at, a.id
+                    """,
+                        (
+                            DraftState.SUBMITTING.value,
+                            DraftState.PARTIAL.value,
+                            *owned,
+                        ),
+                    )
+                ).fetchall()
             attempts = []
             for row in rows:
                 attempts.append(await self._attempt_in_transaction(db, UUID(row[0])))
@@ -1885,6 +1925,14 @@ class DraftStore:
                 current=current,
                 caller_content=caller_content,
             )
+
+    def holds_attempt(self, attempt_id: UUID) -> bool:
+        """Return whether this process holds the live lock for an attempt.
+
+        Ownership is process-local and is never persisted, so the answer is
+        only meaningful to the process that asks it.
+        """
+        return attempt_id in self._held_attempt_locks
 
     def _require_owned(self, attempt_id: UUID) -> None:
         if attempt_id not in self._held_attempt_locks:

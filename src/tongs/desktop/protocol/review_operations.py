@@ -564,7 +564,9 @@ class ReviewOperations:
         review_handle, review = self._resolve_review(params["review"])
         cursor, max_items = _page(params)
         try:
-            attempts = await self._session.drafts.list_recovery_attempts()
+            attempts = await self._session.drafts.list_recovery_attempts(
+                include_owned=True
+            )
         except DraftStoreError as error:
             raise _draft_service_error(error) from None
         admitted = tuple(item for item in attempts if item.snapshot.review == review)
@@ -1117,8 +1119,6 @@ def _preserve_comment_identity(
             next_anchor = replace(comment.anchor, stale=False)
             if prior_anchor != next_anchor:
                 raise _invalid("A draft comment ID cannot change its inline anchor.")
-            if previous.anchor.stale:
-                comment = replace(comment, anchor=replace(comment.anchor, stale=True))
         elif isinstance(comment, ReplyDraftComment):
             assert isinstance(previous, ReplyDraftComment)
             if previous.thread_id != comment.thread_id:
