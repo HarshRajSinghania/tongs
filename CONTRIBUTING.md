@@ -27,7 +27,7 @@ You need Python 3.12 or newer. From the root of your clone:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e ".[dev,mcp]" ruff
+python -m pip install -e ".[dev,lint,mcp]"
 ```
 
 With `uv`, use `uv venv --python 3.12` and `uv pip install` instead. Tests mock

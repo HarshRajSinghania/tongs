@@ -134,9 +134,7 @@ ARTIFACT_LIFECYCLE = "artifact-lifecycle-v1"
 
 #: Jobs of the ordinary CI workflow the aggregate needs: every lane job plus
 #: ``changes``.  Which of them must succeed is decided by the effective plan.
-REQUIRED_CI_JOBS: frozenset[str] = frozenset(CI_PLAN.LANE_CI_JOBS.values()) | {
-    CI_PLAN.CHANGES_JOB
-}
+REQUIRED_CI_JOBS: frozenset[str] = CI_PLAN.AGGREGATE_JOBS
 
 #: Jobs of the called production workflow, owned by the desktop, archive and
 #: packaging lanes.  The reusable workflow reports one aggregated result to its
@@ -330,55 +328,20 @@ class GateIdentity:
     pull_request_base: str
 
 
-def _decode_results(raw_results: str, label: str) -> dict[str, Any]:
-    if not isinstance(raw_results, str) or not raw_results.strip():
-        raise GateVerificationError(f"{label} results are absent")
-    try:
-        results = json.loads(raw_results)
-    except json.JSONDecodeError as error:
-        raise GateVerificationError(f"{label} results are malformed JSON") from error
-    if not isinstance(results, dict):
-        raise GateVerificationError(f"{label} results must be a JSON object")
-    return results
-
-
 def verify_job_results(
-    raw_results: str,
-    required_jobs: frozenset[str] | Mapping[str, frozenset[str]],
-    label: str,
+    raw_results: str, required_jobs: Mapping[str, frozenset[str]], label: str
 ) -> None:
     """Require the exact configured job set with an allowed result each.
 
-    ``required_jobs`` maps each job to the results it may report.  A plain set
-    requires ``success`` from every job.
+    ``required_jobs`` maps each job to the results it may report.  The policy
+    lives in ``ci_plan.check_job_results``, shared with the aggregate; this
+    keeps the gate's own error type.
     """
 
-    if isinstance(required_jobs, Mapping):
-        allowed = {name: frozenset(results) for name, results in required_jobs.items()}
-    else:
-        allowed = {name: frozenset({"success"}) for name in required_jobs}
-    results = _decode_results(raw_results, label)
-    actual = set(results)
-    if actual != set(allowed):
-        missing = sorted(set(allowed) - actual)
-        unexpected = sorted(actual - set(allowed))
-        raise GateVerificationError(
-            f"{label} job set mismatch: missing={missing}, unexpected={unexpected}"
-        )
-    rejected: list[str] = []
-    for name in sorted(allowed):
-        job = results[name]
-        if not isinstance(job, dict):
-            rejected.append(f"{name}=malformed")
-            continue
-        result = job.get("result")
-        if result not in allowed[name]:
-            expected = "|".join(sorted(allowed[name]))
-            rejected.append(f"{name}={result!r} (expected {expected})")
-    if rejected:
-        raise GateVerificationError(
-            f"{label} jobs did not match the effective plan: " + ", ".join(rejected)
-        )
+    try:
+        CI_PLAN.check_job_results(raw_results, required_jobs, label)
+    except CI_PLAN.JobResultError as error:
+        raise GateVerificationError(str(error)) from error
 
 
 def _required_checks(plan: Any) -> tuple[RequiredCheck, ...]:
@@ -770,13 +733,9 @@ def load_plan(path: Path) -> Any:
     """Read the effective plan file strictly."""
 
     try:
-        text = Path(path).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as error:
-        raise GateVerificationError(f"effective plan is unreadable: {path}") from error
-    try:
-        return CI_PLAN.Plan.from_json(text)
-    except ValueError as error:
-        raise GateVerificationError(f"effective plan is malformed: {error}") from error
+        return CI_PLAN.read_plan_file(path)
+    except CI_PLAN.PlanError as error:
+        raise GateVerificationError(str(error)) from error
 
 
 def _identity(arguments: argparse.Namespace) -> GateIdentity:

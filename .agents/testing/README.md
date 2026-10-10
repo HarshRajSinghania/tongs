@@ -8,7 +8,7 @@ dependencies, and reports remain bound to the revision under test:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e ".[dev,mcp]" ruff
+python -m pip install -e ".[dev,lint,mcp]"
 ```
 
 Use `.venv/bin/python`, `.venv/bin/pytest`, and `.venv/bin/ruff` directly when a
