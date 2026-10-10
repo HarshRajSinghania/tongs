@@ -147,10 +147,13 @@ For example: "Use tongs to list open PRs for `github.com/acme/app`", or
 
 ## The palette command
 
-When the `mcp` extra is installed, the built-in `mcp` terminal plugin adds a
-**Start MCP Server** command to the command palette (++ctrl+p++). It launches
-the server in the background as `python -m tongs.mcp.server`. MCP clients start
-the server themselves, so you do not need this command to connect one.
+When the `mcp` extra is installed, the built-in `mcp` terminal plugin adds an
+**MCP Server Setup** command to the command palette (++ctrl+p++). It shows a
+notice with the command that registers the server with Claude Code, for
+example `claude mcp add tongs -- tongs-mcp`. When `tongs-mcp` on your `PATH`
+is not the one from the running install, the notice names the executable by
+its absolute path. The command does not start a server: MCP clients start
+`tongs-mcp` themselves, as described in [Connect a client](#connect-a-client).
 
 Without the extra, the plugin adds no command. To remove it even when the
 extra is installed, disable the plugin in `config.toml`:

@@ -64,7 +64,7 @@ class TongsCommandProvider(Provider):
             ("Help", "Show the keybindings panel", lambda: app.action_help()),
         ]
         if hasattr(app, "plugin_registry"):
-            commands.extend(app.plugin_registry.get_all_commands())
+            commands.extend(app.plugin_registry.get_all_commands(app))
         return commands
 
     def _inbox_commands(self, screen) -> list[tuple[str, str, object]]:

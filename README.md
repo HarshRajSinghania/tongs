@@ -499,7 +499,7 @@ tongs-mcp
 
 The server communicates over stdio, so you can wire it into any MCP-compatible client, including Codex, Claude Code, and Claude Desktop. It reuses the same forge configuration and auth tokens as the TUI.
 
-When the `mcp` extra is installed, the built-in plugin also adds a **Start MCP Server** command to the command palette, which launches the server as `python -m tongs.mcp.server`. On a default install without the extra, the plugin contributes no command.
+When the `mcp` extra is installed, the built-in plugin also adds an **MCP Server Setup** command to the command palette, which shows the command that registers `tongs-mcp` with your MCP client. It does not start a server. On a default install without the extra, the plugin contributes no command.
 
 ### Connect to Codex
 

@@ -332,13 +332,15 @@ The serialized error codes are `duplicate_id`, `entry_point_mismatch`,
 `undeclared_read`, `undeclared_target`, and `invalid_data`. Messages are safe,
 scoped diagnostics rather than raw third-party exceptions.
 
-Default host deadlines are 10 seconds for `start()`, 30 seconds for `call()`,
-and 2 seconds for shutdown cleanup, including `stop()`. Calls require a unique
+All providers start at the same time and share one 6 second deadline for
+`start()`, so a slow provider cannot delay the desktop app's startup past it.
+A call has 25 seconds, and shutdown cleanup, including `stop()`, has 2 seconds
+shared by all providers. Calls require a unique
 active invocation ID. A timed-out call returns a retryable `call_timeout`
 diagnostic, signals cancellation, and retains its invocation ID until provider
-code actually exits. During shutdown, tongs signals lifecycle and call
-cancellation, cancels pending work, awaits bounded cleanup, and rejects new
-calls. An exception, invalid JSON return, or timeout produces a typed call error
+code actually exits. During shutdown, tongs first signals lifecycle and call
+cancellation and cancels pending work for every provider, then runs every
+`stop()` at once and awaits bounded cleanup, and rejects new calls. An exception, invalid JSON return, or timeout produces a typed call error
 while the provider remains available for later calls. Provider code that
 suppresses task cancellation is detached after the call deadline and remains
 tracked for cleanup. Start, stop, or cleanup failure marks the provider
