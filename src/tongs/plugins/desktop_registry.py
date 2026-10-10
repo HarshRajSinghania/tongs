@@ -134,8 +134,8 @@ class DesktopPluginRegistry:
         plugin_config: Mapping[str, Mapping[str, object]] | None = None,
         *,
         supported_api_major: int = DESKTOP_PLUGIN_API_MAJOR,
-        start_timeout_seconds: float = 10.0,
-        call_timeout_seconds: float = 30.0,
+        start_timeout_seconds: float = 6.0,
+        call_timeout_seconds: float = 25.0,
         cleanup_timeout_seconds: float = 2.0,
         entry_point_source: EntryPointSource | None = None,
         host_version: str | None = None,
@@ -236,56 +236,56 @@ class DesktopPluginRegistry:
     async def start_all(
         self, facade_factory: DesktopFacadeFactory
     ) -> tuple[DesktopPluginRecord, ...]:
-        """Start every compatible provider while isolating individual failures."""
+        """Start every compatible provider concurrently under one time budget.
+
+        Every ``start()`` begins at once and shares the start timeout, so the
+        whole call stays inside that budget however many providers are slow.
+        A provider that fails, cancels itself or overruns the budget is
+        recorded as failed without affecting the others.
+        """
         self._require_discovered()
+        starting: dict[str, asyncio.Task[object]] = {}
         for plugin_id in sorted(self._runtimes):
-            record = self._records[plugin_id]
-            if record.state is not DesktopPluginState.DISCOVERED:
+            if self._records[plugin_id].state is not DesktopPluginState.DISCOVERED:
                 continue
             runtime = self._runtimes[plugin_id]
             try:
-                facade = facade_factory(plugin_id, runtime.manifest)
-                if not isinstance(facade, DesktopHostFacade):
-                    raise TypeError("Facade does not implement DesktopHostFacade")
-                raw_config = dict(self._plugin_config.get(plugin_id, {}))
-                raw_config.pop("enabled", None)
-                config = freeze_json_object(raw_config)  # type: ignore[arg-type]
-                context = DesktopPluginContext(
-                    plugin_id=plugin_id,
-                    config=config,
-                    host=facade,
-                    cancellation=runtime.cancellation,
-                    read_kinds=frozenset(runtime.manifest.reads),
-                    method_ids=frozenset(
-                        method.id for method in runtime.manifest.methods
-                    ),
-                    event_ids=frozenset(event.id for event in runtime.manifest.events),
-                    focus_target_ids=frozenset(
-                        target.id for target in runtime.manifest.focus_targets
-                    ),
-                )
-                outcome = await _bounded_plugin_task(
+                context = self._start_context(plugin_id, runtime, facade_factory)
+                starting[plugin_id] = cast(
+                    asyncio.Task[object],
                     _runtime_task(runtime, runtime.provider.start(context)),
-                    self._start_timeout,
-                    runtime.cancellation,
                 )
-                if outcome is _OPERATION_TIMEOUT:
-                    self._set_error(
-                        plugin_id,
-                        DesktopPluginErrorCode.START_FAILED,
-                        "Desktop plugin start exceeded its time limit",
-                    )
-                    continue
-                if outcome is _PROVIDER_CANCELLED:
-                    self._set_error(
-                        plugin_id,
-                        DesktopPluginErrorCode.START_FAILED,
-                        "Desktop plugin cancelled its start operation",
-                    )
-                    continue
-            except asyncio.CancelledError:
-                raise
             except Exception:  # noqa: BLE001 - third-party plugin boundary
+                self._set_error(
+                    plugin_id,
+                    DesktopPluginErrorCode.START_FAILED,
+                    "Desktop plugin failed to start",
+                )
+        if not starting:
+            return self.plugins
+        try:
+            await asyncio.wait(starting.values(), timeout=self._start_timeout)
+        except asyncio.CancelledError:
+            for plugin_id, task in starting.items():
+                self._runtimes[plugin_id].cancellation.cancel()
+                task.cancel()
+            raise
+        for plugin_id, task in starting.items():
+            if not task.done():
+                self._runtimes[plugin_id].cancellation.cancel()
+                task.cancel()
+                self._set_error(
+                    plugin_id,
+                    DesktopPluginErrorCode.START_FAILED,
+                    "Desktop plugin start exceeded its time limit",
+                )
+            elif task.cancelled():
+                self._set_error(
+                    plugin_id,
+                    DesktopPluginErrorCode.START_FAILED,
+                    "Desktop plugin cancelled its start operation",
+                )
+            elif task.exception() is not None:
                 self._set_error(
                     plugin_id,
                     DesktopPluginErrorCode.START_FAILED,
@@ -293,9 +293,36 @@ class DesktopPluginRegistry:
                 )
             else:
                 self._records[plugin_id] = replace(
-                    record, state=DesktopPluginState.STARTED, error=None
+                    self._records[plugin_id],
+                    state=DesktopPluginState.STARTED,
+                    error=None,
                 )
         return self.plugins
+
+    def _start_context(
+        self,
+        plugin_id: str,
+        runtime: _Runtime,
+        facade_factory: DesktopFacadeFactory,
+    ) -> DesktopPluginContext:
+        facade = facade_factory(plugin_id, runtime.manifest)
+        if not isinstance(facade, DesktopHostFacade):
+            raise TypeError("Facade does not implement DesktopHostFacade")
+        raw_config = dict(self._plugin_config.get(plugin_id, {}))
+        raw_config.pop("enabled", None)
+        config = freeze_json_object(raw_config)  # type: ignore[arg-type]
+        return DesktopPluginContext(
+            plugin_id=plugin_id,
+            config=config,
+            host=facade,
+            cancellation=runtime.cancellation,
+            read_kinds=frozenset(runtime.manifest.reads),
+            method_ids=frozenset(method.id for method in runtime.manifest.methods),
+            event_ids=frozenset(event.id for event in runtime.manifest.events),
+            focus_target_ids=frozenset(
+                target.id for target in runtime.manifest.focus_targets
+            ),
+        )
 
     async def call(
         self,
@@ -423,73 +450,106 @@ class DesktopPluginRegistry:
         return DesktopPluginCallResult(value=frozen)
 
     async def stop_all(self) -> tuple[DesktopPluginRecord, ...]:
-        """Cancel plugin work and bound every provider cleanup independently."""
+        """Signal every provider, then bound all cleanup under one deadline.
+
+        Every provider is marked stopping and has its lifecycle token, call
+        tokens, pending calls and provider tasks cancelled before any
+        ``stop()`` runs. All ``stop()`` calls then run concurrently and share
+        the cleanup timeout, so a slow provider cannot keep a later one from
+        being stopped.
+        """
         self._require_discovered()
-        for plugin_id in sorted(self._runtimes, reverse=True):
+        plugin_ids = tuple(
+            plugin_id
+            for plugin_id in sorted(self._runtimes, reverse=True)
+            if self._records[plugin_id].state is not DesktopPluginState.STOPPED
+        )
+        cleanup: dict[str, set[asyncio.Task[object]]] = {}
+        for plugin_id in plugin_ids:
+            cleanup[plugin_id] = self._signal_stop(self._runtimes[plugin_id])
+
+        stop_tasks: dict[str, asyncio.Task[object]] = {}
+        for plugin_id in plugin_ids:
             runtime = self._runtimes[plugin_id]
-            record = self._records[plugin_id]
-            if record.state is DesktopPluginState.STOPPED:
-                continue
-            runtime.stopping = True
-            runtime.cancellation.cancel()
-            pending_calls = tuple(runtime.calls.values())
-            active_provider_tasks = tuple(runtime.provider_tasks)
-            active_outer_tasks = {
-                pending_call.outer_task
-                for pending_call in pending_calls
-                if not pending_call.outer_complete
-            }
-            for pending_call in pending_calls:
-                pending_call.cancellation.cancel()
-                if not pending_call.outer_complete:
-                    pending_call.outer_task.cancel()
-                if pending_call.provider_task is not None:
-                    pending_call.provider_task.cancel()
-            for provider_task in active_provider_tasks:
-                provider_task.cancel()
             try:
-                stop_task = _runtime_task(runtime, runtime.provider.stop())
-                cleanup_tasks = {
-                    *active_provider_tasks,
-                    *active_outer_tasks,
-                    cast(asyncio.Task[object], stop_task),
-                }
-                _done, pending = await asyncio.wait(
-                    cleanup_tasks, timeout=self._cleanup_timeout
+                stop_task = cast(
+                    asyncio.Task[object],
+                    _runtime_task(runtime, runtime.provider.stop()),
                 )
-                if pending:
-                    for task in pending:
-                        task.cancel()
-                    self._set_error(
-                        plugin_id,
-                        DesktopPluginErrorCode.CLEANUP_TIMEOUT,
-                        "Desktop plugin cleanup exceeded its time limit",
-                    )
-                    continue
-                if stop_task.cancelled():
-                    self._set_error(
-                        plugin_id,
-                        DesktopPluginErrorCode.STOP_FAILED,
-                        "Desktop plugin cancelled its stop operation",
-                    )
-                    continue
-                stop_task.result()
-            except asyncio.CancelledError:
-                for task in cleanup_tasks:
-                    task.cancel()
-                raise
             except Exception:  # noqa: BLE001 - third-party plugin boundary
                 self._set_error(
                     plugin_id,
                     DesktopPluginErrorCode.STOP_FAILED,
                     "Desktop plugin failed to stop",
                 )
-            else:
-                if record.state is not DesktopPluginState.FAILED:
-                    self._records[plugin_id] = replace(
-                        record, state=DesktopPluginState.STOPPED, error=None
-                    )
+                continue
+            stop_tasks[plugin_id] = stop_task
+            cleanup[plugin_id].add(stop_task)
+
+        all_tasks = {task for tasks in cleanup.values() for task in tasks}
+        if all_tasks:
+            try:
+                await asyncio.wait(all_tasks, timeout=self._cleanup_timeout)
+            except asyncio.CancelledError:
+                for task in all_tasks:
+                    task.cancel()
+                raise
+
+        for plugin_id in plugin_ids:
+            pending = [task for task in cleanup[plugin_id] if not task.done()]
+            if pending:
+                for task in pending:
+                    task.cancel()
+                self._set_error(
+                    plugin_id,
+                    DesktopPluginErrorCode.CLEANUP_TIMEOUT,
+                    "Desktop plugin cleanup exceeded its time limit",
+                )
+                continue
+            stop_task = stop_tasks.get(plugin_id)
+            if stop_task is None:
+                continue
+            if stop_task.cancelled():
+                self._set_error(
+                    plugin_id,
+                    DesktopPluginErrorCode.STOP_FAILED,
+                    "Desktop plugin cancelled its stop operation",
+                )
+            elif stop_task.exception() is not None:
+                self._set_error(
+                    plugin_id,
+                    DesktopPluginErrorCode.STOP_FAILED,
+                    "Desktop plugin failed to stop",
+                )
+            elif self._records[plugin_id].state is not DesktopPluginState.FAILED:
+                self._records[plugin_id] = replace(
+                    self._records[plugin_id],
+                    state=DesktopPluginState.STOPPED,
+                    error=None,
+                )
         return self.plugins
+
+    @staticmethod
+    def _signal_stop(runtime: _Runtime) -> set[asyncio.Task[object]]:
+        """Cancel one provider's work and return the tasks cleanup must await."""
+        runtime.stopping = True
+        runtime.cancellation.cancel()
+        pending_calls = tuple(runtime.calls.values())
+        active_provider_tasks = tuple(runtime.provider_tasks)
+        active_outer_tasks = {
+            pending_call.outer_task
+            for pending_call in pending_calls
+            if not pending_call.outer_complete
+        }
+        for pending_call in pending_calls:
+            pending_call.cancellation.cancel()
+            if not pending_call.outer_complete:
+                pending_call.outer_task.cancel()
+            if pending_call.provider_task is not None:
+                pending_call.provider_task.cancel()
+        for provider_task in active_provider_tasks:
+            provider_task.cancel()
+        return {*active_provider_tasks, *active_outer_tasks}
 
     def assets(self, plugin_id: str) -> tuple[DesktopResolvedAsset, ...]:
         runtime = self._runtime_or_raise(plugin_id)

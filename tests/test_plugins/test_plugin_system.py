@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tongs.mcp import plugin as mcp_plugin
 from tongs.plugins.base import TongsPlugin
 from tongs.plugins.context import PluginContext
 from tongs.plugins.registry import PluginRegistry
@@ -78,6 +81,25 @@ class TestPluginRegistry:
         reg._plugins.append(BrokenPlugin())
         screens = reg.get_all_screens()
         assert screens == {}
+
+    def test_malformed_command_tuple_is_skipped_for_that_plugin(self, caplog):
+        class MalformedPlugin(TongsPlugin):
+            @property
+            def name(self):
+                return "malformed"
+
+            def get_commands(self):
+                return [("Only a name",)]
+
+        reg = PluginRegistry()
+        reg._plugins.append(MalformedPlugin())
+        reg._plugins.append(DummyPlugin())
+        with caplog.at_level(logging.WARNING, logger="tongs.plugins.registry"):
+            commands = reg.get_all_commands()
+        assert [display for display, _help, _callback in commands] == ["Dummy Command"]
+        assert [r.getMessage() for r in caplog.records] == [
+            "Plugin malformed.get_commands failed"
+        ]
 
     def test_multi_plugin_commands_merged(self):
         reg = PluginRegistry()
@@ -245,30 +267,96 @@ class TestPluginContext:
         assert result == {}
 
 
-class TestMCPPlugin:
-    def test_mcp_plugin_commands(self, monkeypatch):
-        from tongs.mcp import plugin
+class _CallbackPlugin(TongsPlugin):
+    def __init__(self, callback) -> None:
+        self._callback = callback
 
-        monkeypatch.setattr(plugin, "_mcp_available", lambda: True)
+    @property
+    def name(self):
+        return "callback"
 
-        mcp_plugin = plugin.MCPPlugin()
-        commands = mcp_plugin.get_commands()
-        assert len(commands) == 1
-        assert commands[0][0] == "Start MCP Server"
-        assert commands[0][1]
-        assert commands[0][2] == mcp_plugin._start_server
+    def get_commands(self):
+        return [("Run", "Runs the callback", self._callback)]
 
-    def test_mcp_plugin_hides_command_when_dependency_is_missing(self, monkeypatch):
-        from tongs.mcp import plugin
 
-        monkeypatch.setattr(plugin, "_mcp_available", lambda: False)
+@pytest.mark.asyncio
+class TestGuardedPluginCommands:
+    async def _run(self, callback, app=None):
+        reg = PluginRegistry()
+        reg._plugins.append(_CallbackPlugin(callback))
+        ((_display, _help, guarded),) = reg.get_all_commands(app)
+        await guarded()
 
-        assert plugin.MCPPlugin().get_commands() == []
+    async def test_successful_sync_and_async_callbacks_run_once(self):
+        calls = []
 
-    def test_mcp_plugin_refuses_launch_when_dependency_disappears(self, monkeypatch):
-        from tongs.mcp import plugin
+        async def later():
+            calls.append("async")
 
-        monkeypatch.setattr(plugin, "_mcp_available", lambda: False)
+        app = MagicMock()
+        await self._run(lambda: calls.append("sync"), app)
+        await self._run(later, app)
+        assert calls == ["sync", "async"]
+        app.notify.assert_not_called()
 
-        with pytest.raises(RuntimeError, match="optional MCP dependency"):
-            plugin.MCPPlugin()._start_server()
+    async def test_awaitable_result_of_a_sync_callback_is_awaited(self):
+        calls = []
+
+        async def later():
+            calls.append("awaited")
+
+        await self._run(lambda: later(), MagicMock())
+        assert calls == ["awaited"]
+
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    async def test_failure_is_logged_and_noticed(self, asynchronous, caplog):
+        def boom():
+            raise RuntimeError("token glpat-secret in detail")
+
+        async def boom_later():
+            boom()
+
+        app = MagicMock()
+        with caplog.at_level(logging.WARNING, logger="tongs.plugins.registry"):
+            await self._run(boom_later if asynchronous else boom, app)
+        app.notify.assert_called_once_with(
+            "The callback plugin command failed. See the log.", severity="error"
+        )
+        assert [r.getMessage() for r in caplog.records] == [
+            "Plugin callback command 'Run' failed"
+        ]
+
+    async def test_failure_without_an_app_is_only_logged(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="tongs.plugins.registry"):
+            await self._run(None)
+        assert [r.getMessage() for r in caplog.records] == [
+            "Plugin callback command 'Run' failed"
+        ]
+
+    async def test_cancellation_is_not_swallowed(self):
+        async def cancelled():
+            raise asyncio.CancelledError
+
+        app = MagicMock()
+        with pytest.raises(asyncio.CancelledError):
+            await self._run(cancelled, app)
+        app.notify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_mcp_setup_command_is_offered_and_starts_no_process(monkeypatch):
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("the MCP plugin must not start a process")
+
+    monkeypatch.setattr(mcp_plugin, "_mcp_available", lambda: True)
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+    app = MagicMock()
+    plugin = mcp_plugin.MCPPlugin()
+    await plugin.on_app_ready(PluginContext(app))
+
+    ((display, _help, callback),) = plugin.get_commands()
+    callback()
+
+    assert display == "MCP Server Setup"
+    app.notify.assert_called_once()
+    assert app.notify.call_args.kwargs == {"severity": "information"}

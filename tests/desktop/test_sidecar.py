@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import sys
 from collections.abc import AsyncIterator
@@ -691,12 +692,10 @@ raise SystemExit(sidecar.main())
     assert b"python-contamination" in completed.stderr
 
 
-@pytest.mark.asyncio
-async def test_actual_sidecar_handshake_read_shutdown_and_hostile_frame(
-    tmp_path: Path,
-) -> None:
-    # This protocol fixture deliberately requests an empty plugin catalog even
-    # when the developer has installed desktop plugins in the test environment.
+def _isolated_environment(tmp_path: Path) -> dict[str, str]:
+    """Return an environment whose sidecar sees an empty plugin catalog."""
+    # Protocol fixtures deliberately request an empty plugin catalog even when
+    # the developer has installed desktop plugins in the test environment.
     isolated_config = tmp_path / "config" / "tongs"
     isolated_config.mkdir(parents=True)
     plugin_names = sorted(
@@ -714,6 +713,14 @@ async def test_actual_sidecar_handshake_read_shutdown_and_hostile_frame(
         XDG_CONFIG_HOME=str(tmp_path / "config"),
         XDG_DATA_HOME=str(tmp_path / "data"),
     )
+    return environment
+
+
+@pytest.mark.asyncio
+async def test_actual_sidecar_handshake_read_shutdown_and_hostile_frame(
+    tmp_path: Path,
+) -> None:
+    environment = _isolated_environment(tmp_path)
     process = await asyncio.create_subprocess_exec(
         *_actual_sidecar_command(),
         stdin=asyncio.subprocess.PIPE,
@@ -766,6 +773,115 @@ async def test_actual_sidecar_handshake_read_shutdown_and_hostile_frame(
         if process.returncode is None:
             process.kill()
             await process.wait()
+
+
+@pytest.mark.asyncio
+async def test_actual_sidecar_shuts_down_in_order_on_sigterm(tmp_path: Path) -> None:
+    process = await asyncio.create_subprocess_exec(
+        *_actual_sidecar_command(),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd="/tmp",
+        env=_isolated_environment(tmp_path),
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+    try:
+        process.stdin.write(
+            _frame(
+                "handshake",
+                "handshake",
+                {
+                    "protocol_major": 1,
+                    "core_version": version("tongs"),
+                    "capabilities": [],
+                },
+            )
+        )
+        await process.stdin.drain()
+        handshake = json.loads(await asyncio.wait_for(process.stdout.readline(), 10))
+        assert handshake["result"]["protocol_major"] == 1
+
+        # Electron sends SIGTERM with the protocol pipe still open.
+        process.send_signal(signal.SIGTERM)
+
+        assert await asyncio.wait_for(process.wait(), 10) == 0
+        assert await process.stdout.read() == b""
+        assert await process.stderr.read() == b""
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+
+
+@pytest.mark.asyncio
+async def test_sigterm_ends_protocol_input_and_the_handler_is_removed() -> None:
+    script = f"""
+import signal
+import sys
+sys.path.insert(0, {str(_SOURCE_ROOT)!r})
+from tongs.desktop import sidecar
+from tongs.desktop.protocol.messages import encode_response
+
+class FixtureServer:
+    async def run(self, reader, writer):
+        writer.write(encode_response('ready', result={{}}))
+        await writer.drain()
+        line = await reader.readline()
+        writer.write(encode_response('ended', result={{'line': line.decode()}}))
+        await writer.drain()
+
+sidecar.DesktopSidecarServer = FixtureServer
+status = sidecar.main()
+restored = signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+print(f'status={{status}} restored={{restored}}', file=sys.stderr)
+raise SystemExit(status)
+"""
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-E",
+        "-P",
+        "-c",
+        script,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd="/tmp",
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    try:
+        ready = json.loads(await asyncio.wait_for(process.stdout.readline(), 10))
+        assert ready["id"] == "ready"
+
+        process.send_signal(signal.SIGTERM)
+
+        ended = json.loads(await asyncio.wait_for(process.stdout.readline(), 10))
+        assert ended["id"] == "ended"
+        assert ended["result"] == {"line": ""}
+        assert await asyncio.wait_for(process.wait(), 10) == 0
+        assert await process.stderr.read() == b"status=0 restored=True\n"
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+
+
+@pytest.mark.asyncio
+async def test_sigterm_handler_is_optional_where_the_loop_cannot_install_it() -> None:
+    class NoSignals:
+        def add_signal_handler(self, *_args: object) -> None:
+            raise NotImplementedError
+
+    installed = sidecar._install_sigterm_handler(
+        cast(asyncio.AbstractEventLoop, NoSignals()),
+        cast(asyncio.ReadTransport, object()),
+        asyncio.StreamReader(),
+    )
+
+    assert installed is False
 
 
 def test_sidecar_main_logs_redacted_unexpected_failure(

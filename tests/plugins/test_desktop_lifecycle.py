@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from importlib.metadata import EntryPoint
 
 import pytest
@@ -654,3 +655,267 @@ def test_facade_protocol_has_no_concrete_host_or_tui_capabilities() -> None:
     assert public_names.isdisjoint(
         {"forge_registry", "cache", "token", "client", "app", "query_one"}
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _StaticEntryPoint:
+    """An in-memory desktop entry point that loads a test provider class."""
+
+    name: str
+    target: type
+    group: str = "tongs.desktop_plugins"
+
+    def load(self) -> type:
+        return self.target
+
+
+class _TimedProvider:
+    """A provider whose start and stop behavior comes from its plugin config."""
+
+    def __init__(self, plugin_id: str, log: list[tuple[str, str, float]]) -> None:
+        self.plugin_id = plugin_id
+        self.log = log
+        self.context: DesktopPluginContext | None = None
+
+    def manifest(self):
+        fixture = importlib.import_module("fixture_desktop_good")
+        return fixture.make_manifest(self.plugin_id)
+
+    def _note(self, event: str) -> None:
+        self.log.append((event, self.plugin_id, asyncio.get_running_loop().time()))
+
+    async def start(self, context: DesktopPluginContext) -> None:
+        self.context = context
+        self._note("start")
+        behavior = context.config.get("start")
+        if behavior == "hang":
+            await asyncio.Event().wait()
+        elif behavior == "stubborn":
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.05)
+        elif isinstance(behavior, float):
+            await asyncio.sleep(behavior)
+        self._note("started")
+
+    async def call(
+        self, method: str, params: FrozenJsonObject, context: DesktopCallContext
+    ) -> FrozenJsonValue:
+        return {}
+
+    async def stop(self) -> None:
+        assert self.context is not None
+        self._note("stop")
+        behavior = self.context.config.get("stop")
+        if behavior == "hang":
+            await asyncio.Event().wait()
+        elif isinstance(behavior, float):
+            await asyncio.sleep(behavior)
+        self._note("stopped")
+
+
+def _timed_registry(
+    config: dict[str, dict[str, object]],
+    log: list[tuple[str, str, float]],
+    providers: list[_TimedProvider],
+    **timeouts: float,
+) -> DesktopPluginRegistry:
+    def provider_class(plugin_id: str) -> type:
+        class Provider(_TimedProvider):
+            def __init__(self) -> None:
+                super().__init__(plugin_id, log)
+                providers.append(self)
+
+        return Provider
+
+    entries = tuple(
+        _StaticEntryPoint(plugin_id, provider_class(plugin_id)) for plugin_id in config
+    )
+    return DesktopPluginRegistry(
+        config,
+        entry_point_source=lambda group: tuple(
+            entry for entry in entries if entry.group == group
+        ),
+        host_version="1.0",
+        **timeouts,
+    )
+
+
+def test_default_deadlines_fit_inside_electron_timeouts() -> None:
+    registry = DesktopPluginRegistry(entry_point_source=lambda _group: ())
+
+    # Electron allows 10 s for the sidecar start and 30 s for one request.
+    assert registry._start_timeout == 6.0
+    assert registry._call_timeout == 25.0
+    assert registry._cleanup_timeout == 2.0
+
+
+@pytest.mark.asyncio
+async def test_slow_starts_run_concurrently_inside_one_budget(
+    desktop_fixture_root: object,
+) -> None:
+    log: list[tuple[str, str, float]] = []
+    providers: list[_TimedProvider] = []
+    registry = _timed_registry(
+        {
+            "hang": {"start": "hang"},
+            "slow-a": {"start": 0.3},
+            "slow-b": {"start": 0.3},
+            "slow-c": {"start": 0.3},
+            "stubborn": {"start": "stubborn"},
+        },
+        log,
+        providers,
+        start_timeout_seconds=0.5,
+    )
+    registry.discover()
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+
+    await registry.start_all(lambda _plugin_id, _manifest: RecordingFacade())
+
+    elapsed = loop.time() - began
+    # One serial start of the three slow providers alone takes 0.9 s.
+    assert 0.5 <= elapsed < 0.85
+    states = {item.plugin_id: item for item in registry.plugins}
+    for plugin_id in ("slow-a", "slow-b", "slow-c"):
+        assert states[plugin_id].state is DesktopPluginState.STARTED
+    for plugin_id in ("hang", "stubborn"):
+        assert states[plugin_id].state is DesktopPluginState.FAILED
+        error = states[plugin_id].error
+        assert error is not None
+        assert error.code is DesktopPluginErrorCode.START_FAILED
+        assert error.message == "Desktop plugin start exceeded its time limit"
+    assert all(
+        provider.context is not None and provider.context.cancellation.cancelled
+        for provider in providers
+        if provider.plugin_id in {"hang", "stubborn"}
+    )
+    starts = sorted(at for event, _plugin_id, at in log if event == "start")
+    assert len(starts) == 5
+    assert starts[-1] - starts[0] < 0.3
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_all_cancels_every_starting_provider(
+    desktop_fixture_root: object,
+) -> None:
+    log: list[tuple[str, str, float]] = []
+    providers: list[_TimedProvider] = []
+    registry = _timed_registry(
+        {"one": {"start": "hang"}, "two": {"start": "hang"}},
+        log,
+        providers,
+        start_timeout_seconds=5,
+    )
+    registry.discover()
+    starting = asyncio.create_task(
+        registry.start_all(lambda _plugin_id, _manifest: RecordingFacade())
+    )
+    await asyncio.sleep(0.01)
+
+    starting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+
+    assert len(providers) == 2
+    assert all(
+        provider.context is not None and provider.context.cancellation.cancelled
+        for provider in providers
+    )
+    await asyncio.sleep(0.01)
+    assert not any(registry._runtimes[pid].provider_tasks for pid in ("one", "two"))
+
+
+@pytest.mark.asyncio
+async def test_four_slow_providers_all_stop_within_the_cleanup_bound(
+    desktop_fixture_root: object,
+) -> None:
+    log: list[tuple[str, str, float]] = []
+    providers: list[_TimedProvider] = []
+    plugin_ids = ("p1", "p2", "p3", "p4")
+    registry = _timed_registry(
+        {plugin_id: {"stop": 0.3} for plugin_id in plugin_ids},
+        log,
+        providers,
+        cleanup_timeout_seconds=1.0,
+    )
+    registry.discover()
+    await registry.start_all(lambda _plugin_id, _manifest: RecordingFacade())
+    tokens_at_first_stop: list[bool] = []
+    original_stop = _TimedProvider.stop
+
+    async def observe_tokens(self: _TimedProvider) -> None:
+        if not tokens_at_first_stop:
+            tokens_at_first_stop.extend(
+                provider.context is not None and provider.context.cancellation.cancelled
+                for provider in providers
+            )
+        await original_stop(self)
+
+    for provider in providers:
+        provider.stop = observe_tokens.__get__(provider)  # type: ignore[method-assign]
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+
+    await registry.stop_all()
+
+    elapsed = loop.time() - began
+    # Stopping the four providers one after another takes 1.2 s.
+    assert elapsed < 1.1
+    assert tokens_at_first_stop == [True, True, True, True]
+    assert all(item.state is DesktopPluginState.STOPPED for item in registry.plugins)
+    stops = [at for event, _plugin_id, at in log if event == "stop"]
+    assert len(stops) == 4
+    assert max(stops) - began < 0.3
+    assert sorted(plugin_id for event, plugin_id, _at in log if event == "stopped") == [
+        *plugin_ids
+    ]
+
+
+@pytest.mark.asyncio
+async def test_hanging_providers_each_get_stop_and_share_one_deadline(
+    desktop_fixture_root: object,
+) -> None:
+    log: list[tuple[str, str, float]] = []
+    providers: list[_TimedProvider] = []
+    registry = _timed_registry(
+        {
+            "h1": {"stop": "hang"},
+            "h2": {"stop": "hang"},
+            "h3": {"stop": "hang"},
+            "h4": {"stop": "hang"},
+            "quick": {},
+        },
+        log,
+        providers,
+        cleanup_timeout_seconds=0.2,
+    )
+    registry.discover()
+    await registry.start_all(lambda _plugin_id, _manifest: RecordingFacade())
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+
+    await registry.stop_all()
+
+    elapsed = loop.time() - began
+    # One 0.2 s bound per hanging provider would take 0.8 s.
+    assert 0.2 <= elapsed < 0.7
+    assert sorted(plugin_id for event, plugin_id, _at in log if event == "stop") == [
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "quick",
+    ]
+    states = {item.plugin_id: item for item in registry.plugins}
+    assert states["quick"].state is DesktopPluginState.STOPPED
+    for plugin_id in ("h1", "h2", "h3", "h4"):
+        error = states[plugin_id].error
+        assert states[plugin_id].state is DesktopPluginState.FAILED
+        assert error is not None
+        assert error.code is DesktopPluginErrorCode.CLEANUP_TIMEOUT
+    await asyncio.sleep(0.01)
+    assert not any(runtime.provider_tasks for runtime in registry._runtimes.values())

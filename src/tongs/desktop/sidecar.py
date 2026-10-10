@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import sys
 from typing import cast
 
@@ -64,6 +65,31 @@ class _PipeWriter:
         await self._protocol.closed.wait()
 
 
+def _install_sigterm_handler(
+    loop: asyncio.AbstractEventLoop,
+    read_transport: asyncio.ReadTransport,
+    reader: asyncio.StreamReader,
+) -> bool:
+    """Turn SIGTERM into end of input so the server runs its orderly shutdown.
+
+    The server treats end of input like a closed pipe: it cancels pending
+    requests, stops plugins and closes the session within its bounds. Reading
+    is paused first so no later input can follow the injected end of input.
+    Returns whether the handler is installed; platforms without signal
+    handlers in the event loop keep the default SIGTERM behavior.
+    """
+
+    def end_input() -> None:
+        read_transport.pause_reading()
+        reader.feed_eof()
+
+    try:
+        loop.add_signal_handler(signal.SIGTERM, end_input)
+    except (NotImplementedError, RuntimeError):
+        return False
+    return True
+
+
 async def run_stdio() -> None:
     """Bind one sidecar server to process stdin and the original stdout pipe."""
     loop = asyncio.get_running_loop()
@@ -75,16 +101,23 @@ async def run_stdio() -> None:
 
     reader = asyncio.StreamReader(limit=MAX_REQUEST_FRAME_BYTES + 1)
     reader_protocol = asyncio.StreamReaderProtocol(reader)
-    await loop.connect_read_pipe(lambda: reader_protocol, sys.stdin.buffer)
+    read_transport, _ = await loop.connect_read_pipe(
+        lambda: reader_protocol, sys.stdin.buffer
+    )
 
     writer_protocol = _WritePipeProtocol()
     transport, _ = await loop.connect_write_pipe(
         lambda: writer_protocol, protocol_stdout
     )
     writer = _PipeWriter(cast(asyncio.WriteTransport, transport), writer_protocol)
+    sigterm_installed = _install_sigterm_handler(
+        loop, cast(asyncio.ReadTransport, read_transport), reader
+    )
     try:
         await DesktopSidecarServer().run(reader, writer)
     finally:
+        if sigterm_installed:
+            loop.remove_signal_handler(signal.SIGTERM)
         writer.close()
         try:
             await writer.wait_closed()
