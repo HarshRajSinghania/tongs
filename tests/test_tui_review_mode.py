@@ -1810,3 +1810,96 @@ async def test_oversized_comment_save_shows_an_error_and_keeps_the_text(
         assert stored.comments == ()
         assert not any(call[0] == "comment" for call in forge.calls)
         assert all(oversized not in message for message in _messages(app))
+
+
+@pytest.mark.asyncio
+async def test_oversized_summary_submit_reopens_the_dialog_with_the_text(
+    tmp_path: Path,
+) -> None:
+    app, forge = _app(tmp_path)
+    oversized = "s" * 70_000
+
+    async with app.run_test(notifications=True) as pilot:
+        screen = await _open_detail(app, pilot)
+        screen.action_review_draft()
+        await _wait_until(app, lambda: screen._review_draft is not None)
+        draft = screen._review_draft
+        assert draft is not None
+
+        screen.action_review_draft()
+        await _wait_until(app, lambda: isinstance(app.screen, ReviewSubmitScreen))
+        modal = cast(ReviewSubmitScreen, app.screen)
+        await pilot.press("v")
+        modal.query_one("#review-submit-body", TextArea).text = oversized
+        await pilot.press("ctrl+s")
+        await _wait_until(
+            app,
+            lambda: (
+                isinstance(app.screen, ReviewSubmitScreen) and app.screen is not modal
+            ),
+        )
+
+        reopened = cast(ReviewSubmitScreen, app.screen)
+        await pilot.pause()
+        assert reopened.query_one("#review-submit-body", TextArea).text == oversized
+        assert reopened._verdict is DraftVerdict.APPROVE
+        assert any(
+            message.startswith("Review was not submitted.")
+            for message in _messages(app)
+        )
+        stored = await app.session.drafts.get_draft(draft.id)
+        assert stored.version == draft.version
+        assert stored.body == draft.body
+        assert not any(
+            call[0] in {"comment", "inline", "reply", "verdict"} for call in forge.calls
+        )
+
+
+@pytest.mark.asyncio
+async def test_oversized_summary_on_comment_edit_reopens_the_dialog_with_the_text(
+    tmp_path: Path,
+) -> None:
+    app, _forge = _app(tmp_path)
+    oversized = "s" * 70_000
+
+    async with app.run_test(notifications=True) as pilot:
+        screen = await _open_detail(app, pilot)
+        screen.action_review_draft()
+        await _wait_until(app, lambda: screen._review_draft is not None)
+        screen.action_add_comment()
+        editor = screen.query_one("#comment-editor", CommentEditor)
+        editor.query_one("#comment-input", TextArea).text = "draft comment"
+        editor.action_submit()
+        await _wait_until(
+            app,
+            lambda: (
+                screen._review_draft is not None
+                and len(screen._review_draft.comments) == 1
+            ),
+        )
+        draft = screen._review_draft
+        assert draft is not None
+
+        screen.action_review_draft()
+        await _wait_until(app, lambda: isinstance(app.screen, ReviewSubmitScreen))
+        await pilot.pause()
+        modal = cast(ReviewSubmitScreen, app.screen)
+        modal.query_one("#review-submit-body", TextArea).text = oversized
+        await pilot.press("e")
+        await _wait_until(
+            app,
+            lambda: (
+                isinstance(app.screen, ReviewSubmitScreen) and app.screen is not modal
+            ),
+        )
+
+        reopened = cast(ReviewSubmitScreen, app.screen)
+        await pilot.pause()
+        assert reopened.query_one("#review-submit-body", TextArea).text == oversized
+        assert any(
+            message.startswith("Draft was not saved.") for message in _messages(app)
+        )
+        assert editor.display is False
+        stored = await app.session.drafts.get_draft(draft.id)
+        assert stored.version == draft.version
+        assert stored.body == draft.body

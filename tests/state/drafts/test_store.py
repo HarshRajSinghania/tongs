@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import multiprocessing
 import os
 import sqlite3
@@ -1156,6 +1157,46 @@ async def test_session_passes_the_configured_window_to_the_draft_store(
         assert (await session.drafts.get_draft(recent_id)).id == recent_id
         with pytest.raises(DraftNotFoundError):
             await session.drafts.get_draft(older_id)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_session_falls_back_to_the_default_window_for_an_invalid_config(
+    tmp_path: Path, db_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = DraftStore(db_path)
+    await store.open()
+    recent_id, _ = await _submitted(store)
+    older_id, _ = await _submitted(store)
+    await store.close()
+    _age_draft(db_path, recent_id, timedelta(hours=2))
+    _age_draft(db_path, older_id, timedelta(hours=25))
+
+    class _NoHosts:
+        def active_hostnames(self) -> list[str]:
+            return []
+
+        async def close_all(self) -> None:
+            return None
+
+    # Only a Config built in code can hold a window load_config would refuse.
+    session = ApplicationSession(
+        config=Config(submitted_draft_retention=timedelta(minutes=5)),
+        cache=CacheStore(db_path=tmp_path / "cache.db"),
+        draft_db_path=db_path,
+        forge_registry=_NoHosts(),  # type: ignore[arg-type]
+    )
+    with caplog.at_level(logging.WARNING, logger="tongs.services.session"):
+        await session.start()
+    try:
+        assert session.drafts.submitted_retention == store_module.SUBMITTED_RETENTION
+        assert (await session.drafts.get_draft(recent_id)).id == recent_id
+        with pytest.raises(DraftNotFoundError):
+            await session.drafts.get_draft(older_id)
+        assert [record.getMessage() for record in caplog.records] == [
+            "Ignoring an invalid submitted draft retention window"
+        ]
     finally:
         await session.close()
 

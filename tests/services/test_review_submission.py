@@ -1728,3 +1728,45 @@ async def test_cancelled_dispatch_whose_unknown_write_fails_propagates_cancellat
         f"comment:{draft.comments[0].id.hex}"
     ]
     await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_return_whose_first_unknown_write_fails_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "drafts.db"
+    comment = GeneralDraftComment(uuid4(), "confirmed comment")
+    verdict = AsyncMock(side_effect=ValidationError("Validation failed: 400"))
+    store, service, _, _, draft = await _services(
+        path,
+        _content(comment, verdict=DraftVerdict.APPROVE),
+        forge=ForgeType.GITLAB,
+        client=_client(submit_review=verdict),
+    )
+    paused = await service.start(draft.id, draft.version)
+    failures = _fail_unknown_writes(store, monkeypatch)
+    real = store.mark_attempt_unknown
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated(*args: object, **kwargs: object) -> object:
+        entered.set()
+        await release.wait()
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(store, "mark_attempt_unknown", gated)
+    task = asyncio.ensure_future(
+        service.reconcile(paused.attempt_id, ReconciliationResolution.RETURN_EDITABLE)
+    )
+    await entered.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert task.cancelled()
+    assert failures == [1]
+    assert not store.holds_attempt(paused.attempt_id)
+    assert (await store.get_draft(draft.id)).state is DraftState.PARTIAL
+    await store.close()

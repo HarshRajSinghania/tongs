@@ -768,7 +768,11 @@ class ReviewSubmissionService:
         except DraftStoreError:
             # The failed write still released this process's ownership, so
             # the attempt is left paused with no owner until startup recovery
-            # records it as outcome-unknown.
+            # records it as outcome-unknown. A caller cancelled during the
+            # write still gets its cancellation instead of a paused result.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise asyncio.CancelledError from None
             return self._progress(
                 attempt,
                 plan,

@@ -698,6 +698,10 @@ class MRDetailScreen(Screen):
                 editor.reject_submission(message)
             else:
                 self.notify(message, severity="error", markup=False)
+                if reopen_after_conflict:
+                    # Reopens the dialog with the refused text so it can be shortened.
+                    self._draft_conflict = content
+                    reopen_review = True
         except asyncio.CancelledError:
             if acknowledge_editor and not self._detached_from_app():
                 editor.reject_submission(
@@ -830,6 +834,9 @@ class MRDetailScreen(Screen):
             )
         except DraftLimitError as exc:
             # Refused before submission started, so nothing reached the forge.
+            # The dialog reopens with the refused text so it can be shortened.
+            self._draft_conflict = requested
+            reopen_after_conflict = True
             self.notify(
                 f"Review was not submitted. {exc}", severity="error", markup=False
             )
