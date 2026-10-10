@@ -177,21 +177,7 @@ def discard_staged_artifact(staged: VerifiedStagedArtifact) -> None:
     except FileNotFoundError:
         return
     try:
-        stage_fd = os.open(
-            stage_path.name,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-            dir_fd=root_fd,
-        )
-        try:
-            details = os.fstat(stage_fd)
-            if details.st_uid != os.geteuid() or stat.S_IMODE(details.st_mode) != 0o700:
-                raise InstallerError(
-                    InstallerErrorCode.EXTRACTION_FAILED,
-                    "The desktop staging directory is unsafe.",
-                )
-        finally:
-            os.close(stage_fd)
-        shutil.rmtree(stage_path.name, dir_fd=root_fd)
+        _remove_owned_stage(root_fd, stage_path.name)
     except FileNotFoundError:
         return
     except OSError as error:
@@ -201,6 +187,58 @@ def discard_staged_artifact(staged: VerifiedStagedArtifact) -> None:
         ) from error
     finally:
         os.close(root_fd)
+
+
+def sweep_orphaned_staging(staging_root: Path) -> int:
+    """Remove stage directories an interrupted run left behind.
+
+    Call this only while holding the desktop command lock, so no other lifecycle
+    command can be staging into the same root. Each entry passes the same checks
+    as ``discard_staged_artifact``: a stage name, a real directory opened without
+    following symlinks, owned by this user, with mode 0700. Symlinks, foreign
+    entries and anything that cannot be removed are left in place. Returns the
+    number of directories removed.
+    """
+    try:
+        root_fd = _open_existing_private_root(staging_root)
+    except FileNotFoundError:
+        return 0
+    removed = 0
+    try:
+        for name in sorted(os.listdir(root_fd)):
+            if _STAGE_NAME_RE.fullmatch(name) is None:
+                continue
+            try:
+                _remove_owned_stage(root_fd, name)
+            except (InstallerError, OSError):
+                continue
+            removed += 1
+        if removed:
+            os.fsync(root_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(root_fd)
+    return removed
+
+
+def _remove_owned_stage(root_fd: int, name: str) -> None:
+    """Remove one stage directory owned by this user, never following symlinks."""
+    stage_fd = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=root_fd,
+    )
+    try:
+        details = os.fstat(stage_fd)
+        if details.st_uid != os.geteuid() or stat.S_IMODE(details.st_mode) != 0o700:
+            raise InstallerError(
+                InstallerErrorCode.EXTRACTION_FAILED,
+                "The desktop staging directory is unsafe.",
+            )
+    finally:
+        os.close(stage_fd)
+    shutil.rmtree(name, dir_fd=root_fd)
 
 
 async def _accept_release(
@@ -477,4 +515,5 @@ __all__ = [
     "discard_staged_artifact",
     "extract_verified_archive",
     "stage_desktop_release",
+    "sweep_orphaned_staging",
 ]

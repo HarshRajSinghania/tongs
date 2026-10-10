@@ -17,6 +17,7 @@ from tongs.desktop.installer.extract import (
     _accept_release,
     discard_staged_artifact,
     extract_verified_archive,
+    sweep_orphaned_staging,
 )
 from tongs.desktop.installer.models import (
     AcceptedReleaseState,
@@ -320,3 +321,43 @@ async def test_concurrent_staging_allocates_distinct_complete_directories(
     assert second.launcher_path.is_file()
     discard_staged_artifact(first)
     discard_staged_artifact(second)
+
+
+def test_sweep_removes_complete_and_partial_orphans_only(tmp_path: Path) -> None:
+    root = tmp_path / "stage"
+    complete = extract_verified_archive(documents()[1], verified_metadata(), root)
+    partial = root / f".tongs-stage-{'e' * 32}"
+    partial.mkdir(mode=0o700)
+    partial.chmod(0o700)
+    lookalike = root / f".tongs-stage-{'E' * 32}"
+    lookalike.mkdir(mode=0o700)
+    loose_file = root / f".tongs-stage-{'f' * 32}"
+    loose_file.write_text("not a directory")
+    loose_file.chmod(0o700)
+
+    assert sweep_orphaned_staging(root) == 2
+
+    assert not complete.staging_path.exists()
+    assert not partial.exists()
+    assert lookalike.is_dir()
+    assert loose_file.read_text() == "not a directory"
+    assert sweep_orphaned_staging(root) == 0
+
+
+def test_sweep_of_a_missing_root_creates_nothing(tmp_path: Path) -> None:
+    assert sweep_orphaned_staging(tmp_path / "absent") == 0
+    assert not (tmp_path / "absent").exists()
+
+
+def test_sweep_refuses_an_unsafe_staging_root(tmp_path: Path) -> None:
+    root = tmp_path / "stage"
+    root.mkdir(mode=0o755)
+    root.chmod(0o755)
+    orphan = root / f".tongs-stage-{'a' * 32}"
+    orphan.mkdir(mode=0o700)
+
+    with pytest.raises(InstallerError) as raised:
+        sweep_orphaned_staging(root)
+
+    assert raised.value.code is InstallerErrorCode.EXTRACTION_FAILED
+    assert orphan.is_dir()

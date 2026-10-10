@@ -148,6 +148,7 @@ async def _run(
             else InstallRequest()
         )
         with context.store.transaction() as transaction:
+            _sweep_orphaned_staging(transaction)
             if context.environment is None:
                 raise AssertionError("install requires a bound environment")
             require_activation_environment(transaction, context.environment)
@@ -163,6 +164,7 @@ async def _run(
             raise AssertionError("repair requires a bound environment")
         try:
             with context.store.transaction() as transaction:
+                _sweep_orphaned_staging(transaction)
                 state = repair_activation(transaction, context.environment)
         except InstallerError:
             if not arguments.redownload:
@@ -172,6 +174,7 @@ async def _run(
                 file=stdout,
             )
             with context.store.transaction() as transaction:
+                _sweep_orphaned_staging(transaction)
                 require_activation_environment(transaction, context.environment)
                 discard_interrupted_activation(transaction)
                 staged = await context.stage_release(transaction, InstallRequest())
@@ -193,6 +196,7 @@ async def _run(
         return 0 if status.launch_ready or not status.installed else 1
     if action == "uninstall":
         with context.store.transaction() as transaction:
+            _sweep_orphaned_staging(transaction)
             state = uninstall_user_activation(transaction)
         if state is None:
             print("No per-user desktop installation is active.", file=stdout)
@@ -267,6 +271,13 @@ def _activate(
         except InstallerError:
             pass
         raise
+
+
+def _sweep_orphaned_staging(transaction: DesktopInstallationTransaction) -> None:
+    """Remove stage folders an interrupted command left, under the command lock."""
+    from tongs.desktop.installer.extract import sweep_orphaned_staging
+
+    sweep_orphaned_staging(transaction.paths.staging_root)
 
 
 def _platform_probe() -> DesktopPlatform:
