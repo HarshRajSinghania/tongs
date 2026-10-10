@@ -1,4 +1,4 @@
-# www.tongs.tools
+# The `www.tongs.tools` site
 
 Astro 7 and Starlight 0.42. The homepage is `src/pages/index.astro`; the docs
 are the Markdown files in the repository's `docs/`, reached through the

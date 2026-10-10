@@ -18,6 +18,8 @@ from typing import Any
 import pytest
 import yaml
 
+from tests.ci.ci_plan import classify_paths
+
 ROOT = Path(__file__).resolve().parents[2]
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 LINTERS = ROOT / ".github/linters"
@@ -28,7 +30,13 @@ LINTER = "markdownlint-cli2"
 LINTER_BIN = f".github/linters/node_modules/.bin/{LINTER}"
 LINT_STEP = "Lint Markdown"
 SITE_BUILD = "npm run build --prefix site"
-LINT_GLOBS = ("docs/**/*.md", "*.md")
+LINT_GLOBS = (
+    "docs/**/*.md",
+    "*.md",
+    ".agents/**/*.md",
+    ".github/*.md",
+    "site/README.md",
+)
 REGISTRY = "https://registry.npmjs.org/"
 
 
@@ -61,7 +69,7 @@ def test_the_lint_step_runs_the_pinned_binary_with_the_committed_config(
     assert (ROOT / CONFIG).parent == LINTERS
 
 
-def test_the_lint_globs_cover_docs_and_root_markdown(
+def test_the_lint_globs_cover_the_repository_markdown(
     docs_job: dict[str, Any],
 ) -> None:
     globs = tuple(_lint_argv(docs_job)[3:])
@@ -69,11 +77,34 @@ def test_the_lint_globs_cover_docs_and_root_markdown(
     covered: set[Path] = set()
     for pattern in globs:
         covered.update(ROOT.glob(pattern))
-    expected = set((ROOT / "docs").rglob("*.md")) | set(ROOT.glob("*.md"))
-    # Everything under docs/ is linted, including files the site build leaves out
-    # of the site. Checked by walking the tree, not by naming files, so docs
-    # edits never need the core lane to keep this test honest.
+    expected = (
+        set((ROOT / "docs").rglob("*.md"))
+        | set(ROOT.glob("*.md"))
+        | set((ROOT / ".agents").rglob("*.md"))
+        | set((ROOT / ".github").glob("*.md"))
+        | {ROOT / "site/README.md"}
+    )
+    # Everything under docs/ and .agents/ is linted, including files the site
+    # build leaves out of the site. Checked by walking the tree, not by naming
+    # files, so docs edits never need the core lane to keep this test honest.
     assert covered == expected
+
+
+def test_every_linted_markdown_file_selects_the_docs_lane(
+    docs_job: dict[str, Any],
+) -> None:
+    covered: set[Path] = set()
+    for pattern in _lint_argv(docs_job)[3:]:
+        covered.update(ROOT.glob(pattern))
+    assert covered
+    # The linter runs only in the docs job, so an edit to a linted file must
+    # select that lane or the change merges unlinted.
+    offenders = sorted(
+        relative
+        for relative in (path.relative_to(ROOT).as_posix() for path in covered)
+        if "docs" not in classify_paths([relative])[0]
+    )
+    assert offenders == []
 
 
 def test_the_install_is_a_lockfile_npm_ci_under_the_linters_directory(
