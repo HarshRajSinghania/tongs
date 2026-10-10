@@ -1352,22 +1352,21 @@ async def test_failed_reload_after_a_submission_error_still_reports_it(
         app.clear_notifications()
         await pilot.press("v")
         await pilot.press("ctrl+s")
+        stopped = (
+            "Review submission stopped. (start broke) The draft state could "
+            "not be reloaded."
+        )
         await _wait_until(
-            app,
-            lambda: (
-                app._exception is not None
-                or (not screen._draft_busy and bool(_messages(app)))
-            ),
+            app, lambda: app._exception is not None or stopped in _messages(app)
         )
 
         assert app._exception is None
         assert app.is_running
-        assert _messages(app) == [
-            (
-                "Review submission stopped. (start broke) The draft state could "
-                "not be reloaded."
-            )
-        ]
+        # Saving the verdict with v may post its own notice before or after
+        # the submission fails; only the failure notice matters here.
+        assert [
+            message for message in _messages(app) if message != "Draft saved locally."
+        ] == [stopped]
 
 
 @pytest.mark.asyncio
@@ -1395,22 +1394,17 @@ async def test_failed_reload_after_a_recovery_error_still_reports_it(
 
         app.clear_notifications()
         await pilot.press("r")
+        stopped = (
+            "Review recovery stopped. (resume broke) The draft state could "
+            "not be reloaded."
+        )
         await _wait_until(
-            app,
-            lambda: (
-                app._exception is not None
-                or (not screen._draft_busy and bool(_messages(app)))
-            ),
+            app, lambda: app._exception is not None or stopped in _messages(app)
         )
 
         assert app._exception is None
         assert app.is_running
-        assert _messages(app) == [
-            (
-                "Review recovery stopped. (resume broke) The draft state could "
-                "not be reloaded."
-            )
-        ]
+        assert _messages(app) == [stopped]
 
 
 @pytest.mark.asyncio
