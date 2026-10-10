@@ -52,6 +52,12 @@ loads the draft for you.
 A review can hold more than one draft, for example one per revision. Press
 ++alt+close-bracket++ to cycle through them.
 
+A draft holds up to 200 comments. The summary and each comment can be up to
+65,536 bytes, and tab and newline are the only control characters they can
+contain. Both apps check these limits on every save and refuse a save over a
+limit with an error. In the terminal, your text stays in the editor so you can
+shorten it.
+
 :::note
 Drafts live in `drafts.db` in the tongs data directory
 (`~/.local/share/tongs/` on Linux). The file is created with mode `0600`.
@@ -82,8 +88,15 @@ opens this screen instead of approving on its own.
 
 On GitHub, a draft whose comments are all inline goes up as a single pull
 request review, with its summary and verdict. Otherwise tongs sends each
-comment in order, then the summary and the verdict. When the last step lands, tongs says "Review submitted." and removes
-the draft.
+comment in order, then the summary and the verdict. When the last step lands, tongs says "Review submitted." and hides
+the draft from both apps at once.
+
+The submitted draft stays in `drafts.db` for 24 hours, so a status check right
+after the submission still finds it. After that, tongs deletes it and the
+record of its submission from local storage. Drafts that are still being
+edited or submitted are never deleted. To keep submitted drafts for longer or
+shorter, set
+[`submitted_retention`](/reference/configuration/#drafts).
 
 ## When a submission is interrupted
 

@@ -1772,3 +1772,41 @@ async def test_ctrl_n_cycles_between_two_drafts(tmp_path: Path) -> None:
         await pilot.press("ctrl+n")
         await pilot.pause()
         assert screen._review_draft.id == second.id
+
+
+@pytest.mark.asyncio
+async def test_oversized_comment_save_shows_an_error_and_keeps_the_text(
+    tmp_path: Path,
+) -> None:
+    app, forge = _app(tmp_path)
+    oversized = "x" * 70_000
+
+    async with app.run_test(notifications=True) as pilot:
+        screen = await _open_detail(app, pilot)
+        screen.action_review_draft()
+        await _wait_until(app, lambda: screen._review_draft is not None)
+        draft = screen._review_draft
+        assert draft is not None
+
+        screen.action_add_comment()
+        editor = screen.query_one("#comment-editor", CommentEditor)
+        text_area = editor.query_one("#comment-input", TextArea)
+        text_area.text = oversized
+        editor.action_submit()
+        await _wait_until(
+            app,
+            lambda: (
+                not screen._draft_busy
+                and "Draft was not saved. A comment is over the 65,536-byte limit."
+                in _messages(app)
+            ),
+        )
+
+        assert editor.display is True
+        assert text_area.disabled is False
+        assert text_area.text == oversized
+        stored = await app.session.drafts.get_draft(draft.id)
+        assert stored.version == draft.version
+        assert stored.comments == ()
+        assert not any(call[0] == "comment" for call in forge.calls)
+        assert all(oversized not in message for message in _messages(app))

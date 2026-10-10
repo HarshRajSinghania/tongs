@@ -313,6 +313,9 @@ class ApplicationSession:
                     await self._prune_cache()
                     self._require_start_open()
                     self._draft_store_open_attempted = True
+                    self._draft_store.submitted_retention = (
+                        self._config.submitted_draft_retention
+                    )
                     await self._draft_store.open()
                     await self._draft_store.recover_incomplete_attempts()
                     self._recovery_warnings = self._draft_store.recovery_warnings

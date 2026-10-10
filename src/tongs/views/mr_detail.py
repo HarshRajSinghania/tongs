@@ -47,6 +47,7 @@ from tongs.state.drafts import (
     DraftComment,
     DraftConflictError,
     DraftContent,
+    DraftLimitError,
     DraftSnapshot,
     DraftState,
     GeneralDraftComment,
@@ -548,6 +549,10 @@ class MRDetailScreen(Screen):
             self._select_review_draft(draft)
             self.refresh_bindings()
             self.notify("Review mode started. Comments are now saved locally.")
+        except DraftLimitError as exc:
+            self.notify(
+                f"Could not start review mode. {exc}", severity="error", markup=False
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - Surface safe durable-store failures.
@@ -684,6 +689,15 @@ class MRDetailScreen(Screen):
                     severity="warning",
                 )
                 reopen_review = reopen_after_conflict
+        except DraftLimitError as exc:
+            if self._detached_from_app():
+                return
+            message = f"Draft was not saved. {exc}"
+            if acknowledge_editor:
+                # Keeps the text in the editor so it can be shortened.
+                editor.reject_submission(message)
+            else:
+                self.notify(message, severity="error", markup=False)
         except asyncio.CancelledError:
             if acknowledge_editor and not self._detached_from_app():
                 editor.reject_submission(
@@ -813,6 +827,11 @@ class MRDetailScreen(Screen):
             self.notify(
                 "Draft changed elsewhere before submission. Review the recovered summary and verdict.",
                 severity="warning",
+            )
+        except DraftLimitError as exc:
+            # Refused before submission started, so nothing reached the forge.
+            self.notify(
+                f"Review was not submitted. {exc}", severity="error", markup=False
             )
         except asyncio.CancelledError:
             await self._try_recover_submission_state(target, draft_id)

@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
+import logging
 import os
 import sqlite3
 import stat
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Concatenate, Self, cast
 from uuid import UUID, uuid4
@@ -17,6 +18,11 @@ from uuid import UUID, uuid4
 import aiosqlite
 from platformdirs import user_data_dir
 
+from tongs.config import (
+    DEFAULT_SUBMITTED_RETENTION,
+    MAX_SUBMITTED_RETENTION,
+    MIN_SUBMITTED_RETENTION,
+)
 from tongs.scanner.repo import ForgeType
 from tongs.services.models import RepositoryRef, ReviewRef, ReviewRevision
 from tongs.state.drafts._locks import AttemptLock
@@ -54,7 +60,15 @@ from tongs.state.drafts.models import (
     SubmissionPlanStepRecord,
     SubmissionRetryAuthorization,
     UnknownSubmissionOutcome,
+    validate_draft_content,
 )
+
+log = logging.getLogger(__name__)
+
+#: How long a submitted draft and its attempts stay on disk unless configured.
+#: Submitted drafts are hidden from both apps at once; this window only keeps
+#: them readable for a status poll or a recovery check soon after submission.
+SUBMITTED_RETENTION = DEFAULT_SUBMITTED_RETENTION
 
 _SCHEMA_VERSION = 2
 _MIGRATIONS: dict[int, tuple[str, ...]] = {
@@ -380,10 +394,15 @@ class DraftStore:
     """A process-safe durable draft store with optimistic content revisions."""
 
     def __init__(
-        self, db_path: Path | None = None, *, busy_timeout_ms: int = 5_000
+        self,
+        db_path: Path | None = None,
+        *,
+        busy_timeout_ms: int = 5_000,
+        submitted_retention: timedelta = SUBMITTED_RETENTION,
     ) -> None:
         if busy_timeout_ms <= 0:
             raise ValueError("busy_timeout_ms must be positive")
+        self.submitted_retention = submitted_retention
         self._db_path = db_path or default_draft_db_path()
         self._lock_dir = self._db_path.with_name(f"{self._db_path.name}.locks")
         self._busy_timeout_ms = busy_timeout_ms
@@ -396,6 +415,19 @@ class DraftStore:
     @property
     def db_path(self) -> Path:
         return self._db_path
+
+    @property
+    def submitted_retention(self) -> timedelta:
+        """How long a submitted draft stays on disk before it is pruned."""
+        return self._submitted_retention
+
+    @submitted_retention.setter
+    def submitted_retention(self, value: timedelta) -> None:
+        if not isinstance(value, timedelta) or not (
+            MIN_SUBMITTED_RETENTION <= value <= MAX_SUBMITTED_RETENTION
+        ):
+            raise ValueError("submitted_retention must be between 1 hour and 365 days")
+        self._submitted_retention = value
 
     @property
     def recovery_warnings(self) -> tuple[RecoveryWarning, ...]:
@@ -440,6 +472,7 @@ class DraftStore:
                 await db.execute("PRAGMA journal_mode=WAL")
                 await self._migrate(db)
                 await self._validate_schema(db)
+                await self._prune_submitted(db)
                 self._secure_sidecars()
                 self._db = db
             except (DraftStoreError, OSError, sqlite3.Error) as error:
@@ -608,6 +641,7 @@ class DraftStore:
         ):
             raise TypeError("review and revision must use service identity types")
         content = content or DraftContent()
+        validate_draft_content(content)
         self._validate_content_revision(content, revision)
         identifier = draft_id or uuid4()
         now = _now()
@@ -730,6 +764,7 @@ class DraftStore:
         _validate_version(expected_version)
         if not isinstance(content, DraftContent):
             raise TypeError("content must be DraftContent")
+        validate_draft_content(content)
         db = self._connection()
         try:
             await db.execute("BEGIN IMMEDIATE")
@@ -1246,10 +1281,13 @@ class DraftStore:
         try:
             result = await self._transition_owned(attempt_id, DraftState.SUBMITTED)
             completed = True
-            return result
         finally:
             if completed:
                 self._release_owned(attempt_id)
+        # A separate transaction: the draft just submitted is inside the
+        # retention window, so a status read right after submission finds it.
+        await self._prune_submitted(self._connection())
+        return result
 
     @_serialized
     async def mark_attempt_unknown(
@@ -1718,7 +1756,6 @@ class DraftStore:
             if resolution == ReconciliationResolution.RETRY_REMAINING:
                 self._held_attempt_locks[attempt_id] = ownership
                 keep_ownership = True
-            return result
         except (DraftStoreError, DraftNotFoundError):
             await self._rollback(db)
             raise
@@ -1731,6 +1768,76 @@ class DraftStore:
         finally:
             if not keep_ownership:
                 ownership.release()
+        if resolution == ReconciliationResolution.MARK_SUBMITTED:
+            await self._prune_submitted(db)
+        return result
+
+    async def _prune_submitted(self, db: aiosqlite.Connection) -> int:
+        """Delete submitted drafts older than the retention window.
+
+        Only a draft that is SUBMITTED, has no active attempt, whose latest
+        attempt is SUBMITTED and that has no attempt still submitting or
+        partial is eligible. Its attempts and their records cascade. Editable,
+        in-progress and outcome-unknown drafts are never touched. Pruning is
+        housekeeping: a failure is logged and leaves the database unchanged.
+        """
+        cutoff = _now() - self._submitted_retention
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            rows = await (
+                await db.execute(
+                    """
+                    SELECT draft.id, draft.updated_at
+                    FROM drafts AS draft
+                    WHERE draft.state = ?
+                      AND draft.active_attempt_id IS NULL
+                      AND (
+                        SELECT attempt.state FROM submission_attempts AS attempt
+                        WHERE attempt.draft_id = draft.id
+                        ORDER BY attempt.rowid DESC LIMIT 1
+                      ) = ?
+                      AND NOT EXISTS (
+                        SELECT 1 FROM submission_attempts AS attempt
+                        WHERE attempt.draft_id = draft.id AND attempt.state IN (?, ?)
+                      )
+                    """,
+                    (
+                        DraftState.SUBMITTED.value,
+                        DraftState.SUBMITTED.value,
+                        DraftState.SUBMITTING.value,
+                        DraftState.PARTIAL.value,
+                    ),
+                )
+            ).fetchall()
+            expired: list[str] = []
+            for row in rows:
+                try:
+                    submitted_at = _parse_time(row["updated_at"])
+                except (TypeError, ValueError):
+                    continue
+                if submitted_at <= cutoff:
+                    expired.append(row["id"])
+            deleted = 0
+            for identifier in expired:
+                cursor = await db.execute(
+                    """
+                    DELETE FROM drafts
+                    WHERE id = ? AND state = ? AND active_attempt_id IS NULL
+                    """,
+                    (identifier, DraftState.SUBMITTED.value),
+                )
+                deleted += max(cursor.rowcount, 0)
+            await db.execute("COMMIT")
+        except sqlite3.Error:
+            await self._rollback(db)
+            log.warning("Could not prune submitted review drafts; will retry later.")
+            return 0
+        except BaseException:
+            await self._rollback(db)
+            raise
+        if deleted:
+            log.info("Pruned %d submitted review draft(s) from local storage.", deleted)
+        return deleted
 
     @_serialized
     async def is_active_attempt(self, attempt_id: UUID) -> bool:

@@ -40,6 +40,9 @@ max_size_mb = 100
 max_parallel = 8
 request_timeout = 30
 
+[drafts]
+submitted_retention = "24h"
+
 [hosts.work-gitlab]
 hostname = "gitlab.example.com"
 forge_type = "gitlab"
@@ -134,6 +137,25 @@ screen does not wait on the network.
 |-----|------|---------|-------------|
 | `max_parallel` | integer | `8` | The most requests tongs sends to each forge host at once, counting list, CI, GraphQL and job log requests. Each host has its own limit. It must be greater than zero. |
 | `request_timeout` | integer | `30` | The HTTP request timeout, in seconds. |
+
+## `[drafts]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `submitted_retention` | string | `"24h"` | How long a submitted [review draft](/guides/review-drafts/) stays in local storage before tongs deletes it. |
+
+Write the value as a whole number followed by `h` for hours or `d` for days,
+for example `"24h"` or `"7d"`. The unit is lowercase, and the value must be
+from `"1h"` to `"365d"`. Any other value logs a warning and the default
+applies.
+
+- **What it changes.** A submitted draft disappears from the draft list in
+  both apps at once. It stays in `drafts.db` for this window, then tongs
+  deletes it with the record of its submission. tongs checks when either app
+  starts and after each submission.
+- **What it never deletes.** Drafts you are still editing, drafts being
+  submitted, and drafts whose submission was interrupted or has an unknown
+  outcome.
 
 ## `[hosts.<name>]`
 
