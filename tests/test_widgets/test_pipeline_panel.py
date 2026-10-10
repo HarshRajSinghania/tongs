@@ -80,6 +80,43 @@ async def test_editor_export_strips_ansi_sequences(
     assert not paths[0].exists()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job_name", ["rspec 1/3", "caller / callee", "../../etc"])
+async def test_editor_export_works_for_any_job_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, job_name: str
+) -> None:
+    app = PipelinePanelApp()
+    exported: list[tuple[Path, str]] = []
+
+    def capture(command: list[str], *, check: bool) -> None:
+        path = Path(command[-1])
+        exported.append((path, path.read_text()))
+
+    monkeypatch.setenv("EDITOR", "editor")
+    monkeypatch.setattr("tongs.widgets.pipeline_panel.tempfile.tempdir", str(tmp_path))
+    monkeypatch.setattr(app, "suspend", lambda: nullcontext())
+    monkeypatch.setattr("tongs.widgets.pipeline_panel.subprocess.run", capture)
+    notices: list[str] = []
+    monkeypatch.setattr(app, "notify", lambda message, **_: notices.append(message))
+
+    async with app.run_test():
+        panel = app.query_one("#pipeline-panel", PipelinePanel)
+        panel._view_level = 2
+        panel._current_job = PipelineJob(
+            id=31, name=job_name, stage="test", status=CIStatus.FAILED
+        )
+        panel._job_log_text = "log line"
+        panel.action_open_in_editor()
+
+    assert notices == []
+    assert len(exported) == 1
+    path, content = exported[0]
+    assert content == "log line"
+    assert path.parent == tmp_path
+    assert path.name.startswith("tongs-joblog-")
+    assert not path.exists()
+
+
 # ===================================================================
 # Messages posted by the panel actions
 # ===================================================================

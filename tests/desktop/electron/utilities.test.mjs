@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { WorkspaceUtilities } from "../../../desktop/dist/src/main/utilities.js";
+import {
+  EDITOR_HANDOFF_HOLD_MILLISECONDS,
+  resolveEditorExportRoot,
+  WorkspaceUtilities,
+} from "../../../desktop/dist/src/main/utilities.js";
 
 class FakeTransport {
   constructor() {
@@ -42,6 +46,13 @@ class FakeTransport {
   }
 }
 
+class FakeClock {
+  now = 0;
+  read = () => this.now;
+  /** Move past the hand-off hold so a successful exit means the editor closed. */
+  passHold() { this.now += EDITOR_HANDOFF_HOLD_MILLISECONDS; }
+}
+
 class FakeChild extends EventEmitter {
   unrefCalls = 0;
   unref() { this.unrefCalls += 1; }
@@ -61,8 +72,18 @@ async function fixture(t) {
     queueMicrotask(() => child.emit("spawn"));
     return child;
   };
+  const clock = new FakeClock();
   t.after(() => rm(parent, { recursive: true, force: true }));
-  return { parent, root, transport, clipboard, launches, children, utility: new WorkspaceUtilities(transport, clipboard, root, launch) };
+  return {
+    parent,
+    root,
+    transport,
+    clipboard,
+    launches,
+    children,
+    clock,
+    utility: new WorkspaceUtilities(transport, clipboard, root, launch, undefined, clock.read),
+  };
 }
 
 async function rmRoot() {
@@ -118,7 +139,7 @@ test("clear cache has no renderer-selected target", async (t) => {
 });
 
 test("editor export uses exact job, private file, safe argv, and exit cleanup", async (t) => {
-  const { utility, transport, root, launches, children } = await fixture(t);
+  const { utility, transport, root, launches, children, clock } = await fixture(t);
   let allowRelease;
   let descriptorsAtRelease;
   const releaseGate = new Promise((resolve) => {
@@ -152,6 +173,7 @@ test("editor export uses exact job, private file, safe argv, and exit cleanup", 
   assert.equal((await lstat(exported)).mode & 0o777, 0o600);
   assert.equal(children[0].unrefCalls, 1);
 
+  clock.passHold();
   children[0].emit("exit", 0);
   while (descriptorsAtRelease === undefined) {
     await new Promise((resolve) => setImmediate(resolve));
@@ -194,7 +216,7 @@ async function waitForNoExportDescriptors(directory) {
 }
 
 test("duplicate editor launch returns busy without replaying the job read", async (t) => {
-  const { utility, transport, root, children } = await fixture(t);
+  const { utility, transport, root, children, clock } = await fixture(t);
   let release;
   transport.requestRead = (method, params) => {
     transport.reads.push([method, params]);
@@ -207,6 +229,7 @@ test("duplicate editor launch returns busy without replaying the job read", asyn
   assert.equal(transport.reads.length, 1);
   release();
   await first;
+  clock.passHold();
   children[0].emit("exit", 0);
   await waitForEmptyDirectory(root);
   await waitForNoExportDescriptors(root);
@@ -315,8 +338,9 @@ test("two utility instances sharing seven occupied slots admit one delayed expor
   });
   const firstTransport = makeTransport();
   const secondTransport = makeTransport();
-  const first = new WorkspaceUtilities(firstTransport, { writeText() {} }, root, launch);
-  const second = new WorkspaceUtilities(secondTransport, { writeText() {} }, root, launch);
+  const clock = new FakeClock();
+  const first = new WorkspaceUtilities(firstTransport, { writeText() {} }, root, launch, undefined, clock.read);
+  const second = new WorkspaceUtilities(secondTransport, { writeText() {} }, root, launch, undefined, clock.read);
 
   const firstResult = first.openJobLogInEditor("job-one");
   while (firstTransport.reads.length === 0)
@@ -326,28 +350,106 @@ test("two utility instances sharing seven occupied slots admit one delayed expor
   releaseFetch();
   assert.equal((await firstResult).outcome, "started");
   assert.equal(children.length, 1);
-  assert.equal((await readdir(root)).length, 1);
+  assert.equal((await readdir(root)).filter((name) => name.endsWith(".log")).length, 1);
+  clock.passHold();
   children[0].emit("exit", 0);
   await waitForEmptyDirectory(root);
+  assert.deepEqual(await readdir(root), []);
 });
 
-test("exit cleanup preserves a replacement inode and its reservation", async (t) => {
-  const { utility, root, transport, launches, children } = await fixture(t);
+test("a rename-over save is removed and releases its slot", async (t) => {
+  const { utility, root, transport, launches, children, clock } = await fixture(t);
 
   assert.equal((await utility.openJobLogInEditor("job-handle")).outcome, "started");
   const exported = launches[0][1].at(-1);
-  await rm(exported);
-  await writeFile(exported, "replacement", { mode: 0o600 });
+  // Editors that save atomically write a new file and rename it over the old one.
+  const saved = path.join(root, "editor-save.tmp");
+  await writeFile(saved, "edited", { mode: 0o600 });
+  await rename(saved, exported);
 
-  if (process.platform === "linux") {
-    assert.deepEqual(await exportDescriptors(root), [`${exported} (deleted)`]);
-  }
-
+  clock.passHold();
   children[0].emit("exit", 0);
+  await waitForEmptyDirectory(root);
+
+  assert.deepEqual(await readdir(root), []);
+  assert.deepEqual(transport.mutations, [[
+    "utilities.job_log_release",
+    { slot: 1, token: "a".repeat(32) },
+  ]]);
+  await waitForNoExportDescriptors(root);
+});
+
+test("a symlink left under the export name is not followed or removed", async (t) => {
+  const { utility, root, parent, transport, launches, children, clock } = await fixture(t);
+
+  assert.equal((await utility.openJobLogInEditor("job-handle")).outcome, "started");
+  const exported = launches[0][1].at(-1);
+  const outside = path.join(parent, "outside.txt");
+  await writeFile(outside, "keep me", { mode: 0o600 });
+  await rm(exported);
+  await symlink(outside, exported);
+
+  clock.passHold();
+  children[0].emit("exit", 0);
+  while (transport.mutations.length === 0)
+    await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(await readFile(outside, "utf8"), "keep me");
+  assert.equal((await lstat(exported)).isSymbolicLink(), true);
+  // The release is still requested; the ledger refuses it while the name is taken.
+  assert.deepEqual(transport.mutations, [[
+    "utilities.job_log_release",
+    { slot: 1, token: "a".repeat(32) },
+  ]]);
+  await waitForNoExportDescriptors(root);
+});
+
+test("an editor that exits 0 at once still finds the file", async (t) => {
+  const { root, transport, clipboard } = await fixture(t);
+  const launch = () => {
+    const child = new FakeChild();
+    queueMicrotask(() => {
+      child.emit("spawn");
+      child.emit("exit", 0);
+    });
+    return child;
+  };
+  const utility = new WorkspaceUtilities(transport, clipboard, root, launch);
+
+  const result = await utility.openJobLogInEditor("job-handle");
+
+  assert.equal(result.outcome, "started");
+  assert.match(result.message, /returned at once/);
+  assert.match(result.message, /wait flag/);
+  const exportName = `tongs-slot-1-job-31-${"a".repeat(32)}.log`;
+  assert.equal(await readFile(path.join(root, exportName), "utf8"), "safe log\n");
+  assert.deepEqual(transport.mutations, []);
+  await waitForNoExportDescriptors(root);
+});
+
+test("a successful exit within the hand-off hold keeps the export", async (t) => {
+  const { utility, root, transport, children, clock } = await fixture(t);
+
+  assert.equal((await utility.openJobLogInEditor("job-handle")).outcome, "started");
+  clock.now += EDITOR_HANDOFF_HOLD_MILLISECONDS - 1;
+  children[0].emit("exit", 0);
+  await waitForNoExportDescriptors(root);
   await new Promise((resolve) => setTimeout(resolve, 25));
 
-  assert.equal(await readFile(exported, "utf8"), "replacement");
+  const exportName = `tongs-slot-1-job-31-${"a".repeat(32)}.log`;
+  assert.equal(await readFile(path.join(root, exportName), "utf8"), "safe log\n");
   assert.deepEqual(transport.mutations, []);
+});
+
+test("a failing exit within the hand-off hold still removes the export", async (t) => {
+  const { utility, root, transport, children } = await fixture(t);
+
+  assert.equal((await utility.openJobLogInEditor("job-handle")).outcome, "started");
+  children[0].emit("exit", 1);
+  await waitForEmptyDirectory(root);
+
+  assert.deepEqual(await readdir(root), []);
+  assert.equal(transport.mutations.length, 1);
   await waitForNoExportDescriptors(root);
 });
 
@@ -366,12 +468,20 @@ test("completion resolved during cleanup handoff is replayed exactly once", asyn
       cancellations += 1;
     };
   };
+  let now = 0;
+  const clock = () => {
+    // Launch reads zero; the exit replayed during hand-off reads past the hold.
+    const value = now;
+    now = EDITOR_HANDOFF_HOLD_MILLISECONDS;
+    return value;
+  };
   const utility = new WorkspaceUtilities(
     transport,
     clipboard,
     root,
     launch,
     scheduleExpiry,
+    clock,
   );
 
   assert.equal((await utility.openJobLogInEditor("job-handle")).outcome, "started");
@@ -464,4 +574,83 @@ test("editor error after spawn is distinct and removes the export", async (t) =>
   assert.match(result.message, /reported an error/);
   assert.deepEqual(await readdir(root), []);
   await waitForNoExportDescriptors(root);
+});
+
+test("a shared export folder that is not private gets its own message naming it", async (t) => {
+  const { root, transport } = await fixture(t);
+  await mkdir(root, { mode: 0o700 });
+  await chmod(root, 0o755);
+  const utility = new WorkspaceUtilities(transport, { writeText() {} }, root, () => {
+    throw new Error("must not launch");
+  });
+
+  const result = await utility.openJobLogInEditor("job-handle");
+
+  assert.equal(result.outcome, "failed");
+  assert.match(result.message, /not private to this user/);
+  assert.equal(result.message.includes(root), true);
+  assert.doesNotMatch(result.message, /configured command/);
+  assert.equal(transport.reads.length, 0);
+});
+
+test("the export folder is created with its parents inside a private runtime folder", async (t) => {
+  const { parent, transport, clipboard, children, clock } = await fixture(t);
+  const root = path.join(parent, "runtime", "tongs", "editor-exports");
+  const launch = () => {
+    const child = new FakeChild();
+    children.push(child);
+    queueMicrotask(() => child.emit("spawn"));
+    return child;
+  };
+  const utility = new WorkspaceUtilities(transport, clipboard, root, launch, undefined, clock.read);
+
+  assert.equal((await utility.openJobLogInEditor("job-handle")).outcome, "started");
+  assert.equal((await lstat(root)).mode & 0o777, 0o700);
+  assert.equal(children.length, 1);
+  clock.passHold();
+  children[0].emit("exit", 0);
+  await waitForEmptyDirectory(root);
+  await waitForNoExportDescriptors(root);
+});
+
+test("the export folder is per user", async (t) => {
+  const parent = await rmRoot();
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const uid = typeof process.getuid === "function" ? process.getuid() : 1000;
+  const runtime = path.join(parent, "runtime");
+  const temporary = path.join(parent, "tmp");
+  await mkdir(runtime, { mode: 0o700 });
+
+  if (typeof process.getuid === "function") {
+    assert.equal(
+      await resolveEditorExportRoot({ XDG_RUNTIME_DIR: runtime }, temporary, uid),
+      path.join(runtime, "tongs", "editor-exports"),
+    );
+  }
+  assert.equal(
+    await resolveEditorExportRoot({}, temporary, uid),
+    path.join(temporary, `tongs-editor-exports-${uid}`),
+  );
+  assert.equal(
+    await resolveEditorExportRoot({}, temporary, uid + 1),
+    path.join(temporary, `tongs-editor-exports-${uid + 1}`),
+  );
+  // A runtime folder owned by someone else, or open to others, is not used.
+  assert.equal(
+    await resolveEditorExportRoot({ XDG_RUNTIME_DIR: runtime }, temporary, uid + 1),
+    path.join(temporary, `tongs-editor-exports-${uid + 1}`),
+  );
+  await chmod(runtime, 0o755);
+  assert.equal(
+    await resolveEditorExportRoot({ XDG_RUNTIME_DIR: runtime }, temporary, uid),
+    path.join(temporary, `tongs-editor-exports-${uid}`),
+  );
+  assert.equal(
+    await resolveEditorExportRoot({ XDG_RUNTIME_DIR: "relative/runtime" }, temporary, uid),
+    path.join(temporary, `tongs-editor-exports-${uid}`),
+  );
+  assert.equal(
+    await resolveEditorExportRoot({ XDG_RUNTIME_DIR: path.join(parent, "missing") }, temporary, uid),
+    path.join(temporary, `tongs-editor-exports-${uid}`),
+  );
 });

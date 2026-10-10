@@ -27,6 +27,19 @@ _TERMINAL_EDITORS = frozenset(
     {"joe", "less", "micro", "more", "nano", "nvim", "pico", "vi", "vim"}
 )
 
+# Launchers that hand the file to a running instance and exit at once unless
+# told to wait. Each maps to the flag that makes it wait and every spelling of
+# that flag it accepts, so an existing flag is never added twice.
+_HANDOFF_LAUNCHERS: Mapping[str, tuple[str, frozenset[str]]] = {
+    "code": ("--wait", frozenset({"--wait", "-w"})),
+    "code-insiders": ("--wait", frozenset({"--wait", "-w"})),
+    "codium": ("--wait", frozenset({"--wait", "-w"})),
+    "subl": ("--wait", frozenset({"--wait", "-w"})),
+    "gvim": ("-f", frozenset({"-f", "--nofork"})),
+    "kate": ("--block", frozenset({"--block", "-b"})),
+    "gedit": ("--wait", frozenset({"--wait", "-w"})),
+}
+
 
 class EditorPlanStatus(str, Enum):
     """Safe outcomes produced before Electron starts an editor process."""
@@ -281,11 +294,25 @@ class WorkspaceUtilityService:
                 "Configure a wait-capable graphical editor; terminal editors cannot attach to Tongs Desktop.",
                 (),
             )
+        argv = _with_wait_flag(executable, argv)
         return (
             EditorPlanStatus.READY,
             "The configured editor launch plan is ready.",
             argv,
         )
+
+
+def _with_wait_flag(executable: str, argv: tuple[str, ...]) -> tuple[str, ...]:
+    """Add the wait flag a known hand-off launcher needs to keep the export alive."""
+    handoff = _HANDOFF_LAUNCHERS.get(executable)
+    if handoff is None:
+        return argv
+    flag, spellings = handoff
+    if any(argument in spellings for argument in argv[1:]):
+        return argv
+    if len(argv) >= MAX_EDITOR_ARGUMENTS:
+        return argv
+    return (argv[0], flag, *argv[1:])
 
 
 def _utf8_length(value: str) -> int | None:

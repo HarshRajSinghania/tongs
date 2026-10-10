@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -28,6 +29,14 @@ from tongs.widgets.two_press import TwoPressConfirm
 
 LOG_MAX_LINES = 50000
 """Job log lines kept in the widget; older lines are dropped past this."""
+
+
+_UNSAFE_FILE_LABEL = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _safe_file_label(name: str) -> str:
+    """Return a short file name part that cannot leave the temp folder."""
+    return _UNSAFE_FILE_LABEL.sub("_", name)[:40] or "job"
 
 
 class CancelPipelineRequested(Message):
@@ -540,7 +549,9 @@ class PipelinePanel(Widget, can_focus=True):
         tmp_path = None
         try:
             job_name = self._current_job.name if self._current_job else "job"
-            fd, tmp_path = tempfile.mkstemp(suffix=".log", prefix=f"tongs-{job_name}-")
+            fd, tmp_path = tempfile.mkstemp(
+                suffix=".log", prefix=f"tongs-joblog-{_safe_file_label(job_name)}-"
+            )
             os.chmod(tmp_path, 0o600)
             with os.fdopen(fd, "w") as f:
                 f.write(Text.from_ansi(self._job_log_text).plain)

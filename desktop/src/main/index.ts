@@ -16,7 +16,7 @@ import {
   watchServiceLoss,
 } from "./renderer_lifecycle.js";
 import { SidecarTransport } from "./sidecar.js";
-import { WorkspaceUtilities } from "./utilities.js";
+import { resolveEditorExportRoot, WorkspaceUtilities } from "./utilities.js";
 
 protocol.registerSchemesAsPrivileged([APP_SCHEME_REGISTRATION]);
 const forbidden = [
@@ -64,9 +64,9 @@ async function run(): Promise<void> {
   desktopSession.webRequest.onBeforeRequest((details, callback) =>
     callback({ cancel: !isAllowedAppUrl(details.url) }),
   );
-  const editorExportRoot = path.join(
+  const editorExportRoot = await resolveEditorExportRoot(
+    process.env,
     app.getPath("temp"),
-    "tongs-editor-exports",
   );
   transport = new SidecarTransport({
     ...launch,
