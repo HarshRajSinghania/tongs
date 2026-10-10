@@ -7,7 +7,6 @@ to do when a hosted check fails.
 
 ## Full local check set
 
-
 Run Python tools through the checkout-local environment:
 
 ```bash
@@ -16,8 +15,8 @@ pytest tests/ --ignore=tests/test_mcp -v
 pytest tests/test_mcp -v --junitxml="/tmp/tongs-mcp-$$.junit.xml"
 python tests/ci/verify_desktop_ci.py mcp-report \
   --path "/tmp/tongs-mcp-$$.junit.xml"
-ruff check src/ tests/ packaging/ scripts/release-evidence/ examples/
-ruff format --check src/ tests/ packaging/ scripts/release-evidence/ examples/
+ruff check src/ tests/ packaging/ scripts/ .github/scripts/ examples/
+ruff format --check src/ tests/ packaging/ scripts/ .github/scripts/ examples/
 ```
 
 The MCP extra is required so MCP tests execute rather than skip on import. The

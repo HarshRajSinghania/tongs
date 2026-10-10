@@ -10,6 +10,7 @@ frontend imports a concrete forge client. Direct `ForgeRegistry` access remains
 an internal service, MCP, and supported terminal-plugin interface.
 
 **MR operations:**
+
 - `list_mrs(repo_path, state, per_page)`: list MRs for a repo
 - `list_my_reviews()`: MRs where current user is reviewer (host-scoped)
 - `list_my_mrs()`: MRs authored by current user (host-scoped)
@@ -20,6 +21,7 @@ an internal service, MCP, and supported terminal-plugin interface.
 - `invalidate_review_reads(repo_path, number)`: non-abstract hook, returns True; `CachedForgeClient` overrides it
 
 **Comment operations:**
+
 - `get_mr_discussions(repo_path, number)`: threaded discussions
 - `create_inline_comment(repo_path, number, file_path, line, side, body, start_line=None, start_side=None, ...)`: new inline comment; both clients use `start_line`/`start_side` to transport an optional multi-line API range. The ABC also declares keyword-only revision and old/new path fields; consult it rather than copying this abbreviated signature. Suggestion-fence syntax separately describes replacement content.
 - `reply_to_discussion(repo_path, number, discussion_id, body)`: reply to thread
@@ -27,6 +29,7 @@ an internal service, MCP, and supported terminal-plugin interface.
 - `add_comment(repo_path, number, body)`: general (non-inline) comment; abstract
 
 **Review operations:**
+
 - `submit_review(repo_path, number, verdict, body, inline_comments)`: abstract on both forges
 - `approve_mr(repo_path, number)`
 - `unapprove_mr(repo_path, number)`: non-abstract, default raises `NotImplementedError`; GitLab overrides with `/unapprove` endpoint, GitHub does not implement
@@ -36,6 +39,7 @@ an internal service, MCP, and supported terminal-plugin interface.
 submit_review, approve_mr, merge_mr and reply_to_discussion also take keyword-only revision guards (`head_sha`, `expected_source_*`, `expected_target_branch`, `root_comment_id`); consult the ABC.
 
 **Pipeline operations:**
+
 - `list_pipelines(repo_path, per_page)`
 - `list_mr_pipelines(repo_path, number, per_page)`: list pipelines for a specific MR/PR. Default implementation falls back to `list_pipelines()`. GitLab overrides with `/merge_requests/{number}/pipelines`. GitHub overrides to fetch the PR's head branch then query `/actions/runs?branch={branch}`.
 - `get_pipeline_jobs(repo_path, pipeline_id)`
@@ -45,6 +49,7 @@ submit_review, approve_mr, merge_mr and reply_to_discussion also take keyword-on
 - `cancel_job(repo_path, job_id)`: cancel a single job. Default raises `NotImplementedError`. GitLab overrides with `/jobs/{id}/cancel`.
 
 **Capability queries** (properties, override in subclasses):
+
 - `supports_batched_review`: GitHub batches comments into a review; GitLab does not
 - `supports_thread_resolution`: GitLab has first-class resolution; GitHub uses GraphQL
 - `supports_draft_notes`: reserved capability; currently false for both implemented clients
@@ -52,6 +57,7 @@ submit_review, approve_mr, merge_mr and reply_to_discussion also take keyword-on
 - `supports_job_cancel`: GitLab returns `True`; base returns `False` (default). The session capability snapshot and `CIMutationService` check this before offering job cancel.
 
 **Lifecycle:**
+
 - `close()`: abstract; closes the owned httpx client
 
 ## Data Models
@@ -93,6 +99,7 @@ class MRDetail(MRSummary):
 - `close_all()` closes all cached httpx clients (owned by `ApplicationSession.close()`)
 
 API base URL patterns:
+
 - GitLab: `https://{hostname}/api/v4`
 - GitHub: `https://api.github.com` (github.com) or `https://{hostname}/api/v3` (enterprise)
 
@@ -108,6 +115,7 @@ API base URL patterns:
    type.
 
 Key details:
+
 - `gh auth token` omits `--hostname` for `github.com` (default), adds it for enterprise
 - `glab config get token` always includes `--host`
 - Token is held in the `httpx.AsyncClient` session, never stored in cache or logs

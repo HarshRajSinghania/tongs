@@ -113,6 +113,7 @@ clear authority and ignores renderer paths or keys.
 ## Testing
 
 Tests in `tests/test_cache/test_store.py` cover:
+
 - get/put round trip and TTL expiration
 - JSON convenience methods
 - Single-key and prefix invalidation
