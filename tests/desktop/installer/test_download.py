@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 
-from tongs.desktop.installer.download import download_bytes
+import tongs.desktop.installer.download as download_module
+from tongs.desktop.installer.download import download_bytes, download_optional_bytes
 from tongs.desktop.installer.models import (
     InstallerError,
     InstallerErrorCode,
@@ -215,3 +217,173 @@ async def test_stream_without_content_length_still_enforces_maximum_bytes() -> N
             )
 
     assert raised.value.code is InstallerErrorCode.LIMIT_EXCEEDED
+
+
+RATE_NOW = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
+PRIVATE_BODY = "API rate limit exceeded for 203.0.113.9 private-detail"
+
+
+def _local(moment: datetime) -> str:
+    return moment.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z").strip()
+
+
+async def _rejection(
+    monkeypatch: pytest.MonkeyPatch, status: int, headers: dict[str, str]
+) -> InstallerError:
+    monkeypatch.setattr(download_module, "_utc_now", lambda: RATE_NOW)
+    response = lambda _request: httpx.Response(
+        status, headers=headers, json={"message": PRIVATE_BODY}
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
+        with pytest.raises(InstallerError) as raised:
+            await download_bytes(
+                client,
+                "https://api.github.com/release",
+                limits=InstallerLimits(),
+                maximum_bytes=100,
+            )
+    assert raised.value.code is InstallerErrorCode.DOWNLOAD_FAILED
+    assert PRIVATE_BODY not in str(raised.value)
+    assert "203.0.113.9" not in str(raised.value)
+    return raised.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "headers", "reset"),
+    [
+        (
+            403,
+            {
+                "x-ratelimit-remaining": "0",
+                "x-ratelimit-reset": str(
+                    int((RATE_NOW + timedelta(minutes=17)).timestamp())
+                ),
+            },
+            RATE_NOW + timedelta(minutes=17),
+        ),
+        (403, {"retry-after": "90"}, RATE_NOW + timedelta(seconds=90)),
+        (
+            403,
+            {"retry-after": "Mon, 07 Sep 2026 12:30:00 GMT"},
+            RATE_NOW + timedelta(minutes=30),
+        ),
+        (429, {"retry-after": "60"}, RATE_NOW + timedelta(seconds=60)),
+        (
+            429,
+            {
+                "x-ratelimit-reset": str(
+                    int((RATE_NOW + timedelta(hours=1)).timestamp())
+                )
+            },
+            RATE_NOW + timedelta(hours=1),
+        ),
+    ],
+)
+async def test_rate_limits_are_retryable_and_name_the_local_reset_time(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    headers: dict[str, str],
+    reset: datetime,
+) -> None:
+    error = await _rejection(monkeypatch, status, headers)
+
+    assert error.retryable is True
+    assert str(error) == (
+        f"GitHub's anonymous API rate limit was reached. Retry after {_local(reset)}."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"retry-after": "not a time"},
+        {"retry-after": "9" * 40},
+        {"x-ratelimit-reset": "-5"},
+        {"x-ratelimit-reset": str(int((RATE_NOW + timedelta(days=2)).timestamp()))},
+    ],
+)
+async def test_429_without_a_usable_reset_time_is_still_retryable(
+    monkeypatch: pytest.MonkeyPatch, headers: dict[str, str]
+) -> None:
+    error = await _rejection(monkeypatch, 429, headers)
+
+    assert error.retryable is True
+    assert str(error) == (
+        "GitHub's anonymous API rate limit was reached. Wait a few minutes, then retry."
+    )
+
+
+@pytest.mark.asyncio
+async def test_reset_time_already_passed_is_reported_as_now(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    past = int((RATE_NOW - timedelta(minutes=3)).timestamp())
+    error = await _rejection(
+        monkeypatch,
+        403,
+        {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(past)},
+    )
+
+    assert error.retryable is True
+    assert f"Retry after {_local(RATE_NOW)}." in str(error)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [{}, {"x-ratelimit-remaining": "12", "x-ratelimit-reset": "1788000000"}],
+)
+async def test_plain_403_stays_a_permanent_rejection(
+    monkeypatch: pytest.MonkeyPatch, headers: dict[str, str]
+) -> None:
+    error = await _rejection(monkeypatch, 403, headers)
+
+    assert error.retryable is False
+    assert str(error) == "Desktop release download was rejected by its source."
+
+
+@pytest.mark.asyncio
+async def test_optional_download_returns_none_only_for_404() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/missing":
+            return httpx.Response(404, json={"message": PRIVATE_BODY})
+        if request.url.path == "/gone":
+            return httpx.Response(410)
+        return httpx.Response(200, content=b"{}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        missing = await download_optional_bytes(
+            client,
+            "https://api.github.com/missing",
+            limits=InstallerLimits(),
+            maximum_bytes=100,
+        )
+        present = await download_optional_bytes(
+            client,
+            "https://api.github.com/present",
+            limits=InstallerLimits(),
+            maximum_bytes=100,
+        )
+        with pytest.raises(InstallerError) as gone:
+            await download_optional_bytes(
+                client,
+                "https://api.github.com/gone",
+                limits=InstallerLimits(),
+                maximum_bytes=100,
+            )
+        with pytest.raises(InstallerError) as required:
+            await download_bytes(
+                client,
+                "https://api.github.com/missing",
+                limits=InstallerLimits(),
+                maximum_bytes=100,
+            )
+
+    assert missing is None
+    assert present == b"{}"
+    assert gone.value.code is InstallerErrorCode.DOWNLOAD_FAILED
+    assert required.value.code is InstallerErrorCode.DOWNLOAD_FAILED
+    assert required.value.retryable is False

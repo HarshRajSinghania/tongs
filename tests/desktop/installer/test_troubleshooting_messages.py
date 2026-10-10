@@ -12,6 +12,9 @@ INSTALLER_MODULES = (
     ROOT / "src/tongs/desktop/installer/activation.py",
     ROOT / "src/tongs/desktop/installer/launcher.py",
     ROOT / "src/tongs/desktop/installer/commands.py",
+    ROOT / "src/tongs/desktop/installer/download.py",
+    ROOT / "src/tongs/desktop/installer/metadata.py",
+    ROOT / "src/tongs/desktop/installer/menu.py",
 )
 
 

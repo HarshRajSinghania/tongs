@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -25,6 +27,9 @@ _ALLOWED_DOWNLOAD_HOSTS = frozenset(
         "github-releases.githubusercontent.com",
     }
 )
+_RATE_LIMIT_MESSAGE = "GitHub's anonymous API rate limit was reached."
+_MAX_RATE_LIMIT_WAIT = timedelta(days=1)
+_MAX_HEADER_DIGITS = 12
 
 
 async def download_asset_bytes(
@@ -68,6 +73,52 @@ async def download_bytes(
     accept: str = "application/vnd.github+json",
 ) -> bytes:
     """Stream one HTTPS response with explicit redirects, size and digest bounds."""
+    content = await _download(
+        client,
+        url,
+        limits=limits,
+        maximum_bytes=maximum_bytes,
+        expected_byte_count=expected_byte_count,
+        expected_sha256=expected_sha256,
+        accept=accept,
+        allow_missing=False,
+    )
+    if content is None:
+        raise AssertionError("a required download reported a missing resource")
+    return content
+
+
+async def download_optional_bytes(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    limits: InstallerLimits,
+    maximum_bytes: int,
+) -> bytes | None:
+    """Stream one bounded JSON response, or return None when its source answers 404."""
+    return await _download(
+        client,
+        url,
+        limits=limits,
+        maximum_bytes=maximum_bytes,
+        expected_byte_count=None,
+        expected_sha256=None,
+        accept="application/vnd.github+json",
+        allow_missing=True,
+    )
+
+
+async def _download(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    limits: InstallerLimits,
+    maximum_bytes: int,
+    expected_byte_count: int | None,
+    expected_sha256: str | None,
+    accept: str,
+    allow_missing: bool,
+) -> bytes | None:
     if maximum_bytes <= 0:
         raise InstallerError(
             InstallerErrorCode.LIMIT_EXCEEDED,
@@ -104,6 +155,10 @@ async def download_bytes(
                     )
                 current_url = urljoin(current_url, location)
                 continue
+            if response.status_code == 404 and allow_missing:
+                return None
+            if _is_rate_limited(response):
+                raise _rate_limit_error(response.headers)
             if response.status_code != 200:
                 _download_error("Desktop release download was rejected by its source.")
             content_encoding = response.headers.get("content-encoding", "identity")
@@ -135,6 +190,80 @@ async def download_bytes(
             if response is not None:
                 await response.aclose()
     raise AssertionError("redirect loop did not return")
+
+
+def _is_rate_limited(response: httpx.Response) -> bool:
+    if response.status_code == 429:
+        return True
+    if response.status_code != 403:
+        return False
+    remaining = response.headers.get("x-ratelimit-remaining")
+    return (
+        remaining is not None and remaining.strip() == "0"
+    ) or "retry-after" in response.headers
+
+
+def _rate_limit_error(headers: httpx.Headers) -> InstallerError:
+    """Name the local reset time from bounded headers, never the response body."""
+    now = _utc_now()
+    reset = _rate_limit_reset(headers, now)
+    if reset is None:
+        guidance = "Wait a few minutes, then retry."
+    else:
+        local = max(reset, now).astimezone()
+        guidance = f"Retry after {local.strftime('%Y-%m-%d %H:%M:%S %Z').strip()}."
+    return InstallerError(
+        InstallerErrorCode.DOWNLOAD_FAILED,
+        f"{_RATE_LIMIT_MESSAGE} {guidance}",
+        retryable=True,
+    )
+
+
+def _rate_limit_reset(headers: httpx.Headers, now: datetime) -> datetime | None:
+    reset: datetime | None = None
+    retry_after = headers.get("retry-after")
+    if retry_after is not None:
+        reset = _retry_after_time(retry_after.strip(), now)
+    if reset is None:
+        epoch = headers.get("x-ratelimit-reset")
+        if epoch is not None and _is_bounded_digits(epoch.strip()):
+            try:
+                reset = datetime.fromtimestamp(int(epoch.strip()), UTC)
+            except (OverflowError, OSError, ValueError):
+                reset = None
+    if reset is None or reset > now + _MAX_RATE_LIMIT_WAIT:
+        return None
+    return reset
+
+
+def _retry_after_time(value: str, now: datetime) -> datetime | None:
+    if _is_bounded_digits(value):
+        seconds = int(value)
+        if seconds > _MAX_RATE_LIMIT_WAIT.total_seconds():
+            return None
+        return now + timedelta(seconds=seconds)
+    if not value.isascii() or len(value) > 64:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
+def _is_bounded_digits(value: str) -> bool:
+    return (
+        bool(value)
+        and value.isascii()
+        and value.isdigit()
+        and len(value) <= _MAX_HEADER_DIGITS
+    )
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 async def _consume_response(
@@ -214,4 +343,9 @@ def _download_error(message: str) -> None:
     raise InstallerError(InstallerErrorCode.DOWNLOAD_FAILED, message)
 
 
-__all__ = ["GITHUB_API_ORIGIN", "download_asset_bytes", "download_bytes"]
+__all__ = [
+    "GITHUB_API_ORIGIN",
+    "download_asset_bytes",
+    "download_bytes",
+    "download_optional_bytes",
+]
