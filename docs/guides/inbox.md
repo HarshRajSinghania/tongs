@@ -83,7 +83,8 @@ Press ++ctrl+r++ to reload the current tab from the forge. All Open normally
 reads through the local cache, which keeps each list for `mr_list_ttl` seconds
 (60 by default); a refresh skips that cache and stores the new list in its
 place. Retrying or cancelling a pipeline also drops that repository's cached
-list, so its CI status is read again. A refresh also retries a sign-in that
-failed a moment ago, so a fixed token works without waiting. The desktop app's
-Refresh reviews button does the same. In the repo list, ++ctrl+r++ scans the
+list, so its CI status is read again. A failed sign-in is otherwise
+remembered for a minute; a refresh retries it once it is a few seconds old, so
+a fixed token works without waiting. The desktop app's Refresh reviews button
+does the same. In the repo list, ++ctrl+r++ scans the
 scan root again.

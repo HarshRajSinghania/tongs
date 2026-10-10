@@ -1026,7 +1026,9 @@ class ApplicationSession:
             # forget.
             return
         for hostname in hostnames:
-            forget(hostname)
+            # A refresh keeps a running lookup and a failure from moments ago,
+            # so the per-repository requests of one refresh share one lookup.
+            forget(hostname, refresh=True)
 
     async def _prune_cache(self) -> None:
         """Drop expired cache entries once per session start, best effort."""

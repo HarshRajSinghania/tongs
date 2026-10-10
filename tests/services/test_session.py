@@ -48,6 +48,7 @@ from tongs.services import (
     PipelineMutationTarget,
     PipelineRef,
     RepositoryRef,
+    RepositorySnapshot,
     RetryPipelineCommand,
     ReviewActionTarget,
     ReviewQuery,
@@ -1913,9 +1914,13 @@ class ForgettingRegistry(FakeRegistry):
     def __init__(self, clients: dict[str, object] | None = None) -> None:
         super().__init__(clients)
         self.forgotten: list[str | None] = []
+        self.refresh_modes: list[bool] = []
 
-    def forget_auth_failures(self, hostname: str | None = None) -> None:
+    def forget_auth_failures(
+        self, hostname: str | None = None, *, refresh: bool = False
+    ) -> None:
         self.forgotten.append(hostname)
+        self.refresh_modes.append(refresh)
 
 
 class PruningCache(FakeCache):
@@ -2005,11 +2010,14 @@ class TestExplicitRefresh:
         registry.forgotten.clear()
         await session.list_reviews(ReviewQuery(ReviewScope.MY_MRS, fresh=True))
         assert registry.forgotten == ["github.com", "gitlab.com"]
+        # A refresh never orphans a running lookup or drops a fresh failure.
+        assert registry.refresh_modes == [True, True, True]
         await session.close()
 
     @pytest.mark.asyncio
     async def test_fresh_read_looks_up_a_failed_sign_in_again(self) -> None:
-        registry = ForgeRegistry(clock=lambda: 0.0)
+        now = [0.0]
+        registry = ForgeRegistry(clock=lambda: now[0])
         session = await start_session(cast(FakeRegistry, registry))
         query = ReviewQuery(ReviewScope.MY_REVIEWS, hostnames=("github.com",))
         with patch(
@@ -2020,10 +2028,81 @@ class TestExplicitRefresh:
             remembered = await session.list_reviews(query)
             assert resolved.call_count == 1
 
+            # The user fixes their sign-in and refreshes well inside the
+            # failure's minute.
+            now[0] = 10.0
             refreshed = await session.list_reviews(replace(query, fresh=True))
             assert resolved.call_count == 2
 
         for page in (first, remembered, refreshed):
+            assert [failure.code for failure in page.failures] == [
+                ServiceErrorCode.AUTHENTICATION_FAILED
+            ]
+        await session.close()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_fresh_reads_share_one_sign_in_lookup(
+        self, tmp_path: Path
+    ) -> None:
+        # The desktop Refresh button sends one fresh read per repository, up
+        # to eight at a time, and keeps going after a repository fails.
+        repos = [make_repo(tmp_path, project=f"acme/repo{i}") for i in range(12)]
+        now = [0.0]
+        registry = ForgeRegistry(clock=lambda: now[0])
+        session = await start_session(
+            cast(FakeRegistry, registry), discoverer=lambda *args, **kwargs: repos
+        )
+        snapshots = await session.discover_repositories()
+        assert len(snapshots) == 12
+        started = threading.Event()
+        release = threading.Event()
+
+        def resolve(_hostname: str, _forge_type: ForgeType) -> str:
+            started.set()
+            assert release.wait(10)
+            raise AuthError("No credentials found for github.com")
+
+        def fresh_read(snapshot: RepositorySnapshot) -> ReviewQuery:
+            return ReviewQuery(
+                ReviewScope.ALL_OPEN, repository=snapshot.ref, paged=True, fresh=True
+            )
+
+        with patch(
+            "tongs.forges.registry.resolve_token", side_effect=resolve
+        ) as resolved:
+            release.set()
+            await session.list_reviews(replace(fresh_read(snapshots[0]), fresh=False))
+            assert resolved.call_count == 1
+
+            # Signed out and refreshing: the burst shares one new lookup.
+            now[0] = 30.0
+            started.clear()
+            release.clear()
+            burst = asyncio.gather(
+                *(session.list_reviews(fresh_read(s)) for s in snapshots[:8])
+            )
+            assert await asyncio.to_thread(started.wait, 10)
+            await asyncio.sleep(0.05)
+            release.set()
+            pages = list(await asyncio.wait_for(burst, 10))
+            assert resolved.call_count == 2
+
+            # The rest of the same refresh reuses the failure it just saw.
+            pages.extend(
+                await asyncio.gather(
+                    *(session.list_reviews(fresh_read(s)) for s in snapshots[8:])
+                )
+            )
+            assert resolved.call_count == 2
+
+            # A later refresh looks again.
+            now[0] = 40.0
+            pages.append(await session.list_reviews(fresh_read(snapshots[0])))
+            assert resolved.call_count == 3
+
+        assert len(pages) == 13
+        for page in pages:
+            assert page.items == ()
             assert [failure.code for failure in page.failures] == [
                 ServiceErrorCode.AUTHENTICATION_FAILED
             ]

@@ -28,6 +28,10 @@ def _gitlab_api_base(hostname: str) -> str:
 #: How long a failed token lookup for a host is reused before it is retried.
 AUTH_FAILURE_TTL_SECONDS = 60.0
 
+#: How long a failed token lookup is kept even by a refresh, so the requests
+#: of one refresh share a single new lookup.
+AUTH_RETRY_GRACE_SECONDS = 5.0
+
 
 class ForgeRegistry:
     """Maps hostnames to authenticated ForgeClient instances.
@@ -38,7 +42,8 @@ class ForgeRegistry:
     every client, call path and caller of this registry; ``None`` leaves them
     unbounded. Token lookups run in a worker thread, one at a time per host,
     and a failed lookup is reused for ``auth_failure_ttl`` seconds of
-    ``clock`` time before the host is looked up again.
+    ``clock`` time before the host is looked up again. A refresh can retry it
+    sooner, but never within ``auth_retry_grace`` seconds of the failure.
     """
 
     def __init__(
@@ -52,6 +57,7 @@ class ForgeRegistry:
         *,
         max_parallel: int | None = None,
         auth_failure_ttl: float = AUTH_FAILURE_TTL_SECONDS,
+        auth_retry_grace: float = AUTH_RETRY_GRACE_SECONDS,
         clock: Callable[[], float] = time.monotonic,
     ):
         if max_parallel is not None and max_parallel < 1:
@@ -64,6 +70,7 @@ class ForgeRegistry:
         self._diff_ttl = diff_ttl
         self._max_parallel = max_parallel
         self._auth_failure_ttl = auth_failure_ttl
+        self._auth_retry_grace = auth_retry_grace
         self._clock = clock
         self._clients: dict[str, ForgeClient] = {}
         self._hosts: dict[str, ForgeHost] = {}
@@ -144,13 +151,29 @@ class ForgeRegistry:
         self._clients[hostname] = client
         return client
 
-    def forget_auth_failures(self, hostname: str | None = None) -> None:
+    def forget_auth_failures(
+        self, hostname: str | None = None, *, refresh: bool = False
+    ) -> None:
         """Drop remembered token lookup failures so the next access looks again.
 
         With ``hostname`` only that host is forgotten; otherwise every host is.
         A lookup still running for a forgotten host no longer records its
         result, and the next access starts a new one.
+
+        With ``refresh``, as for a user's explicit refresh, a lookup still
+        running stays shared and a failure recorded less than
+        ``auth_retry_grace`` seconds ago is kept. The many concurrent requests
+        of one refresh then share a single new lookup per host instead of each
+        starting its own.
         """
+        if refresh:
+            now = self._clock()
+            hostnames = list(self._auth_failures) if hostname is None else [hostname]
+            for name in hostnames:
+                failure = self._auth_failures.get(name)
+                if failure is not None and now - failure[0] >= self._auth_retry_grace:
+                    del self._auth_failures[name]
+            return
         if hostname is None:
             self._auth_failures.clear()
             self._token_lookups.clear()
