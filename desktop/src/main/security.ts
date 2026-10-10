@@ -43,7 +43,7 @@ export function assertParams(method: string, value: unknown): asserts value is J
     "reviews.get": { required: ["review"] }, "discussions.list": { required: ["review"] },
     "reviews.ci_status": { required: ["review"], optional: ["fresh"] },
     "commits.list": { required: ["review"] }, "jobs.list": { required: ["pipeline"] },
-    "diff.open": { required: ["review"], optional: ["layout", "max_items"] },
+    "diff.open": { required: ["review"], optional: ["layout", "max_items", "from_snapshot"] },
     "logs.open": { required: ["job"], optional: ["max_items"] },
     "diff.page": { required: ["snapshot", "resource", "cursor"], optional: ["max_items"] },
     "discussions.page": { required: ["snapshot", "resource", "cursor"], optional: ["max_items"] },
@@ -62,6 +62,9 @@ export function assertParams(method: string, value: unknown): asserts value is J
     if (method === "reviews.list" && key === "cursor") {
       // An opaque cursor the service sealed; the service rejects forged ones.
       if (item !== null && (typeof item !== "string" || !/^[A-Za-z0-9._-]{1,64}$/.test(item))) throw new Error("Invalid desktop cursor parameter");
+    } else if (method === "diff.open" && key === "from_snapshot") {
+      // The snapshot id a diff open issued, for a layout switch that reuses it.
+      if (typeof item !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(item)) throw new Error("Invalid desktop snapshot parameter");
     } else if ((method === "reviews.list" || method === "reviews.ci_status") && key === "fresh") {
       // An explicit refresh that reads past the service's list cache.
       if (typeof item !== "boolean") throw new Error("Invalid desktop boolean parameter");

@@ -29,6 +29,11 @@ test("runtime parameter boundary rejects unknown, malformed, and oversized value
   assert.throws(() => assertParams("reviews.list", { scope: "all_open", surprise: true }));
   assert.throws(() => assertParams("reviews.list", { scope: "all_open", surprise: "text" }), /Invalid desktop parameter fields/);
   assert.throws(() => assertParams("diff.open", { layout: "split" }), /Invalid desktop parameter fields/);
+  // A layout switch names the open snapshot; only an opaque snapshot id passes.
+  assertParams("diff.open", { review: "review", layout: "split", from_snapshot: "Ab_9-xY".padEnd(32, "z") });
+  for (const from_snapshot of ["", "x".repeat(65), "snap shot", "../s", 7, null, true])
+    assert.throws(() => assertParams("diff.open", { review: "review", from_snapshot }), /Invalid desktop snapshot parameter/);
+  assert.throws(() => assertParams("diff.page", { snapshot: "s", resource: "r", cursor: 0, from_snapshot: "s" }), /Invalid desktop parameter fields/);
   assert.throws(() => assertParams("diff.page", { snapshot: "s", resource: "r", cursor: -1 }));
   assert.throws(() => assertParams("reviews.list", { scope: "all_open", per_page: 101 }));
   assert.throws(() => assertParams("reviews.list", { scope: "everything" }));
