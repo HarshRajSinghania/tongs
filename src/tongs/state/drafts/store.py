@@ -291,7 +291,8 @@ def _anchor_from_data(data: object) -> InlineAnchor:
         context_fingerprint=cast(str, values["context_fingerprint"]),
         start_line=cast(int | None, values.get("start_line")),
         start_side=DiffSide(cast(str, start_side)) if start_side else None,
-        stale=cast(bool, values.get("stale", False)),
+        # The stored stale flag is ignored: staleness is derived by comparing
+        # revisions, and older tongs versions still read the flag they wrote.
     )
 
 
@@ -1530,22 +1531,56 @@ class DraftStore:
             return None
 
     @_serialized
-    async def list_recovery_attempts(self) -> tuple[SubmissionAttempt, ...]:
-        """Return unresolved unknown attempts requiring an explicit user decision."""
+    async def list_recovery_attempts(
+        self, *, include_owned: bool = False
+    ) -> tuple[SubmissionAttempt, ...]:
+        """Return unresolved unknown attempts requiring an explicit user decision.
+
+        With ``include_owned`` the result also holds the active submitting or
+        partial attempts whose ownership lock this process holds, so a caller
+        can offer an owned paused attempt again after it lost its own record
+        of it. Ownership is process-local, so another process's attempts are
+        never included.
+        """
+        owned = (
+            tuple(str(attempt_id) for attempt_id in self._held_attempt_locks)
+            if include_owned
+            else ()
+        )
         db = self._connection()
         try:
             await db.execute("BEGIN")
-            rows = await (
-                await db.execute(
-                    """
+            rows = list(
+                await (
+                    await db.execute(
+                        """
                 SELECT a.id FROM submission_attempts a
                 JOIN drafts d ON d.active_attempt_id = a.id
                 WHERE a.state = ? AND d.state = ?
                 ORDER BY a.updated_at, a.id
                 """,
-                    (DraftState.UNKNOWN.value, DraftState.UNKNOWN.value),
-                )
-            ).fetchall()
+                        (DraftState.UNKNOWN.value, DraftState.UNKNOWN.value),
+                    )
+                ).fetchall()
+            )
+            if owned:
+                placeholders = ", ".join("?" for _ in owned)
+                rows += await (
+                    await db.execute(
+                        f"""
+                    SELECT a.id FROM submission_attempts a
+                    JOIN drafts d ON d.active_attempt_id = a.id
+                    WHERE a.state IN (?, ?) AND d.state = a.state
+                    AND a.id IN ({placeholders})
+                    ORDER BY a.updated_at, a.id
+                    """,
+                        (
+                            DraftState.SUBMITTING.value,
+                            DraftState.PARTIAL.value,
+                            *owned,
+                        ),
+                    )
+                ).fetchall()
             attempts = []
             for row in rows:
                 attempts.append(await self._attempt_in_transaction(db, UUID(row[0])))

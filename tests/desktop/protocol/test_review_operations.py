@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -31,7 +32,7 @@ from tongs.desktop.protocol.review_operations import (
 )
 from tongs.desktop.protocol.server import DesktopSidecarServer, RequestContext
 from tongs.desktop.protocol.state import HandleKind, HandleRegistry
-from tongs.errors import AuthError, NetworkError
+from tongs.errors import AuthError, NetworkError, ValidationError
 from tongs.forges.base import ForgeClient
 from tongs.forges.github import GitHubClient
 from tongs.forges.models import (
@@ -73,6 +74,7 @@ from tongs.services import session as session_module
 from tongs.state.drafts import (
     DraftContent,
     DraftStore,
+    DraftVerdict,
     GeneralDraftComment,
     ReconciliationResolution,
     context_fingerprint,
@@ -970,6 +972,127 @@ async def test_reconnect_rediscovers_unknown_submission_without_attempt_id(
     assert recovered_attempt["attempt_id"] == str(attempt.id)
     assert recovered_attempt["outcome"] == "unknown"
     assert status == recovered_attempt
+
+
+@pytest.mark.asyncio
+async def test_persisted_stale_anchor_with_matching_revision_is_fresh(
+    setup,
+) -> None:
+    operations, session, handles = setup
+    created = await operations.create_draft(
+        {
+            "review": handles["review"],
+            "revision": _revision_wire(),
+            "content": _draft_content(),
+        },
+        _context(),
+    )
+    # A row written by an older tongs, or echoed back by a client, carries a
+    # sticky stale flag. Only the revisions decide staleness now.
+    with sqlite3.connect(session.drafts.db_path) as db:
+        (raw,) = db.execute(
+            "SELECT comments_json FROM drafts WHERE id = ?", (created["id"],)
+        ).fetchone()
+        comments = json.loads(raw)
+        comments[0]["anchor"]["stale"] = True
+        db.execute(
+            "UPDATE drafts SET comments_json = ? WHERE id = ?",
+            (json.dumps(comments), created["id"]),
+        )
+
+    loaded = await operations.get_draft(
+        {"review": handles["review"], "draft_id": created["id"]}, _context()
+    )
+    echoed = cast(list[JsonObject], json.loads(json.dumps(loaded["comments"])))
+    cast(JsonObject, echoed[0]["anchor"])["stale"] = True
+    saved = await operations.save_draft(
+        {
+            "review": handles["review"],
+            "draft_id": created["id"],
+            "expected_version": loaded["version"],
+            "content": {
+                "body": loaded["body"],
+                "verdict": loaded["verdict"],
+                "comments": echoed,
+            },
+        },
+        _context(),
+    )
+    listed = await operations.list_drafts({"review": handles["review"]}, _context())
+    started = await operations.start_submission(
+        {
+            "review": handles["review"],
+            "draft_id": created["id"],
+            "expected_version": saved["version"],
+        },
+        _context(),
+    )
+
+    assert loaded["comments"][0]["anchor"]["stale"] is False
+    assert saved["comments"][0]["anchor"]["stale"] is False
+    assert listed["drafts"][0]["comments"][0]["anchor"]["stale"] is False
+    assert started["outcome"] == "submitted"
+    session.client.submit_review.assert_awaited_once()
+
+    session.snapshots[REVIEW] = _snapshot(revision=CHANGED_REVISION)
+    changed = await operations.get_draft(
+        {"review": handles["review"], "draft_id": created["id"]}, _context()
+    )
+    assert changed["comments"][0]["anchor"]["stale"] is True
+
+
+@pytest.mark.asyncio
+async def test_submission_list_includes_an_owned_paused_attempt(setup) -> None:
+    operations, session, handles = setup
+    draft = await session.drafts.create_draft(
+        REVIEW, REVISION, DraftContent(body="summary", verdict=DraftVerdict.APPROVE)
+    )
+    session.client.submit_review.side_effect = ValidationError("Validation failed: 422")
+
+    started = await operations.start_submission(
+        {
+            "review": handles["review"],
+            "draft_id": str(draft.id),
+            "expected_version": draft.version,
+        },
+        _context(),
+    )
+    # A drawer remount has no record of the attempt it started; the list is
+    # how it finds the owned paused attempt again.
+    listed = await operations.list_submissions(
+        {"review": handles["review"], "max_items": 10}, _context()
+    )
+    other = await operations.list_submissions(
+        {"review": handles["other"], "max_items": 10}, _context()
+    )
+    status = await operations.submission_status(
+        {"review": handles["review"], "attempt_id": started["attempt_id"]},
+        _context(),
+    )
+
+    assert started["outcome"] == "paused"
+    assert session.drafts.holds_attempt(UUID(started["attempt_id"]))
+    assert [item["attempt_id"] for item in listed["attempts"]] == [
+        started["attempt_id"]
+    ]
+    assert listed["attempts"] == [status]
+    assert listed["attempts"][0]["outcome"] == "paused"
+    assert other["attempts"] == []
+
+    editable = await operations.reconcile_submission(
+        {
+            "review": handles["review"],
+            "attempt_id": started["attempt_id"],
+            "resolution": ReconciliationResolution.RETURN_EDITABLE.value,
+        },
+        _context(),
+    )
+    after = await operations.list_submissions(
+        {"review": handles["review"], "max_items": 10}, _context()
+    )
+    assert editable["outcome"] == "editable"
+    assert after["attempts"] == []
+    assert session.client.submit_review.await_count == 1
 
 
 @pytest.mark.asyncio

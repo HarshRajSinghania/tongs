@@ -480,6 +480,22 @@ export function useReviewDrawer(
         ...items.filter((item) => item.attempt_id !== progress.attempt_id),
       ]);
     } catch (reason) {
+      // A refused start can still have locked and released the draft, which
+      // moves its stored version on, so the stored draft is read and adopted
+      // before anything else is attempted, as a continued submission does.
+      const stored = await recoverDraft(bridge, review, draft.id);
+      if (stored) {
+        try {
+          apply((state) => adoptDraft(state, stored));
+          setDraftCandidates((items) => [
+            stored,
+            ...items.filter((item) => item.id !== stored.id),
+          ]);
+        } catch {
+          // Local edits made meanwhile keep the held draft; the next save
+          // reports the conflict.
+        }
+      }
       const recovered = await recoverLatestSubmission(
         bridge,
         review,

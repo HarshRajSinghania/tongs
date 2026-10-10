@@ -775,15 +775,20 @@ export function failSubmission(
   });
 }
 
+/**
+ * Whether the held draft may be submitted. Staleness is derived from
+ * revisions, so an anchor carrying a stale flag from an earlier assessment
+ * does not block a draft whose revision, and every anchor's, matches the
+ * latest observed one; the sidecar checks the revision again before sending.
+ */
 export function canStartSubmission(state: ReviewWorkflowState): boolean {
+  const current = state.displayed.latestObservedRevision;
   return Boolean(
     state.draft.remote?.state === "editable" &&
-      sameRevision(
-        state.draft.remote.revision,
-        state.displayed.latestObservedRevision,
-      ) &&
-      !state.draft.remote.comments.some(
-        (comment) => comment.kind === "inline" && comment.anchor.stale,
+      sameRevision(state.draft.remote.revision, current) &&
+      state.draft.remote.comments.every(
+        (comment) =>
+          comment.kind !== "inline" || sameRevision(comment.anchor.revision, current),
       ) &&
       !state.draft.dirty &&
       !state.draft.conflict &&

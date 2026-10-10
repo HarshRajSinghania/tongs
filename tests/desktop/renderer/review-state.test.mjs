@@ -392,6 +392,44 @@ test("old-revision drafts load intact and stay blocked across either head-change
   assert.equal(canCaptureDraftInline(changedAfter), false);
 });
 
+test("a stale flag does not block a draft whose revision and anchors match", () => {
+  const nextRevision = { ...revision, head_sha: "new-head" };
+  const anchor = (anchorRevision, stale) => ({
+    revision: anchorRevision,
+    old_path: "old.py",
+    new_path: "new.py",
+    old_line: null,
+    new_line: 2,
+    side: "new",
+    context_fingerprint: "a".repeat(64),
+    start_line: null,
+    start_side: null,
+    stale,
+  });
+  const flagged = {
+    ...draft(3, "flagged body"),
+    comments: [{
+      id: "33333333-3333-4333-8333-333333333333",
+      kind: "inline",
+      body: "flagged inline",
+      anchor: anchor(revision, true),
+    }],
+  };
+
+  const matching = adoptDraft(createReviewWorkflowState(review, revision), flagged);
+  const observedLater = observeReviewRevision(matching, nextRevision);
+  const mismatchedAnchor = adoptDraft(createReviewWorkflowState(review, revision), {
+    ...flagged,
+    comments: [{ ...flagged.comments[0], anchor: anchor(nextRevision, false) }],
+  });
+
+  assert.deepEqual(
+    [matching, observedLater, mismatchedAnchor].map(canStartSubmission),
+    [true, false, false],
+  );
+  assert.equal(beginSubmission(matching, "start").submission.pending.frozenVersion, 3);
+});
+
 test("explicit current-revision fork copies only portable content and preserves stale draft", () => {
   const nextRevision = { ...revision, head_sha: "new-head" };
   const stale = {
