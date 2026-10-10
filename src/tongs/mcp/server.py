@@ -17,6 +17,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from tongs.config import load_config
 from tongs.errors import ForgeError
 from tongs.forges.base import ForgeClient
+from tongs.forges.models import MRState
 from tongs.forges.registry import ForgeRegistry
 from tongs.scanner.repo import ForgeType
 from tongs.services.errors import translate_error
@@ -89,6 +90,12 @@ async def _client_for(repo_path: str) -> tuple[ForgeClient, str]:
     return client, path
 
 
+def _is_github(repo_path: str) -> bool:
+    """Whether an admitted repo_path names a GitHub host."""
+    host = _get_registry().get_host(repo_path.split("/", 1)[0])
+    return host is not None and host.forge_type == ForgeType.GITHUB
+
+
 @mcp.tool()
 async def list_mrs(repo_path: str, state: str = "open") -> list[dict]:
     """List merge requests for a repository.
@@ -99,7 +106,13 @@ async def list_mrs(repo_path: str, state: str = "open") -> list[dict]:
     """
     with _redacted_forge_errors("list_mrs"):
         client, path = await _client_for(repo_path)
-        mrs = await client.list_mrs(path, state=state)
+        if state == "merged" and _is_github(repo_path):
+            # GitHub has no merged filter: a merged pull request is a closed
+            # one with merged_at set, which the client reads as MERGED.
+            closed = await client.list_mrs(path, state="closed")
+            mrs = [mr for mr in closed if mr.state is MRState.MERGED]
+        else:
+            mrs = await client.list_mrs(path, state=state)
         return [
             {
                 "number": mr.number,

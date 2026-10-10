@@ -146,6 +146,25 @@ def _changes_overflowed(value: object) -> bool:
     return bool(plus) and not rest and count.isdecimal()
 
 
+def _discussion_resolution(discussion: dict, notes: list) -> tuple[bool, bool]:
+    """Return whether a discussion is resolvable and whether it is resolved.
+
+    GitLab reports ``resolvable`` and ``resolved`` on each note, not on the
+    discussion.  A standalone comment (``individual_note``) cannot be
+    resolved, and a thread is resolved once every resolvable note is.
+    """
+    if discussion.get("individual_note") is True:
+        return False, False
+    resolvable = [
+        note
+        for note in notes
+        if isinstance(note, dict) and note.get("resolvable") is True
+    ]
+    if not resolvable:
+        return False, False
+    return True, all(note.get("resolved") is True for note in resolvable)
+
+
 def _parse_user(data: dict | None) -> User:
     if not data:
         return User(username="unknown")
@@ -373,13 +392,14 @@ class GitLabClient(ForgeClient):
                 replies=replies,
             )
             is_inline = root.get("position") is not None
+            resolvable, is_resolved = _discussion_resolution(d, notes)
             discussions.append(
                 Discussion(
                     id=d["id"],
                     is_inline=is_inline,
                     root_comment=root_comment,
-                    is_resolved=d.get("resolved", False),
-                    resolvable=d.get("resolvable", True),
+                    is_resolved=is_resolved,
+                    resolvable=resolvable,
                 )
             )
         return discussions

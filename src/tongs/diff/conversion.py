@@ -166,12 +166,15 @@ def _convert_change(change: Mapping[str, object]) -> DiffFile:
     if not is_binary and withheld_no_lines and _has_binary_suffix(path):
         is_binary = True
 
+    # A rename that also changes the file mode is not rename-only.  GitLab
+    # sends it with an empty patch body like a plain rename, so the mode change
+    # is what it reports about the file, and the rename stays in the paths.
     is_mode_only = (
         mode_only_value is True
         or (
             mode_only_value is None
             and _modes_differ(change)
-            and status == FileStatus.MODIFIED
+            and status in (FileStatus.MODIFIED, FileStatus.RENAMED)
         )
     ) and not has_hunks
 

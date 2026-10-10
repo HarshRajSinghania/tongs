@@ -508,3 +508,42 @@ def test_change_without_new_path_or_filename_falls_back_to_old_path() -> None:
 
     assert file.old_path == "src/legacy.py"
     assert file.new_path == "src/legacy.py"
+
+
+def test_gitlab_rename_with_mode_change_is_not_rename_only() -> None:
+    renamed_chmod, renamed_chmod_with_content = convert_forge_changes(
+        (
+            {
+                "old_path": "bin/old_tool.sh",
+                "new_path": "bin/tool.sh",
+                "renamed_file": True,
+                "a_mode": "100644",
+                "b_mode": "100755",
+                "diff": "",
+            },
+            {
+                "old_path": "bin/old_run.sh",
+                "new_path": "bin/run.sh",
+                "renamed_file": True,
+                "a_mode": "100644",
+                "b_mode": "100755",
+                "diff": "@@ -1 +1 @@\n-old\n+new\n",
+            },
+        )
+    )
+
+    assert renamed_chmod.status is FileStatus.RENAMED
+    assert renamed_chmod.is_rename_only is False
+    assert renamed_chmod.is_mode_only is True
+    assert renamed_chmod.is_empty is False
+    assert renamed_chmod.is_unavailable is False
+    assert renamed_chmod.is_metadata_only is True
+    assert (renamed_chmod.old_path, renamed_chmod.new_path) == (
+        "bin/old_tool.sh",
+        "bin/tool.sh",
+    )
+
+    assert renamed_chmod_with_content.hunks
+    assert renamed_chmod_with_content.is_rename_only is False
+    assert renamed_chmod_with_content.is_mode_only is False
+    assert renamed_chmod_with_content.is_metadata_only is False
