@@ -1,8 +1,10 @@
 import {
   Component,
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ErrorInfo,
   type ReactNode,
@@ -17,11 +19,13 @@ import {
   type FeatureContext,
   type InlineAnchorSelection,
 } from "./core/navigation.js";
+import { safeError } from "./core/presentation.js";
 import { QueryCoordinator } from "./core/query.js";
 import {
   ServiceNotices,
   ServiceStatusLine,
   ServiceStatusModel,
+  isResyncEvent,
 } from "./core/service-status.js";
 import { createDiffFeature } from "./features/diff/index.js";
 import { createInboxFeature } from "./features/inbox/index.js";
@@ -67,6 +71,10 @@ function App(): ReactNode {
     [],
   );
   const [repositoriesReady, setRepositoriesReady] = useState(false);
+  const [repositoriesError, setRepositoriesError] = useState<string | null>(
+    null,
+  );
+  const discoveryRetry = useRef<(() => void) | null>(null);
   const [repositoryGeneration, setRepositoryGeneration] = useState(0);
   const [inlineAnchor, setInlineAnchor] =
     useState<InlineAnchorSelection | null>(null);
@@ -76,17 +84,16 @@ function App(): ReactNode {
   useEffect(
     () =>
       bridge.onEvent((event) => {
-        if (event.name === "service.changed" && isRepositoryChange(event.data))
-          return;
-        if (
-          event.name === "protocol.resync_required" ||
-          event.name === "service.changed"
-        ) {
+        if (isResyncEvent(event.name, event.data))
           serviceStatus.updatesAvailable();
-        }
       }),
     [],
   );
+  // Opening another view reads it afresh, so the updates warning has done its
+  // job once the route changes.
+  useEffect(() => {
+    serviceStatus.clearUpdates();
+  }, [route]);
   useEffect(() => {
     pluginsFeature.runtime.start();
     return () => {
@@ -132,6 +139,14 @@ function App(): ReactNode {
       setRouteNotice(null);
     }
   }, [navigation]);
+  const onDiscoveryError = useCallback(
+    (message: string | null, retry: () => void) => {
+      discoveryRetry.current = retry;
+      setRepositoriesError(message);
+    },
+    [],
+  );
+  const retryDiscovery = useCallback(() => discoveryRetry.current?.(), []);
   const feature = useMemo(() => registry.find(route), [route]);
   const selected = route.kind === "inbox" ? route.repository : undefined;
   const featureContext: FeatureContext = {
@@ -139,6 +154,8 @@ function App(): ReactNode {
     queries,
     repositories,
     repositoriesReady,
+    repositoriesError,
+    retryDiscovery,
     repositoryGeneration,
     reviewPanels: registry.reviewPanels(),
     inlineAnchor,
@@ -188,6 +205,7 @@ function App(): ReactNode {
           selected={selected}
           navigate={navigation}
           onDiscovery={onDiscovery}
+          onDiscoveryError={onDiscoveryError}
           pluginNavigation={pluginsFeature.navigation(
             plugins,
             route,
@@ -221,35 +239,42 @@ function App(): ReactNode {
   );
 }
 
-function isRepositoryChange(value: unknown): boolean {
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    "kind" in value &&
-    value.kind === "repositories_changed"
-  );
-}
-
-class ErrorBoundary extends Component<
+/**
+ * Keeps one view's failure inside the content pane. Try again mounts the view
+ * afresh in place; logging carries only the safe error text, never the raw
+ * error or its component stack.
+ */
+export class ErrorBoundary extends Component<
   { readonly children: ReactNode },
-  { readonly failed: boolean }
+  { readonly failed: boolean; readonly attempt: number }
 > {
-  state = { failed: false };
+  state = { failed: false, attempt: 0 };
   static getDerivedStateFromError(): { readonly failed: boolean } {
     return { failed: true };
   }
-  componentDidCatch(_error: Error, _info: ErrorInfo): void {}
+  componentDidCatch(error: Error, _info: ErrorInfo): void {
+    console.error(safeError(error));
+  }
+  #retry = (): void => {
+    this.setState((current) => ({
+      failed: false,
+      attempt: current.attempt + 1,
+    }));
+  };
   render(): ReactNode {
     return this.state.failed ? (
       <>
         <h1 className="view-title">This view could not be displayed</h1>
         <div className="notice notice-error" role="alert">
-          The local view encountered an error. Choose another repository or
-          review to continue.
+          The local view encountered an error. Try again, or choose another
+          repository or review to continue.
         </div>
+        <button className="button button-secondary" onClick={this.#retry}>
+          Try again
+        </button>
       </>
     ) : (
-      this.props.children
+      <Fragment key={this.state.attempt}>{this.props.children}</Fragment>
     );
   }
 }

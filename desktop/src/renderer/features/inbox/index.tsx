@@ -172,6 +172,8 @@ export function createInboxFeature(): FeatureContribution {
           route={route}
           repositories={context.repositories}
           repositoriesReady={context.repositoriesReady}
+          repositoriesError={context.repositoriesError ?? null}
+          retryDiscovery={context.retryDiscovery}
           repositoryGeneration={context.repositoryGeneration}
           navigate={context.navigate}
         />
@@ -185,6 +187,8 @@ function InboxView({
   route,
   repositories,
   repositoriesReady,
+  repositoriesError,
+  retryDiscovery,
   repositoryGeneration,
   navigate,
 }: {
@@ -193,6 +197,8 @@ function InboxView({
   readonly route: Extract<AppRoute, { kind: "inbox" }>;
   readonly repositories: FeatureParameters["repositories"];
   readonly repositoriesReady: boolean;
+  readonly repositoriesError: string | null;
+  readonly retryDiscovery: (() => void) | undefined;
   readonly repositoryGeneration: number;
   readonly navigate: (route: AppRoute) => void;
 }): ReactNode {
@@ -306,6 +312,8 @@ function InboxView({
         repository={repository}
         repositories={repositories}
         repositoriesReady={repositoriesReady}
+        repositoriesError={repositoriesError}
+        retryDiscovery={retryDiscovery}
         repositoryGeneration={repositoryGeneration}
         reviewScope={reviewScope}
         reviewState={reviewState}
@@ -326,6 +334,8 @@ function InboxResults({
   repository,
   repositories,
   repositoriesReady,
+  repositoriesError,
+  retryDiscovery,
   repositoryGeneration,
   reviewScope,
   reviewState,
@@ -341,6 +351,8 @@ function InboxResults({
   readonly repository: Extract<AppRoute, { kind: "inbox" }>["repository"];
   readonly repositories: FeatureParameters["repositories"];
   readonly repositoriesReady: boolean;
+  readonly repositoriesError: string | null;
+  readonly retryDiscovery: (() => void) | undefined;
   readonly repositoryGeneration: number;
   readonly reviewScope: ReviewScope;
   readonly reviewState: "open" | "closed";
@@ -532,6 +544,9 @@ function InboxResults({
   );
 
   const shown = state.error && !state.value ? null : feeds;
+  // A discovery that failed before any succeeded leaves nothing to read, so the
+  // pane says why and offers the retry instead of waiting for it forever.
+  const discoveryFailed = !repositoriesReady && repositoriesError !== null;
   // With no repositories there is no feed to settle, so the list (and its
   // empty label) is shown once the read itself has finished.
   const listReady =
@@ -549,7 +564,20 @@ function InboxResults({
           {state.loading && state.value ? "Refreshing…" : "Refresh reviews"}
         </button>
       </div>
-      {state.loading && !shown?.some(firstPageArrived) && (
+      {discoveryFailed && (
+        <>
+          <Notice kind="error">{repositoriesError}</Notice>
+          {retryDiscovery && (
+            <button
+              className="button button-secondary discovery-retry"
+              onClick={retryDiscovery}
+            >
+              Retry
+            </button>
+          )}
+        </>
+      )}
+      {!discoveryFailed && state.loading && !shown?.some(firstPageArrived) && (
         <Notice kind="loading">
           {repositoriesReady
             ? "Loading reviews from the local service…"
