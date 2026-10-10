@@ -25,12 +25,27 @@ HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
 FILE_HEADER_RE = re.compile(r"^--- (.+)$")
 FILE_HEADER_NEW_RE = re.compile(r"^\+\+\+ (.+)$")
 
-DIFF_GIT_RE = re.compile(r"^diff --git a/(.+) b/(.+)$")
+# Either name may be written quoted, as git does for a path with a special or
+# non-ASCII character (core.quotePath).
+DIFF_GIT_RE = re.compile(r'^diff --git "?a/(.+) "?b/(.+)$')
 _DIFF_GIT_PREFIX = "diff --git "
 
 # A git file mode such as ``100644``.  Anything else on a mode line is ignored
 # rather than shown, so a header can only ever display octal digits.
 _MODE_RE = re.compile(r"[0-7]{1,7}")
+
+# The C escapes git writes inside a quoted path, besides octal byte escapes.
+_PATH_ESCAPES = {
+    "a": 0x07,
+    "b": 0x08,
+    "t": 0x09,
+    "n": 0x0A,
+    "v": 0x0B,
+    "f": 0x0C,
+    "r": 0x0D,
+    '"': 0x22,
+    "\\": 0x5C,
+}
 
 # Distinct file names whose language lookup is remembered.  Pygments matches a
 # lexer on the base name alone, so the cache key loses nothing.
@@ -129,13 +144,13 @@ def _parse_git_diff_file(
 
         if line.startswith(("rename from ", "copy from ")):
             status = FileStatus.RENAMED
-            moved_from = line.split(" from ", 1)[1]
+            moved_from = unquote_path(line.split(" from ", 1)[1])
             i += 1
             continue
 
         if line.startswith(("rename to ", "copy to ")):
             status = FileStatus.RENAMED
-            moved_to = line.split(" to ", 1)[1]
+            moved_to = unquote_path(line.split(" to ", 1)[1])
             i += 1
             continue
 
@@ -250,7 +265,13 @@ def _git_header_paths(names: str) -> tuple[str, str]:
     git writes as two equal halves; that split is unambiguous and is tried
     first.  Otherwise the last separator is used, and the caller replaces both
     paths with the exact ``rename``/``copy`` or ``---``/``+++`` names.
+
+    A quoted name never holds an unquoted ``"``, so with either name quoted
+    the split is exact.
     """
+    quoted = _split_quoted_names(names)
+    if quoted is not None:
+        return quoted
     prefix = "a/"
     separator = " b/"
     if names.startswith(prefix):
@@ -270,12 +291,79 @@ def _git_header_paths(names: str) -> tuple[str, str]:
     return names, names
 
 
+def _split_quoted_names(names: str) -> tuple[str, str] | None:
+    """Split ``a/<old> b/<new>`` when git quoted either name, else None."""
+    if names.startswith('"'):
+        end = _closing_quote(names)
+        if end is None or names[end + 1 : end + 2] != " ":
+            return None
+        old, new = names[: end + 1], names[end + 2 :]
+    elif names.endswith('"') and ' "' in names:
+        old, new = names.split(' "', 1)
+        new = '"' + new
+    else:
+        return None
+    return _strip_prefix(old), _strip_prefix(new)
+
+
+def _closing_quote(text: str) -> int | None:
+    """Index of the quote that closes the one opening ``text``."""
+    index = 1
+    while index < len(text):
+        if text[index] == "\\":
+            index += 2
+            continue
+        if text[index] == '"':
+            return index
+        index += 1
+    return None
+
+
+def unquote_path(path: str) -> str:
+    """Undo git's quoting of a path written between double quotes.
+
+    git quotes a path holding a control, quote, backslash or (with
+    core.quotePath, the default) non-ASCII character: each such byte becomes
+    a C escape such as ``\\t`` or ``\\"``, or a three-digit octal escape.  The
+    octal escapes are UTF-8 bytes, so they are collected and decoded together.
+    A path that is not quoted is returned as it is.
+    """
+    if len(path) < 2 or not (path.startswith('"') and path.endswith('"')):
+        return path
+    body = path[1:-1]
+    out = bytearray()
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char != "\\" or index + 1 == len(body):
+            out += char.encode()
+            index += 1
+            continue
+        escape = body[index + 1]
+        octal = body[index + 1 : index + 4]
+        if len(octal) == 3 and all(digit in "01234567" for digit in octal):
+            out.append(int(octal, 8) & 0xFF)
+            index += 4
+        elif escape in _PATH_ESCAPES:
+            out.append(_PATH_ESCAPES[escape])
+            index += 2
+        else:
+            out += char.encode()
+            index += 1
+    return out.decode("utf-8", errors="replace")
+
+
+def is_file_mode(value: object) -> bool:
+    """Whether ``value`` is an octal git file mode such as ``100644``."""
+    return isinstance(value, str) and _MODE_RE.fullmatch(value) is not None
+
+
 def _header_mode(line: str, prefix: str) -> str | None:
     """Read an octal git file mode from an extended header line."""
     if not line.startswith(prefix):
         return None
     mode = line[len(prefix) :].strip()
-    return mode if _MODE_RE.fullmatch(mode) else None
+    return mode if is_file_mode(mode) else None
 
 
 def _is_mode_only(
@@ -501,8 +589,8 @@ def _is_file_header_boundary(
 
 
 def _strip_prefix(path: str) -> str:
-    """Strip a/ or b/ prefix from diff paths."""
-    path = path.strip()
+    """Unquote a diff path and strip its a/ or b/ prefix."""
+    path = unquote_path(path.strip())
     if path.startswith(("a/", "b/")):
         return path[2:]
     return path

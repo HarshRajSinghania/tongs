@@ -8,7 +8,7 @@ from typing import ClassVar
 import pytest
 
 from tongs.diff.models import DiffFile, FileStatus, LineType
-from tongs.diff.parser import parse_diff
+from tongs.diff.parser import parse_diff, unquote_path
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 
@@ -780,6 +780,63 @@ class TestGitExtendedHeaders:
         assert file.is_mode_only is True
         assert file.is_rename_only is False
         assert file.mode_change == "mode 100644 -> 100755"
+
+    def test_quoted_non_ascii_rename_is_unquoted_and_decoded(self) -> None:
+        # What git writes for a renamed and edited dir/old.txt -> dir/\u00e9.txt
+        # with the default core.quotePath.
+        diff = (
+            'diff --git a/dir/old.txt "b/dir/\\303\\251.txt"\n'
+            "similarity index 80%\n"
+            "rename from dir/old.txt\n"
+            'rename to "dir/\\303\\251.txt"\n'
+            "index d68dd40..9405325 100644\n"
+            "--- a/dir/old.txt\n"
+            '+++ "b/dir/\\303\\251.txt"\n'
+            "@@ -2,3 +2,4 @@ a\n"
+            " b\n"
+            " c\n"
+            " d\n"
+            "+e\n"
+        )
+
+        (file,) = parse_diff(diff)
+
+        assert (file.old_path, file.new_path) == ("dir/old.txt", "dir/\u00e9.txt")
+        assert file.status is FileStatus.RENAMED
+        assert file.additions == 1
+
+    def test_quoted_copy_paths_decode_c_escapes(self) -> None:
+        diff = (
+            'diff --git "a/\\303\\251/q\\"t.txt" "b/a\\\\b\\tc\\nd.txt"\n'
+            "similarity index 100%\n"
+            'copy from "\\303\\251/q\\"t.txt"\n'
+            'copy to "a\\\\b\\tc\\nd.txt"\n'
+        )
+
+        (file,) = parse_diff(diff)
+
+        assert (file.old_path, file.new_path) == (
+            '\u00e9/q"t.txt',
+            "a\\b\tc\nd.txt",
+        )
+        assert file.is_rename_only is True
+
+    def test_quoted_names_on_the_diff_git_line_are_split_and_decoded(self) -> None:
+        diff = (
+            'diff --git "a/bin/\\303\\251 b/run.sh" "b/bin/\\303\\251 b/run.sh"\n'
+            "old mode 100644\n"
+            "new mode 100755\n"
+        )
+
+        (file,) = parse_diff(diff)
+
+        assert file.old_path == file.new_path == "bin/\u00e9 b/run.sh"
+        assert file.mode_change == "mode 100644 -> 100755"
+
+    def test_unquote_path_leaves_plain_paths_alone(self) -> None:
+        assert unquote_path("dir/plain.txt") == "dir/plain.txt"
+        assert unquote_path('"') == '"'
+        assert unquote_path('"dir/\\303\\251.txt"') == "dir/\u00e9.txt"
 
     def test_malformed_mode_is_ignored(self) -> None:
         diff = "diff --git a/f b/f\nold mode 100644\nnew mode [red]x\n"

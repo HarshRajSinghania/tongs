@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping, Sequence
 
 from tongs.diff.models import DiffFile, DiffHunk, FileStatus, LineType
-from tongs.diff.parser import _detect_language, parse_diff
-
-# A git file mode such as ``100644``.  A forge value of any other shape is
-# dropped rather than shown in a file header.
-_MODE_RE = re.compile(r"[0-7]{1,7}")
+from tongs.diff.parser import _detect_language, is_file_mode, parse_diff
 
 # Suffixes whose content a unified diff cannot show as reviewable text.  The
 # probe that uses this set applies only where the forge withheld both the patch
@@ -384,7 +379,8 @@ def _modes(
 
 
 def _mode(value: object) -> str | None:
-    if not isinstance(value, str) or not _MODE_RE.fullmatch(value):
+    """A forge mode of any shape but an octal git mode is dropped, not shown."""
+    if not isinstance(value, str) or not is_file_mode(value):
         return None
     return value if value.strip("0") else None
 
