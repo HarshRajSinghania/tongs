@@ -4,6 +4,7 @@ import type {
   DraftInlineAnchorInputDto,
   DraftSnapshotDto,
   MutationOutcomeDto,
+  ReconciliationResolution,
   ReviewActionReceiptDto,
   SubmissionProgressDto,
 } from "../../../shared/review.js";
@@ -668,17 +669,36 @@ export function discardDraft(state: ReviewWorkflowState): ReviewWorkflowState {
   });
 }
 
+/**
+ * Whether a reconciliation may be sent for the held submission. Every
+ * resolution applies to an unknown outcome. A paused attempt was stopped by a
+ * definite answer, so it may only return to editing: nothing in doubt can be
+ * marked submitted, and retrying is what Resume already does.
+ */
+export function canReconcileSubmission(
+  progress: SubmissionProgressDto | null,
+  resolution?: ReconciliationResolution,
+): boolean {
+  if (progress?.outcome === "unknown") return true;
+  return progress?.outcome === "paused" && resolution === "return_editable";
+}
+
 export function beginSubmission(
   state: ReviewWorkflowState,
   kind: PendingSubmission["kind"],
+  resolution?: ReconciliationResolution,
 ): ReviewWorkflowState {
   if (state.submission.pending) throw new ReviewWorkflowRefusal("Submission operation is already pending");
   if (kind === "start" && !canStartSubmission(state))
     throw new ReviewWorkflowRefusal("Save the editable draft before submitting it");
   if (kind === "resume" && state.submission.progress?.outcome !== "paused")
     throw new ReviewWorkflowRefusal("Only paused submissions can resume");
-  if (kind === "reconcile" && state.submission.progress?.outcome !== "unknown")
-    throw new ReviewWorkflowRefusal("Only unknown submissions can be reconciled");
+  if (kind === "reconcile" && !canReconcileSubmission(state.submission.progress, resolution))
+    throw new ReviewWorkflowRefusal(
+      state.submission.progress?.outcome === "paused"
+        ? "A paused submission can only return to editing"
+        : "Only unknown submissions can be reconciled",
+    );
   const remote = state.draft.remote;
   const progress = state.submission.progress;
   const pending: PendingSubmission =
@@ -806,7 +826,7 @@ export function submissionGuidance(progress: SubmissionProgressDto): string | nu
     return "Submission was interrupted before anything was sent. Return the draft to editing to continue.";
   }
   if (progress.outcome === "paused")
-    return "Submission paused after confirmed steps. Resume uses the existing durable attempt.";
+    return "Submission paused after confirmed steps. Resume uses the existing durable attempt, or return the draft to editing without sending anything more.";
   return "The draft is editable again.";
 }
 

@@ -323,6 +323,86 @@ test("the drawer shows the engine's step list with each step's own standing", as
   assert.ok(view.getByRole("button", { name: "Resume confirmed attempt" }));
 });
 
+test("a paused submission returns to editing beside Resume without sending more", async () => {
+  const review = "review-drawer-paused-return";
+  const kept = content({ body: "Kept summary", verdict: "approve" });
+  const paused = {
+    ...submission(review, "paused", 2),
+    state: "submitting",
+    failure: {
+      code: "invalid_input",
+      message: "The forge rejected this request as invalid.",
+      retryable: false,
+      step_id: "verdict",
+    },
+  };
+  const reconciles = [];
+  let resumes = 0;
+  const view = renderDiff(
+    diffBridge(review, {
+      listReviewDrafts: () =>
+        read({ cursor: 0, next_cursor: null, drafts: [draft(review, 2, kept)] }),
+      startReviewSubmission: async () => paused,
+      resumeReviewSubmission: async () => {
+        resumes += 1;
+        return submission(review, "submitted", 2);
+      },
+      reconcileReviewSubmission: async (params) => {
+        reconciles.push(params);
+        return { ...submission(review, "editable", 2), state: "editable" };
+      },
+      getReviewDraft: () => read(draft(review, 4, kept)),
+    }),
+    review,
+  );
+  fireEvent.click(await view.findByRole("button", { name: /Your review/ }));
+  fireEvent.click(await view.findByRole("button", { name: "Submit review" }));
+  fireEvent.click(
+    await view.findByRole("button", { name: "Confirm submit review" }),
+  );
+  await view.findByText("The forge rejected this request as invalid.");
+
+  const resume = view.queryAllByRole("button", {
+    name: "Resume confirmed attempt",
+  });
+  const returning = view.queryAllByRole("button", {
+    name: "Return draft to editing",
+  });
+  assert.equal(resume.length, 1);
+  assert.equal(returning.length, 1);
+  assert.equal(returning[0].textContent, "Return draft to editing");
+  assert.equal(returning[0].disabled, false);
+  assert.equal(
+    view.queryAllByRole("button", { name: "Mark submitted" }).length,
+    0,
+  );
+
+  fireEvent.click(returning[0]);
+  await waitFor(() =>
+    assert.equal(
+      view.queryAllByRole("button", { name: "Return draft to editing" }).length,
+      0,
+    ),
+  );
+  assert.equal(
+    JSON.stringify(reconciles),
+    JSON.stringify([
+      {
+        review,
+        attempt_id: "22222222-2222-4222-8222-222222222222",
+        resolution: "return_editable",
+      },
+    ]),
+  );
+  assert.equal(resumes, 0);
+  assert.equal(view.queryAllByLabelText("Submission steps").length, 0);
+  assert.equal(view.getByLabelText("Summary").value, "Kept summary");
+  assert.equal(
+    view.queryAllByRole("button", { name: "Submit review" }).length,
+    1,
+  );
+});
+
 test("a zero-step interrupted attempt only offers returning to editing", async () => {
   const review = "review-drawer-zero-step-recovery";
   const attempt = {

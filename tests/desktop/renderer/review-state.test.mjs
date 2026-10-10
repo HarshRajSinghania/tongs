@@ -8,6 +8,7 @@ import {
   beginDraftSave,
   beginQuickIntent,
   beginSubmission,
+  canReconcileSubmission,
   canStartSubmission,
   canCaptureDraftInline,
   canSaveDraft,
@@ -466,6 +467,52 @@ test("submission recovery distinguishes confirmed, paused, and unknown steps", (
   assert.match(state.submission.message, /Reconcile before continuing/);
   assert.throws(() => beginSubmission(state, "resume"), /paused/);
   assert.doesNotThrow(() => beginSubmission(state, "reconcile"));
+});
+
+test("a paused submission admits only a return to editing", () => {
+  let state = adoptDraft(createReviewWorkflowState(review, revision), draft(1, "ready"));
+  state = beginSubmission(state, "start");
+  state = finishSubmission(state, progress("paused", [], []));
+  const paused = state.submission.progress;
+
+  assert.equal(canReconcileSubmission(paused, "return_editable"), true);
+  assert.equal(canReconcileSubmission(paused, "retry_remaining"), false);
+  assert.equal(canReconcileSubmission(paused, "mark_submitted"), false);
+  assert.equal(canReconcileSubmission(paused), false);
+  assert.equal(canReconcileSubmission(null, "return_editable"), false);
+  assert.match(state.submission.message, /return the draft to editing/);
+  for (const resolution of ["retry_remaining", "mark_submitted", undefined]) {
+    assert.throws(
+      () => beginSubmission(state, "reconcile", resolution),
+      /paused submission can only return to editing/,
+    );
+  }
+
+  const returning = beginSubmission(state, "reconcile", "return_editable");
+  assert.equal(returning.submission.pending.kind, "reconcile");
+  assert.equal(returning.submission.pending.attemptId, attemptId);
+  assert.equal(returning.submission.pending.frozenVersion, 1);
+  state = finishSubmission(returning, progress("editable", [], []));
+  assert.equal(state.submission.progress.outcome, "editable");
+  assert.equal(state.submission.message, "The draft is editable again.");
+  state = adoptDraft(state, draft(3, "ready"));
+  assert.equal(state.submission.progress, null);
+  assert.equal(state.submission.pending, null);
+  assert.equal(state.draft.remote.state, "editable");
+  assert.equal(state.draft.local.body, "ready");
+});
+
+test("an unknown submission still admits every resolution", () => {
+  let state = adoptDraft(createReviewWorkflowState(review, revision), draft(1, "ready"));
+  state = beginSubmission(state, "start");
+  state = finishSubmission(state, progress("unknown", ["verdict"], []));
+  for (const resolution of ["retry_remaining", "return_editable", "mark_submitted"]) {
+    assert.equal(canReconcileSubmission(state.submission.progress, resolution), true);
+    assert.equal(
+      beginSubmission(state, "reconcile", resolution).submission.pending.kind,
+      "reconcile",
+    );
+  }
 });
 
 test("submission recovery cannot bind progress to another active draft", () => {
