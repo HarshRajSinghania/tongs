@@ -2266,7 +2266,7 @@ class RevisionReadClient(FakeClient):
 
 class TestRevisionOnlyGuards:
     @pytest.mark.asyncio
-    async def test_github_diff_reads_the_pull_request_twice_before_its_pages(
+    async def test_github_diff_reads_the_pull_request_once_before_and_once_after_its_pages(
         self,
     ) -> None:
         paths: list[str] = []

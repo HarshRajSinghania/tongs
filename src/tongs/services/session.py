@@ -926,8 +926,9 @@ class ApplicationSession:
     async def get_raw_diff(self, ref: ReviewRef) -> RawDiffSnapshot:
         """Read fresh raw changes and prove the complete revision stayed stable.
 
-        The guards before and after the diff read the review resource alone,
-        so a diff costs two review requests before its pages.
+        The guards read the review resource alone, once before the diff
+        pages and once after them, so a diff costs its pages plus two review
+        requests.
         """
         client = await self._client_for_review(ref, "get_raw_diff")
         try:
