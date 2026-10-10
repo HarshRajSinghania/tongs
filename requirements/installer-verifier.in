@@ -1,0 +1,4 @@
+# Direct input of requirements/installer-verifier.lock, the hash-locked
+# verifier environment of the Python 3.14 Fedora 44 probe container.
+# Regenerate the lock with the command at the top of that file.
+sigstore==4.5.0

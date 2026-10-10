@@ -5,13 +5,26 @@ LABEL org.opencontainers.image.description="Disposable headless test environment
 
 COPY installer-verifier.lock /opt/tongs-harness/installer-verifier.lock
 
+# The verifier closure installs first, by hash and as wheels only.  The test
+# tools then resolve fresh in a second call that is constrained to the exact
+# locked versions, so it fails rather than replace a hash-checked package.
 RUN dnf install --assumeyes --setopt=install_weak_deps=False \
         git-core \
         python3 \
         python3-pip \
     && dnf clean all \
     && python3 -m venv /opt/tongs-harness \
-    && /opt/tongs-harness/bin/python -m pip install --no-cache-dir \
+    && /opt/tongs-harness/bin/python -I -m pip install --no-cache-dir \
+        --disable-pip-version-check \
+        --require-hashes \
+        --only-binary=:all: \
+        -r /opt/tongs-harness/installer-verifier.lock \
+    && sed -n 's/^\([A-Za-z0-9][A-Za-z0-9._-]*==[^ ]*\).*/\1/p' \
+        /opt/tongs-harness/installer-verifier.lock \
+        > /opt/tongs-harness/installer-verifier.constraints \
+    && /opt/tongs-harness/bin/python -I -m pip install --no-cache-dir \
+        --disable-pip-version-check \
+        -c /opt/tongs-harness/installer-verifier.constraints \
         aiosqlite\>=0.20 \
         build\>=1.2 \
         hatch-vcs \
@@ -26,7 +39,9 @@ RUN dnf install --assumeyes --setopt=install_weak_deps=False \
         setuptools\>=68 \
         textual==4.0.0 \
         wheel \
-        -r /opt/tongs-harness/installer-verifier.lock
+    && /opt/tongs-harness/bin/python -I -c 'import importlib.metadata as m, sys; pins = [line.strip().split("==") for line in open(sys.argv[1])]; bad = [(n, v, m.version(n)) for n, v in pins if m.version(n) != v]; sys.exit(f"installed versions differ from the lock: {bad}" if bad else 0)' \
+        /opt/tongs-harness/installer-verifier.constraints \
+    && /opt/tongs-harness/bin/python -I -m pip check
 
 COPY probe.py /opt/tongs-harness/probe.py
 
