@@ -5,7 +5,8 @@ import type {
   JsonValue, ListPipelinesParams, ListReviewPipelinesParams, ListReviewsParams,
   LocationParams, LogPage, ServiceStatusDto, OpenDiffParams, OpenLogParams, OpenRepositoryParams,
   PageParams, PipelinesResult, PluginResult, PluginsResult,
-  RepositoryDto, RepositoryListResult, ReviewListResult, ReviewSnapshotDto,
+  RepositoryDto, RepositoryListResult, ReviewCIStatusParams, ReviewCIStatusResult,
+  ReviewListResult, ReviewSnapshotDto,
 } from "../shared/bridge.js";
 import type {
   CICapabilitiesResult,
@@ -52,6 +53,7 @@ import type {
 
 const IPC_CHANNELS = Object.freeze({
   discoverRepositories: "tongs:repositories.discover", openRepository: "tongs:repositories.open", listReviews: "tongs:reviews.list", getReview: "tongs:reviews.get",
+  getReviewCIStatus: "tongs:reviews.ci-status",
   openDiff: "tongs:diff.open", pageDiff: "tongs:diff.page", listDiscussions: "tongs:discussions.list", pageDiscussions: "tongs:discussions.page", listCommits: "tongs:commits.list",
   listPipelines: "tongs:pipelines.list", listReviewPipelines: "tongs:review-pipelines.list", listJobs: "tongs:jobs.list", openLog: "tongs:logs.open", pageLog: "tongs:logs.page",
   listPlugins: "tongs:plugins.list", invokePlugin: "tongs:plugins.invoke", setLocation: "tongs:host.set-location", listAssets: "tongs:assets.list",
@@ -124,6 +126,7 @@ const bridge: DesktopBridge = Object.freeze({
   openRepository: (params: OpenRepositoryParams): DesktopRead<RepositoryDto> => read(IPC_CHANNELS.openRepository, params),
   listReviews: (params: ListReviewsParams): DesktopRead<ReviewListResult> => read(IPC_CHANNELS.listReviews, params),
   getReview: (review: string): DesktopRead<ReviewSnapshotDto> => read(IPC_CHANNELS.getReview, { review }),
+  getReviewCIStatus: (params: ReviewCIStatusParams): DesktopRead<ReviewCIStatusResult> => read(IPC_CHANNELS.getReviewCIStatus, params),
   openDiff: (params: OpenDiffParams): DesktopRead<DiffPage> => read(IPC_CHANNELS.openDiff, params),
   pageDiff: (params: PageParams): DesktopRead<DiffPage> => read(IPC_CHANNELS.pageDiff, params),
   listDiscussions: (review: string): DesktopRead<DiscussionsPage> => read(IPC_CHANNELS.listDiscussions, { review }),
