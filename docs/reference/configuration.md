@@ -75,7 +75,8 @@ The desktop app appends the path of a private log export to the command and
 starts it without a shell. Use an editor that opens a window and waits, such as
 `code --wait` or `kate --block`. Known terminal-only editors, such as `vim`,
 `nano` or `less`, are reported as unsupported, because they cannot attach to
-the desktop window. A wrapper script must itself start a graphical editor and
+the desktop window. `vim --remote-wait`, which hands the file to a running Vim
+server, is accepted. A wrapper script must itself start a graphical editor and
 wait for it. The desktop app reports that the editor started separately from
 confirmation that it read the file.
 

@@ -40,6 +40,21 @@ _HANDOFF_LAUNCHERS: Mapping[str, tuple[str, frozenset[str]]] = {
     "gedit": ("--wait", frozenset({"--wait", "-w"})),
 }
 
+# Vim's remote flags hand the file to a running Vim server and return at once.
+# Each maps to the spelling that waits until the server is done with the file.
+_VIM_REMOTE_WAIT: Mapping[str, str] = {
+    "--remote": "--remote-wait",
+    "--remote-silent": "--remote-wait-silent",
+    "--remote-tab": "--remote-tab-wait",
+    "--remote-tab-silent": "--remote-tab-wait-silent",
+}
+_VIM_REMOTE_FLAGS = frozenset(_VIM_REMOTE_WAIT) | frozenset(_VIM_REMOTE_WAIT.values())
+_VIM_LAUNCHERS = frozenset({"gvim", "vim"})
+
+# emacsclient waits for the running Emacs by default; these flags make it
+# return at once, so they are dropped.
+_EMACSCLIENT_NO_WAIT = frozenset({"-n", "--no-wait"})
+
 
 class EditorPlanStatus(str, Enum):
     """Safe outcomes produced before Electron starts an editor process."""
@@ -284,7 +299,11 @@ class WorkspaceUtilityService:
             )
 
         executable = PurePath(argv[0]).name.casefold()
-        terminal_only = executable in _TERMINAL_EDITORS or (
+        # A Vim remote hands the file to a running server, which may be graphical.
+        vim_remote = executable in _VIM_LAUNCHERS and any(
+            argument in _VIM_REMOTE_FLAGS for argument in argv[1:]
+        )
+        terminal_only = (executable in _TERMINAL_EDITORS and not vim_remote) or (
             executable in {"emacs", "emacsclient"}
             and any(argument in {"-nw", "-t", "--tty"} for argument in argv[1:])
         )
@@ -303,7 +322,21 @@ class WorkspaceUtilityService:
 
 
 def _with_wait_flag(executable: str, argv: tuple[str, ...]) -> tuple[str, ...]:
-    """Add the wait flag a known hand-off launcher needs to keep the export alive."""
+    """Make a known hand-off launcher wait, so the export stays alive while in use."""
+    if executable == "emacsclient":
+        return (
+            argv[0],
+            *(
+                argument
+                for argument in argv[1:]
+                if argument not in _EMACSCLIENT_NO_WAIT
+            ),
+        )
+    if executable in _VIM_LAUNCHERS:
+        argv = (
+            argv[0],
+            *(_VIM_REMOTE_WAIT.get(argument, argument) for argument in argv[1:]),
+        )
     handoff = _HANDOFF_LAUNCHERS.get(executable)
     if handoff is None:
         return argv

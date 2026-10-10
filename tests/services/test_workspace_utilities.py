@@ -305,6 +305,17 @@ async def test_editor_command_control_characters_are_not_ready(command: str) -> 
         ("kate", ("kate", "--block")),
         ("kate -b", ("kate", "-b")),
         ("gedit", ("gedit", "--wait")),
+        ("emacsclient -n", ("emacsclient",)),
+        ("emacsclient --no-wait -c", ("emacsclient", "-c")),
+        ("emacsclient -c", ("emacsclient", "-c")),
+        ("gvim --remote-silent", ("gvim", "-f", "--remote-wait-silent")),
+        ("gvim --remote", ("gvim", "-f", "--remote-wait")),
+        ("gvim --remote-tab", ("gvim", "-f", "--remote-tab-wait")),
+        ("gvim --remote-tab-silent", ("gvim", "-f", "--remote-tab-wait-silent")),
+        ("gvim -f --remote-wait", ("gvim", "-f", "--remote-wait")),
+        ("vim --remote-silent", ("vim", "--remote-wait-silent")),
+        ("vim --servername T --remote", ("vim", "--servername", "T", "--remote-wait")),
+        ("vim --remote-wait", ("vim", "--remote-wait")),
         ("my-editor", ("my-editor",)),
     ],
 )
@@ -327,3 +338,13 @@ async def test_handoff_launcher_from_environment_gets_its_wait_flag() -> None:
 
     assert result.status is EditorPlanStatus.READY
     assert result.argv == ("subl", "--wait")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["vim", "vim -g", "emacsclient -n -t"])
+async def test_terminal_editors_without_a_remote_stay_unsupported(command: str) -> None:
+    result = await _service(
+        Calls(), config=Config(editor_command=command)
+    ).prepare_editor_log(JOB)
+
+    assert result.status is EditorPlanStatus.TERMINAL_UNSUPPORTED
