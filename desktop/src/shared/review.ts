@@ -35,8 +35,13 @@ export type SourceCleanupOutcome =
   | "rejected"
   | "unknown";
 
+/** A full session write ledger: only a new session frees space. */
+export const CAPACITY_EXHAUSTED_MESSAGE =
+  "Too many write actions in this session. Restart tongs to continue.";
+
 const REVIEW_MUTATION_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   authentication_failed: "Sign in to the forge again, then retry the review action.",
+  capacity_exhausted: CAPACITY_EXHAUSTED_MESSAGE,
   closed: "This review session is closed. Reopen it before continuing.",
   configuration_invalid:
     "Review actions are unavailable because the local service configuration is invalid.",

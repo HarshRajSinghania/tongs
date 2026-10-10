@@ -10,9 +10,13 @@ import {
   APP_SCHEME_REGISTRATION,
   isAllowedAppUrl,
 } from "./security.js";
-import { RendererRecoveryCoordinator } from "./renderer_lifecycle.js";
+import {
+  RendererRecoveryCoordinator,
+  ServiceRecoveryPolicy,
+  watchServiceLoss,
+} from "./renderer_lifecycle.js";
 import { SidecarTransport } from "./sidecar.js";
-import { WorkspaceUtilities } from "./utilities.js";
+import { resolveEditorExportRoot, WorkspaceUtilities } from "./utilities.js";
 
 protocol.registerSchemesAsPrivileged([APP_SCHEME_REGISTRATION]);
 const forbidden = [
@@ -46,6 +50,7 @@ let window: BrowserWindow | null = null;
 let transport: SidecarTransport | null = null;
 let controller: DesktopIpcController | null = null;
 let rendererRecovery: RendererRecoveryCoordinator | null = null;
+let quitting = false;
 const childProcessFailures: object[] = [];
 
 async function run(): Promise<void> {
@@ -59,9 +64,9 @@ async function run(): Promise<void> {
   desktopSession.webRequest.onBeforeRequest((details, callback) =>
     callback({ cancel: !isAllowedAppUrl(details.url) }),
   );
-  const editorExportRoot = path.join(
+  const editorExportRoot = await resolveEditorExportRoot(
+    process.env,
     app.getPath("temp"),
-    "tongs-editor-exports",
   );
   transport = new SidecarTransport({
     ...launch,
@@ -113,6 +118,18 @@ async function run(): Promise<void> {
     // transport stopped, so the reloaded document already reports it.
     showFailure: async () => undefined,
   });
+  // A service that stops on its own, or that a read finds gone, is restarted
+  // through the same path as a renderer crash, so stale handles are dropped.
+  const serviceRecovery = new ServiceRecoveryPolicy({
+    restart: async () => {
+      await restartRendererSession();
+      return sidecar.serviceState === "connected";
+    },
+    shuttingDown: () =>
+      quitting || transport !== sidecar || rendererRecovery === null,
+    onState: (state) => sidecar.setRecovery(state),
+  });
+  watchServiceLoss(sidecar, serviceRecovery);
   window.setMenu(null);
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   window.webContents.on("will-navigate", (event, url) => {
@@ -390,6 +407,7 @@ app
     app.exit(1);
   });
 app.on("before-quit", () => {
+  quitting = true;
   controller?.dispose();
 });
 app.on("window-all-closed", () => app.quit());

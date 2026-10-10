@@ -68,34 +68,23 @@ class EditorExportLedger:
             try:
                 rows = await self._rows(db)
                 stale_before = float(timestamp) - STALE_EDITOR_EXPORT_SECONDS
-                if not self._reclaim_files(rows, stale_before):
-                    await db.rollback()
-                    return None
-                for slot, row_token, export_name, created_at in rows:
-                    if created_at <= stale_before and not self._path_exists(
-                        export_name
-                    ):
-                        await db.execute(
-                            "DELETE FROM editor_exports WHERE slot = ? AND token = ?",
-                            (slot, row_token),
-                        )
-                if self._has_blocking_orphan_or_legacy(rows, stale_before):
-                    await db.rollback()
-                    return None
-                occupied = {
-                    int(row[0]) for row in await self._rows(db) if _valid_row(*row)
-                }
-                slot = next(
-                    (
-                        candidate
-                        for candidate in range(1, MAX_EDITOR_EXPORTS + 1)
-                        if candidate not in occupied
-                    ),
-                    None,
+                occupied, extra_held = await self._reclaim_rows(db, rows, stale_before)
+                orphans_occupied, orphans_held = self._reclaim_orphans(
+                    rows, stale_before
                 )
-                if slot is None:
-                    await db.rollback()
+                occupied |= orphans_occupied
+                extra_held += orphans_held
+                free = [
+                    candidate
+                    for candidate in range(1, MAX_EDITOR_EXPORTS + 1)
+                    if candidate not in occupied
+                ]
+                # Each held file without a slot of its own still counts against
+                # the bound, so at most eight export files ever exist.
+                if len(free) <= extra_held:
+                    await db.commit()
                     return None
+                slot = free[0]
                 export_name = editor_export_name(slot, job_id, token)
                 await db.execute(
                     "INSERT INTO editor_exports(slot, token, export_name, created_at) VALUES (?, ?, ?, ?)",
@@ -205,42 +194,72 @@ class EditorExportLedger:
         )
         return list(await cursor.fetchall())
 
-    def _reclaim_files(
+    async def _reclaim_rows(
         self,
+        db: aiosqlite.Connection,
         rows: list[tuple[object, object, object, object]],
         stale_before: float,
-    ) -> bool:
-        for row in rows:
-            if not _valid_row(*row):
-                return False
-            _slot, _token_value, export_name, created_at = row
-            if created_at > stale_before:
-                continue
-            assert isinstance(export_name, str)
-            if not self._remove_stale_owned(export_name, stale_before):
-                return False
-        return True
+    ) -> tuple[set[int], int]:
+        """Free each stale slot whose export is gone; keep every other slot held.
 
-    def _has_blocking_orphan_or_legacy(
+        Returns the held slots and the number of malformed rows that hold no
+        valid slot but still count against the bound.
+        """
+        occupied: set[int] = set()
+        unslotted = 0
+        for row in rows:
+            slot, row_token, export_name, created_at = row
+            if not _valid_row(*row):
+                held_slot = _slot_number(slot)
+                if held_slot is None:
+                    unslotted += 1
+                else:
+                    occupied.add(held_slot)
+                continue
+            assert isinstance(slot, int)
+            assert isinstance(export_name, str)
+            assert isinstance(created_at, (int, float))
+            if created_at > stale_before or not self._remove_stale_owned(
+                export_name, stale_before
+            ):
+                occupied.add(slot)
+                continue
+            await db.execute(
+                "DELETE FROM editor_exports WHERE slot = ? AND token = ?",
+                (slot, row_token),
+            )
+        return occupied, unslotted
+
+    def _reclaim_orphans(
         self,
         rows: list[tuple[object, object, object, object]],
         stale_before: float,
-    ) -> bool:
+    ) -> tuple[set[int], int]:
+        """Remove stale export files without a row; report the ones still held.
+
+        A held file named for a slot holds that slot. A held legacy file has no
+        slot, so it is returned as a count that reduces the free slots.
+        """
         admitted = {
             row[2] for row in rows if _valid_row(*row) and isinstance(row[2], str)
         }
+        occupied: set[int] = set()
+        unslotted = 0
         for entry in os.scandir(self._root):
             if entry.name in {_LEDGER_NAME, f"{_LEDGER_NAME}-journal"}:
                 continue
-            if not (
-                _LEGACY_EXPORT.fullmatch(entry.name) or _EXPORT.fullmatch(entry.name)
-            ):
+            slotted = _EXPORT.fullmatch(entry.name)
+            if not (_LEGACY_EXPORT.fullmatch(entry.name) or slotted):
                 continue
             if entry.name in admitted:
                 continue
-            if not self._remove_stale_owned(entry.name, stale_before):
-                return True
-        return False
+            if self._remove_stale_owned(entry.name, stale_before):
+                continue
+            if slotted is None:
+                unslotted += 1
+            else:
+                occupied.add(int(slotted.group(1)))
+        return occupied, unslotted
 
     def _remove_stale_owned(self, name: str, stale_before: float) -> bool:
         path = self._root / name
@@ -279,6 +298,16 @@ def editor_export_name(slot: int, job_id: int, token: str) -> str:
     if not _TOKEN.fullmatch(token):
         raise ValueError("editor export token is invalid")
     return f"tongs-slot-{slot}-job-{job_id}-{token}.log"
+
+
+def _slot_number(slot: object) -> int | None:
+    if (
+        isinstance(slot, int)
+        and not isinstance(slot, bool)
+        and slot in range(1, MAX_EDITOR_EXPORTS + 1)
+    ):
+        return slot
+    return None
 
 
 def _valid_row(

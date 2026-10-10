@@ -27,6 +27,42 @@ _TERMINAL_EDITORS = frozenset(
     {"joe", "less", "micro", "more", "nano", "nvim", "pico", "vi", "vim"}
 )
 
+# Launchers that hand the file to a running instance and exit at once unless
+# told to wait. Each maps to the flag that makes it wait and every spelling of
+# that flag it accepts, so an existing flag is never added twice.
+_HANDOFF_LAUNCHERS: Mapping[str, tuple[str, frozenset[str]]] = {
+    "code": ("--wait", frozenset({"--wait", "-w"})),
+    "code-insiders": ("--wait", frozenset({"--wait", "-w"})),
+    "codium": ("--wait", frozenset({"--wait", "-w"})),
+    "subl": ("--wait", frozenset({"--wait", "-w"})),
+    "gvim": ("-f", frozenset({"-f", "--nofork"})),
+    "kate": ("--block", frozenset({"--block", "-b"})),
+    "gedit": ("--wait", frozenset({"--wait", "-w"})),
+}
+
+# Vim's remote flags hand the file to a running Vim server and return at once.
+# Each maps to the spelling that waits until the server is done with the file.
+_VIM_REMOTE_WAIT: Mapping[str, str] = {
+    "--remote": "--remote-wait",
+    "--remote-silent": "--remote-wait-silent",
+    "--remote-tab": "--remote-tab-wait",
+    "--remote-tab-silent": "--remote-tab-wait-silent",
+}
+_VIM_REMOTE_FLAGS = frozenset(_VIM_REMOTE_WAIT) | frozenset(_VIM_REMOTE_WAIT.values())
+_VIM_LAUNCHERS = frozenset({"gvim", "vim"})
+
+# Most often the slots are held by exports an editor that returned at once left
+# behind, so the message names the fix as well as the wait.
+_CAPACITY_EXCEEDED_MESSAGE = (
+    "The private editor export limit was reached. Editors that return at once "
+    "keep their exports until they expire after 24 hours. Add the editor's wait "
+    "flag, such as code --wait."
+)
+
+# emacsclient waits for the running Emacs by default; these flags make it
+# return at once, so they are dropped.
+_EMACSCLIENT_NO_WAIT = frozenset({"-n", "--no-wait"})
+
 
 class EditorPlanStatus(str, Enum):
     """Safe outcomes produced before Electron starts an editor process."""
@@ -158,7 +194,7 @@ class WorkspaceUtilityService:
         if reservation is None:
             return EditorLogPlan(
                 EditorPlanStatus.CAPACITY_EXCEEDED,
-                "The private editor export limit was reached. Retry after older exports expire.",
+                _CAPACITY_EXCEEDED_MESSAGE,
                 job,
             )
         try:
@@ -271,7 +307,11 @@ class WorkspaceUtilityService:
             )
 
         executable = PurePath(argv[0]).name.casefold()
-        terminal_only = executable in _TERMINAL_EDITORS or (
+        # A Vim remote hands the file to a running server, which may be graphical.
+        vim_remote = executable in _VIM_LAUNCHERS and any(
+            argument in _VIM_REMOTE_FLAGS for argument in argv[1:]
+        )
+        terminal_only = (executable in _TERMINAL_EDITORS and not vim_remote) or (
             executable in {"emacs", "emacsclient"}
             and any(argument in {"-nw", "-t", "--tty"} for argument in argv[1:])
         )
@@ -281,11 +321,39 @@ class WorkspaceUtilityService:
                 "Configure a wait-capable graphical editor; terminal editors cannot attach to Tongs Desktop.",
                 (),
             )
+        argv = _with_wait_flag(executable, argv)
         return (
             EditorPlanStatus.READY,
             "The configured editor launch plan is ready.",
             argv,
         )
+
+
+def _with_wait_flag(executable: str, argv: tuple[str, ...]) -> tuple[str, ...]:
+    """Make a known hand-off launcher wait, so the export stays alive while in use."""
+    if executable == "emacsclient":
+        return (
+            argv[0],
+            *(
+                argument
+                for argument in argv[1:]
+                if argument not in _EMACSCLIENT_NO_WAIT
+            ),
+        )
+    if executable in _VIM_LAUNCHERS:
+        argv = (
+            argv[0],
+            *(_VIM_REMOTE_WAIT.get(argument, argument) for argument in argv[1:]),
+        )
+    handoff = _HANDOFF_LAUNCHERS.get(executable)
+    if handoff is None:
+        return argv
+    flag, spellings = handoff
+    if any(argument in spellings for argument in argv[1:]):
+        return argv
+    if len(argv) >= MAX_EDITOR_ARGUMENTS:
+        return argv
+    return (argv[0], flag, *argv[1:])
 
 
 def _utf8_length(value: str) -> int | None:

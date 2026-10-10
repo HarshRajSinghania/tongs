@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { constants } from "node:fs";
+import { constants, type Stats } from "node:fs";
 import {
   lstat,
   mkdir,
@@ -23,6 +23,14 @@ const MAX_EDITOR_ARGUMENT_BYTES = 4096;
 const LAUNCH_TIMEOUT_MILLISECONDS = 5_000;
 const EARLY_EXIT_MILLISECONDS = 250;
 const LIVE_EXPORT_LEASE_MILLISECONDS = 23 * 60 * 60 * 1_000;
+/**
+ * An editor that exits successfully this soon after starting most likely
+ * handed the file to an already running instance, so the export is kept for
+ * the ledger's stale reclamation instead of being removed under the editor.
+ */
+export const EDITOR_HANDOFF_HOLD_MILLISECONDS = 5_000;
+const HANDED_OFF_MESSAGE =
+  "Editor started and returned at once, so Tongs kept the exported log. A later export removes it after 24 hours. Add the editor's wait flag to remove it when the editor closes.";
 const EXPORT_NAME = /^tongs-slot-([1-8])-job-([1-9][0-9]{0,18})-([0-9a-f]{32})\.log$/;
 
 interface UtilityTransport {
@@ -89,6 +97,10 @@ type SpawnEditor = (
 
 type ScheduleExportExpiry = (expire: () => void) => () => void;
 
+type EditorExit = number | null | "error";
+
+class ExportRootError extends Error {}
+
 export class WorkspaceUtilities {
   private openingEditor = false;
   private readonly exportRoot: string;
@@ -100,6 +112,7 @@ export class WorkspaceUtilities {
     private readonly spawnEditor: SpawnEditor = defaultSpawnEditor,
     private readonly scheduleExportExpiry: ScheduleExportExpiry =
       defaultScheduleExportExpiry,
+    private readonly clock: () => number = () => performance.now(),
   ) {
     if (!path.isAbsolute(exportRoot))
       throw new Error("The editor export root must be absolute");
@@ -187,6 +200,7 @@ export class WorkspaceUtilities {
       exportFile = created.file;
       identity = created.identity;
       await exportFile.writeFile(content, { encoding: "utf8" });
+      const startedAt = this.clock();
       const started = await startEditor(
         this.spawnEditor,
         plan.argv,
@@ -213,7 +227,9 @@ export class WorkspaceUtilities {
             attachBoundedCleanup(
               started.completion,
               started.cancelCompletion,
-              () => this.scheduleCleanup(
+              (exit) => this.finishEditor(
+                exit,
+                startedAt,
                 retainedPath,
                 retainedFile,
                 retainedIdentity,
@@ -247,21 +263,16 @@ export class WorkspaceUtilities {
       reservation = null;
       identity = null;
       if (started.exited) {
-        await this.cleanupExport(
-          retainedPath,
-          retainedFile,
-          retainedIdentity,
-          retainedReservation,
-        );
-        return utilityResult(
-          "started",
-          "Editor process started and exited. Tongs cannot confirm that the exported log was opened.",
-        );
+        // A successful exit this early is a hand-off to a running editor.
+        await retainedFile.close().catch(() => undefined);
+        return utilityResult("started", HANDED_OFF_MESSAGE);
       }
       attachBoundedCleanup(
         started.completion,
         started.cancelCompletion,
-        () => this.scheduleCleanup(
+        (exit) => this.finishEditor(
+          exit,
+          startedAt,
           retainedPath,
           retainedFile,
           retainedIdentity,
@@ -275,7 +286,7 @@ export class WorkspaceUtilities {
         "started",
         "Editor started. Tongs cannot confirm that the exported log was opened.",
       );
-    } catch {
+    } catch (error) {
       if (reservation !== null) {
         await this.cleanupExport(
           exportPath,
@@ -283,6 +294,9 @@ export class WorkspaceUtilities {
           identity,
           reservation,
         );
+      }
+      if (error instanceof ExportRootError) {
+        return utilityResult("failed", error.message);
       }
       return utilityResult(
         "failed",
@@ -295,27 +309,50 @@ export class WorkspaceUtilities {
 
   private async prepareExportRoot(): Promise<void> {
     try {
-      await mkdir(this.exportRoot, { mode: 0o700 });
+      await mkdir(this.exportRoot, { recursive: true, mode: 0o700 });
     } catch (error) {
-      if (!isAlreadyExists(error)) throw error;
+      if (!isAlreadyExists(error)) {
+        throw new ExportRootError(
+          `The editor export folder ${this.exportRoot} could not be created. Check the permissions of the folder that contains it.`,
+        );
+      }
     }
-    const root = await lstat(this.exportRoot);
+    let root: Stats | null = null;
+    try {
+      root = await lstat(this.exportRoot);
+    } catch {
+      root = null;
+    }
     if (
+      root === null ||
       !root.isDirectory() ||
       root.isSymbolicLink() ||
       (typeof process.getuid === "function" && root.uid !== process.getuid()) ||
       (root.mode & 0o077) !== 0
     ) {
-      throw new Error("The editor export root is not private");
+      throw new ExportRootError(
+        `The editor export folder ${this.exportRoot} is not private to this user. It must be a folder you own that no other account can open.`,
+      );
     }
   }
 
-  private scheduleCleanup(
+  private finishEditor(
+    exit: EditorExit,
+    startedAt: number,
     exportPath: string,
     exportFile: FileHandle,
     identity: FileIdentity,
     reservation: EditorReservation,
   ): void {
+    if (
+      exit === 0 &&
+      this.clock() - startedAt < EDITOR_HANDOFF_HOLD_MILLISECONDS
+    ) {
+      // A hand-off launcher returned while a running editor may still be
+      // reading the file. Keep it for the ledger's stale reclamation.
+      void exportFile.close().catch(() => undefined);
+      return;
+    }
     void this.cleanupExport(exportPath, exportFile, identity, reservation);
   }
 
@@ -330,38 +367,61 @@ export class WorkspaceUtilities {
     reservation: EditorReservation,
   ): Promise<void> {
     try {
-      const absent =
-        exportPath === null
-          ? true
-          : await removeExport(
-              this.exportRoot,
-              exportPath,
-              identity,
-            ).catch(() => false);
-      if (!absent) return;
-      if (exportFile !== null) {
-        try {
-          await exportFile.close();
-        } catch {
-          return;
-        }
-        exportFile = null;
-      }
-      try {
-        const result = await this.transport.requestMutation(
-          "utilities.job_log_release",
-          { slot: reservation.slot, token: reservation.token },
-        ).result;
-        exactKeys(result, ["released"]);
-        if (typeof result.released !== "boolean")
-          throw new Error("Invalid editor reservation release result");
-      } catch {
-        // The retained ledger row is reclaimed by a later explicit operation.
+      if (exportPath !== null) {
+        await removeExport(this.exportRoot, exportPath, identity).catch(
+          () => false,
+        );
       }
     } finally {
       await exportFile?.close().catch(() => undefined);
     }
+    // Always ask for the slot back. The ledger itself refuses while a file
+    // it cannot account for still holds the export name.
+    try {
+      const result = await this.transport.requestMutation(
+        "utilities.job_log_release",
+        { slot: reservation.slot, token: reservation.token },
+      ).result;
+      exactKeys(result, ["released"]);
+      if (typeof result.released !== "boolean")
+        throw new Error("Invalid editor reservation release result");
+    } catch {
+      // The retained ledger row is reclaimed by a later explicit operation.
+    }
   }
+}
+
+/**
+ * Choose the private, per-user folder for editor exports. A private
+ * `$XDG_RUNTIME_DIR` is preferred; otherwise a name that carries the user id
+ * under the temp folder keeps one account from blocking another.
+ */
+export async function resolveEditorExportRoot(
+  environment: Readonly<Record<string, string | undefined>>,
+  temporaryDirectory: string,
+  uid: number | undefined = typeof process.getuid === "function"
+    ? process.getuid()
+    : undefined,
+): Promise<string> {
+  const runtime = environment.XDG_RUNTIME_DIR;
+  if (uid !== undefined && runtime && path.isAbsolute(runtime)) {
+    try {
+      const metadata = await lstat(runtime);
+      if (
+        metadata.isDirectory() &&
+        !metadata.isSymbolicLink() &&
+        metadata.uid === uid &&
+        (metadata.mode & 0o077) === 0
+      ) {
+        return path.join(path.resolve(runtime), "tongs", "editor-exports");
+      }
+    } catch {
+      // Fall back to the per-user temp folder below.
+    }
+  }
+  const name =
+    uid === undefined ? "tongs-editor-exports" : `tongs-editor-exports-${uid}`;
+  return path.join(path.resolve(temporaryDirectory), name);
 }
 
 function defaultSpawnEditor(command: string, args: readonly string[]): ChildProcess {
@@ -379,19 +439,19 @@ function defaultScheduleExportExpiry(expire: () => void): () => void {
 }
 
 function attachBoundedCleanup(
-  completion: Promise<number | null | "error">,
+  completion: Promise<EditorExit>,
   cancelCompletion: () => void,
-  cleanup: () => void,
+  cleanup: (exit: EditorExit) => void,
   expire: () => void,
   scheduleExpiry: ScheduleExportExpiry,
 ): void {
   let settled = false;
   let cancelExpiry: () => void = () => undefined;
-  const completeOnce = () => {
+  const completeOnce = (exit: EditorExit) => {
     if (settled) return;
     settled = true;
     cancelExpiry();
-    cleanup();
+    cleanup(exit);
   };
   const expireOnce = () => {
     if (settled) return;
@@ -570,16 +630,22 @@ async function removeExport(
   identity: FileIdentity | null,
 ): Promise<boolean> {
   try {
-    const metadata = await lstat(filePath);
+    // Without an identity Tongs never created the file, so it is not removed.
     if (
       identity === null ||
       !EXPORT_NAME.test(path.basename(filePath)) ||
-      path.dirname(filePath) !== exportRoot ||
+      path.dirname(filePath) !== exportRoot
+    ) {
+      return false;
+    }
+    const metadata = await lstat(filePath);
+    // An editor that saves by writing a new file and renaming it over the
+    // export leaves a different inode under the same private name. A regular
+    // file owned by this user is still the export, so it is removed too.
+    if (
       !metadata.isFile() ||
       metadata.isSymbolicLink() ||
-      (typeof process.getuid === "function" && metadata.uid !== process.getuid()) ||
-      metadata.dev !== identity.device ||
-      metadata.ino !== identity.inode
+      (typeof process.getuid === "function" && metadata.uid !== process.getuid())
     ) {
       return false;
     }

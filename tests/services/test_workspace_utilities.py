@@ -235,6 +235,9 @@ async def test_editor_capacity_is_reserved_before_log_fetch() -> None:
     result = await _service(calls).prepare_editor_log(JOB)
 
     assert result.status is EditorPlanStatus.CAPACITY_EXCEEDED
+    assert "return at once" in result.message
+    assert "expire after 24 hours" in result.message
+    assert "wait flag" in result.message
     assert calls.reservations == [(JOB.job_id, "1" * 32)]
     assert calls.jobs == []
 
@@ -289,3 +292,62 @@ async def test_editor_command_control_characters_are_not_ready(command: str) -> 
         Calls(), config=Config(editor_command=command)
     ).prepare_editor_log(JOB)
     assert result.status is EditorPlanStatus.MALFORMED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "argv"),
+    [
+        ("code", ("code", "--wait")),
+        ("code --reuse-window", ("code", "--wait", "--reuse-window")),
+        ("code -w", ("code", "-w")),
+        ("/usr/bin/codium", ("/usr/bin/codium", "--wait")),
+        ("subl", ("subl", "--wait")),
+        ("gvim", ("gvim", "-f")),
+        ("gvim --nofork", ("gvim", "--nofork")),
+        ("kate", ("kate", "--block")),
+        ("kate -b", ("kate", "-b")),
+        ("gedit", ("gedit", "--wait")),
+        ("emacsclient -n", ("emacsclient",)),
+        ("emacsclient --no-wait -c", ("emacsclient", "-c")),
+        ("emacsclient -c", ("emacsclient", "-c")),
+        ("gvim --remote-silent", ("gvim", "-f", "--remote-wait-silent")),
+        ("gvim --remote", ("gvim", "-f", "--remote-wait")),
+        ("gvim --remote-tab", ("gvim", "-f", "--remote-tab-wait")),
+        ("gvim --remote-tab-silent", ("gvim", "-f", "--remote-tab-wait-silent")),
+        ("gvim -f --remote-wait", ("gvim", "-f", "--remote-wait")),
+        ("vim --remote-silent", ("vim", "--remote-wait-silent")),
+        ("vim --servername T --remote", ("vim", "--servername", "T", "--remote-wait")),
+        ("vim --remote-wait", ("vim", "--remote-wait")),
+        ("my-editor", ("my-editor",)),
+    ],
+)
+async def test_handoff_launchers_get_their_wait_flag_once(
+    command: str, argv: tuple[str, ...]
+) -> None:
+    result = await _service(
+        Calls(), config=Config(editor_command=command)
+    ).prepare_editor_log(JOB)
+
+    assert result.status is EditorPlanStatus.READY
+    assert result.argv == argv
+
+
+@pytest.mark.asyncio
+async def test_handoff_launcher_from_environment_gets_its_wait_flag() -> None:
+    result = await _service(
+        Calls(), config=Config(editor_command=""), environment={"VISUAL": "subl"}
+    ).prepare_editor_log(JOB)
+
+    assert result.status is EditorPlanStatus.READY
+    assert result.argv == ("subl", "--wait")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["vim", "vim -g", "emacsclient -n -t"])
+async def test_terminal_editors_without_a_remote_stay_unsupported(command: str) -> None:
+    result = await _service(
+        Calls(), config=Config(editor_command=command)
+    ).prepare_editor_log(JOB)
+
+    assert result.status is EditorPlanStatus.TERMINAL_UNSUPPORTED

@@ -173,3 +173,37 @@ for (const prefix of ["", "a", "ab"]) {
     assert.ok(notice.startsWith(prefix));
   });
 }
+
+test("the recovery state is published with the status only while it is set", async () => {
+  const fake = harness();
+  const transport = transportFor(fake);
+  await transport.start();
+  const reports = [];
+  const publisher = new ServiceStatusPublisher(transport, (status) =>
+    reports.push(`${status.state}@${status.revision}:${status.recovery ?? "none"}`),
+  );
+  publisher.start();
+  fake.children[0].finish(9, null);
+  transport.setRecovery("restarting");
+  transport.setRecovery("restarting");
+  assert.deepEqual(publisher.current, {
+    state: "stopped",
+    revision: 2,
+    notices: [],
+    recovery: "restarting",
+  });
+  await transport.restart();
+  transport.setRecovery("idle");
+  assert.deepEqual(publisher.current, { state: "connected", revision: 4, notices: [] });
+  assert.deepEqual(reports, [
+    "stopped@1:none",
+    "stopped@2:restarting",
+    "connected@3:restarting",
+    "connected@4:none",
+  ]);
+  publisher.dispose();
+  transport.setRecovery("failed");
+  assert.equal(reports.length, 4);
+  assert.equal(transport.serviceRecovery, "failed");
+  await transport.stop();
+});

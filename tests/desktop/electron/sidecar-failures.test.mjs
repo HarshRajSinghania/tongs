@@ -8,6 +8,10 @@ import {
   MIN_JSON_ITEMS,
   SidecarTransport,
 } from "../../../desktop/dist/src/main/sidecar.js";
+import {
+  ServiceRecoveryPolicy,
+  watchServiceLoss,
+} from "../../../desktop/dist/src/main/renderer_lifecycle.js";
 import { harness, launch, transportFor } from "./fake-sidecar.mjs";
 
 test("trusted launch binds the sidecar to the exact editor export root", async () => {
@@ -504,3 +508,219 @@ for (const [name, overrides] of [
     });
   });
 }
+
+/** Waits a bounded number of turns for a condition the test drives. */
+async function until(condition, label) {
+  for (let turn = 0; turn < 200; turn += 1) {
+    if (condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.fail(`timed out waiting for ${label}`);
+}
+
+test("a failed first handshake does not stop a later restart", async () => {
+  const fake = harness({ autoHandshake: false });
+  const transport = new SidecarTransport(launch, 60_000, 20, 1_000, fake.spawn);
+  await assert.rejects(transport.start(), { code: "startup_timeout" });
+  assert.equal(transport.serviceState, "stopped");
+  const restarting = transport.restart();
+  await until(() => fake.children[1]?.handshake !== undefined, "second handshake");
+  fake.respond(fake.children[1]);
+  await restarting;
+  assert.equal(transport.serviceState, "connected");
+  assert.equal(transport.sessionGeneration, 2);
+  assert.equal(transport.processId, fake.children[1].pid);
+  await transport.stop();
+  await assert.rejects(transport.start(), { code: "shutting_down" });
+});
+
+test("a rejected first handshake does not stop a later start", async () => {
+  const extras = { recovery_warnings: "not a list" };
+  const fake = harness({ handshakeExtras: extras });
+  const transport = transportFor(fake);
+  await assert.rejects(transport.start(), { code: "incompatible_handshake" });
+  delete extras.recovery_warnings;
+  await transport.start();
+  assert.equal(transport.serviceState, "connected");
+  assert.equal(fake.children.length, 2);
+  await transport.stop();
+});
+
+/** Wires a transport to the recovery policy the way the desktop app does. */
+function recovering(transport, { now = () => 0 } = {}) {
+  const states = [];
+  const policy = new ServiceRecoveryPolicy({
+    restart: async () => {
+      try {
+        await transport.restart();
+      } catch {
+        // The renderer recovery path reports a failed restart as a result.
+      }
+      return transport.serviceState === "connected";
+    },
+    shuttingDown: () => false,
+    onState: (state) => {
+      states.push(state);
+      transport.setRecovery(state);
+    },
+    now,
+  });
+  const detach = watchServiceLoss(transport, policy);
+  return { policy, states, detach };
+}
+
+test("a crashed service is restarted and a retried read succeeds", async () => {
+  const fake = harness();
+  const transport = transportFor(fake);
+  await transport.start();
+  const { policy, states, detach } = recovering(transport);
+  const first = transport.requestRead("repositories.discover", {}).result;
+  fake.children[0].finish(9, null);
+  await assert.rejects(first, { code: "unexpected_eof" });
+  await until(() => transport.serviceState === "connected", "restart");
+  await until(() => policy.state === "idle", "recovery to finish");
+  assert.deepEqual(states, ["restarting", "idle"]);
+  assert.equal(transport.serviceRecovery, "idle");
+  const retry = transport.requestRead("repositories.discover", {});
+  respondTo(fake.children[1], retry.requestId, { result: { repositories: [] } });
+  assert.deepEqual(await retry.result, { repositories: [] });
+  detach();
+  await transport.stop();
+});
+
+test("a read that finds no service restarts it once, and the retried read succeeds", async () => {
+  const fake = harness();
+  const transport = transportFor(fake);
+  await transport.start();
+  const pending = transport.requestRead("repositories.discover", {}).result;
+  fake.children[0].finish(9, null);
+  await assert.rejects(pending, { code: "unexpected_eof" });
+  // Nothing watched the crash, so only the failed read can report it.
+  const { policy, detach } = recovering(transport);
+  assert.throws(() => transport.requestRead("repositories.discover", {}), {
+    code: "not_running",
+  });
+  assert.throws(() => transport.requestRead("repositories.discover", {}), {
+    code: "not_running",
+  });
+  await until(() => transport.serviceState === "connected", "restart");
+  await until(() => policy.state === "idle", "recovery to finish");
+  assert.equal(policy.restartCount, 1);
+  assert.equal(fake.children.length, 2);
+  const retry = transport.requestRead("repositories.discover", {});
+  respondTo(fake.children[1], retry.requestId, { result: { repositories: [] } });
+  assert.deepEqual(await retry.result, { repositories: [] });
+  detach();
+  await transport.stop();
+});
+
+test("a read during shutdown or a deliberate stop does not ask for a restart", async () => {
+  const fake = harness();
+  const transport = transportFor(fake);
+  const lost = [];
+  transport.on("not_running", () => lost.push("not_running"));
+  await transport.start();
+  await transport.restart();
+  await transport.stop();
+  assert.throws(() => transport.requestRead("repositories.discover", {}), {
+    code: "not_running",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(lost, []);
+});
+
+test("a read while a restart stops the old service does not ask for a restart", async () => {
+  const fake = harness({ delayedShutdown: true });
+  const transport = transportFor(fake, 1_000);
+  const lost = [];
+  transport.on("not_running", () => lost.push("not_running"));
+  await transport.start();
+  const old = fake.children[0];
+  const restarting = transport.restart();
+  await until(() => old.frames.some((frame) => frame.method === "shutdown"), "shutdown request");
+  const shutdown = old.frames.find((frame) => frame.method === "shutdown");
+  // The old service accepts the shutdown but has not exited yet.
+  respondTo(old, shutdown.id, { result: {} });
+  await until(() => old.stdin.writableEnded, "the old service's input to close");
+  assert.equal(fake.children.length, 1);
+  assert.throws(() => transport.requestRead("repositories.discover", {}), {
+    code: "not_running",
+  });
+  old.finish(0, null);
+  await restarting;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(lost, []);
+  assert.equal(transport.serviceState, "connected");
+  const current = fake.children[1];
+  const stopping = transport.stop();
+  await until(() => current.frames.some((frame) => frame.method === "shutdown"), "final shutdown");
+  const last = current.frames.find((frame) => frame.method === "shutdown");
+  respondTo(current, last.id, { result: {} });
+  current.finish(0, null);
+  await stopping;
+});
+
+test("a read after a failed handshake does not ask for a restart", async () => {
+  const fake = harness({ autoHandshake: false });
+  const transport = new SidecarTransport(launch, 60_000, 20, 1_000, fake.spawn);
+  const lost = [];
+  transport.on("not_running", () => lost.push("not_running"));
+  await assert.rejects(transport.start(), { code: "startup_timeout" });
+  assert.throws(() => transport.requestRead("repositories.discover", {}), {
+    code: "not_running",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(lost, []);
+  assert.equal(fake.children.length, 1);
+  await transport.stop();
+});
+
+test("an invalid frame while a restart stops the old service does not spend a restart", async () => {
+  const fake = harness({ delayedShutdown: true });
+  const transport = transportFor(fake, 50);
+  await transport.start();
+  const { policy, detach } = recovering(transport);
+  const crashes = watchCrashes(transport);
+  const old = fake.children[0];
+  // The old service answers the restart's shutdown request with garbage.
+  old.stdin.on("data", (chunk) => {
+    if (String(chunk).includes('"method":"shutdown"')) old.stdout.write("garbage\n");
+  });
+  await transport.restart();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(crashes, []);
+  assert.equal(policy.restartCount, 0);
+  assert.equal(policy.state, "idle");
+  assert.equal(fake.children.length, 2);
+  assert.equal(transport.serviceState, "connected");
+  detach();
+  await transport.stop();
+});
+
+test("a service that keeps crashing is restarted three times, then left stopped", async () => {
+  const fake = harness();
+  // Every service after the first exits before its handshake completes.
+  const spawn = (...args) => {
+    const child = fake.spawn(...args);
+    if (fake.children.length > 1) queueMicrotask(() => child.finish(1, null));
+    return child;
+  };
+  const transport = new SidecarTransport(launch, 1_000, 1_000, 1_000, spawn);
+  await transport.start();
+  const { policy, states, detach } = recovering(transport);
+  fake.children[0].finish(9, null);
+  await until(() => policy.state === "failed", "the recovery to give up");
+  assert.equal(policy.restartCount, 3);
+  assert.equal(fake.children.length, 4);
+  assert.equal(transport.serviceState, "stopped");
+  assert.equal(transport.serviceRecovery, "failed");
+  assert.deepEqual(states, ["restarting", "failed"]);
+  // Later reads fail at once and never start another service.
+  assert.throws(() => transport.requestRead("repositories.discover", {}), {
+    code: "not_running",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(fake.children.length, 4);
+  detach();
+  await transport.stop();
+});
