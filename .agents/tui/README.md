@@ -89,9 +89,11 @@ Every tab lists without CI and fills CI per row through
 `MRTable.keys_near_viewport()` returns the rows in view plus one screen above
 and below, and `MRTable.ViewportChanged` (scroll or resize) rebuilds the queue
 after a short debounce, dropping queued rows that left the window; rows that
-arrive together are looked up as one view. The rows near the view are looked
-up at once (up to 200 per tab) so GitHub's client batches them into GraphQL
-queries of 50; the per-host request limit still bounds the requests. A pending row
+arrive together are looked up as one view. While the first All Open load
+streams in, lookups wait until it ends or pauses for longer than the debounce,
+so repositories that re-sort the list cost one window. Lookups in flight per
+tab and host are bounded by `max_parallel`, or by one GraphQL batch (50) while
+GitHub's client batches them (`TUIServiceAdapter.ci_lookup_limit()`). A pending row
 shows `…` (`..` in `ascii_mode`), and the CI sort puts pending rows last. A
 rate-limited lookup or list read leaves its rows pending, notifies once per tab
 load with the reset time from `ApplicationSession.host_rate_limit()`, adds the

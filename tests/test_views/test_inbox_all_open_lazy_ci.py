@@ -273,9 +273,11 @@ async def test_rows_show_loading_ci_then_their_own_status(tmp_path: Path) -> Non
 
         assert ci_cells(table) == {1: LOADING, 2: LOADING, 3: LOADING}
         assert sorted(client.page_reads) == [("acme/a", 1, False), ("acme/b", 1, False)]
-        # Every row in view is looked up at once; the per-host request limit
-        # (max_parallel is 2 here) bounds the requests, not the lookups.
-        await wait_until(pilot, lambda: len(client.ci_calls) == 3)
+        # Each lookup of this forge is its own read, so max_parallel (2 here)
+        # bounds the lookups in flight; the third waits for a slot.
+        await wait_until(pilot, lambda: len(client.ci_calls) == 2)
+        await pilot.pause(0.05)
+        assert len(client.ci_calls) == 2
 
         gate.set()
         await wait_until(pilot, lambda: LOADING not in ci_cells(table).values())

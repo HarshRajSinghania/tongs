@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime
@@ -62,12 +63,15 @@ _SEARCH_RESULT_CAP = 1000
 _CHECK_RUNS_PAGE_SIZE = 100
 _CHECK_RUNS_MAX_PAGES = 10
 
-# The state of one legacy commit status (Jenkins, Prow and similar).
+# The state of one legacy commit status (Jenkins, Prow and similar). Only
+# GraphQL reports "expected": a required status that has not reported yet,
+# which is still pending work.
 _COMMIT_STATUS_STATES = {
     "success": CIStatus.SUCCESS,
     "failure": CIStatus.FAILED,
     "error": CIStatus.FAILED,
     "pending": CIStatus.PENDING,
+    "expected": CIStatus.PENDING,
 }
 
 # A CI source the token may not read counts as empty when the other answers:
@@ -84,6 +88,11 @@ _CI_BATCH_SIZE = 50
 # A head commit with more checks than one query reads (the ``contexts(first:
 # 100)`` of the fragment below) is read over REST.
 _CI_ROLLUP_PAGE_SIZE = 100
+# A 404 from GraphQL means the host has none, so CI is read over REST from
+# then on. A 403 reads that batch over REST only; this many in a row (with
+# no batch answered between them) pause batching for the given time.
+_CI_GRAPHQL_FORBIDDEN_LIMIT = 2
+_CI_GRAPHQL_PAUSE_SECONDS = 600.0
 
 # The head commit and its checks for one pull request of a CI batch. Check
 # runs and commit statuses are classified like the REST reads.
@@ -238,7 +247,8 @@ def _rollup_context_state(node: object) -> CIStatus:
     """Classify one check of a GraphQL status check rollup.
 
     A check run and a commit status map exactly as their REST reads do, so a
-    batched read and a REST read agree.
+    batched read and a REST read agree. A commit status GraphQL reports as
+    EXPECTED (required, not reported yet) is PENDING.
     """
     if not isinstance(node, dict):
         return CIStatus.UNKNOWN
@@ -458,16 +468,27 @@ def _github_state_result(
 class GitHubClient(ForgeClient):
     """GitHub REST + GraphQL API client."""
 
-    def __init__(self, host: ForgeHost, http_client: httpx.AsyncClient):
+    def __init__(
+        self,
+        host: ForgeHost,
+        http_client: httpx.AsyncClient,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ):
         self._host = host
         self._http = http_client
+        self._clock = clock
         # Per-pull-request CI reads waiting for the next GraphQL batch.
         self._ci_reads: list[_CIRead] = []
         self._ci_timer: asyncio.TimerHandle | None = None
         self._ci_batch_deadline = 0.0
         self._ci_batches: set[asyncio.Task[None]] = set()
-        # False once the host answered that it has no usable GraphQL API.
+        # False once the host answered that it has no GraphQL API.
         self._ci_graphql = True
+        # GraphQL refusals (403) in a row, and the ``clock`` time until which
+        # repeated refusals pause batching.
+        self._ci_forbidden = 0
+        self._ci_paused_until = 0.0
 
     @property
     def _graphql_url(self) -> str:
@@ -1294,9 +1315,23 @@ class GitHubClient(ForgeClient):
     def supports_lazy_ci(self) -> bool:
         return True
 
+    @property
+    def batched_ci_lookups(self) -> int:
+        """How many per-pull-request CI lookups share one request right now.
+
+        While GraphQL batching is on, up to ``_CI_BATCH_SIZE`` lookups that
+        are in flight together become one query; otherwise each lookup is
+        its own REST read and this is 1.
+        """
+        return _CI_BATCH_SIZE if self._ci_batching() else 1
+
     async def close(self) -> None:
         self._cancel_ci_batches()
         await self._http.aclose()
+
+    def _ci_batching(self) -> bool:
+        """Return whether CI reads go out in GraphQL batches right now."""
+        return self._ci_graphql and self._clock() >= self._ci_paused_until
 
     async def _batched_ci_status(
         self, owner: str, repo: str, number: int, head_sha: str
@@ -1308,11 +1343,12 @@ class GitHubClient(ForgeClient):
         repository, go out as one query of up to ``_CI_BATCH_SIZE`` pull
         requests, which takes one slot of the per-host request limit.
         Returns None when this read must use REST instead: GraphQL is
-        unavailable on this host, the batch could not answer for this pull
+        unavailable on this host or paused after repeated refusals, the
+        batch was refused, the batch could not answer for this pull
         request, its head moved, or it has more checks than one query reads.
         A rate limit, a sign-in failure or a network failure raises.
         """
-        if not self._ci_graphql or type(number) is not int or number < 1:
+        if not self._ci_batching() or type(number) is not int or number < 1:
             return None
         loop = asyncio.get_running_loop()
         future: asyncio.Future[CIStatus | None] = loop.create_future()
@@ -1363,10 +1399,19 @@ class GitHubClient(ForgeClient):
             for read in batch:
                 read.future.cancel()
             raise
-        except (NotFoundError, ForgePermissionError):
-            # The host has no GraphQL API (an older GitHub Enterprise) or the
-            # token may not use it, so this client reads CI over REST.
+        except NotFoundError:
+            # The host has no GraphQL API (an older GitHub Enterprise), so
+            # this client reads CI over REST from then on.
             self._ci_graphql = False
+            results = [None] * len(batch)
+        except ForgePermissionError:
+            # The token may not use GraphQL, or the host refused this query.
+            # This batch reads REST; repeated refusals pause batching for a
+            # while rather than for the client's lifetime.
+            self._ci_forbidden += 1
+            if self._ci_forbidden >= _CI_GRAPHQL_FORBIDDEN_LIMIT:
+                self._ci_forbidden = 0
+                self._ci_paused_until = self._clock() + _CI_GRAPHQL_PAUSE_SECONDS
             results = [None] * len(batch)
         except (RateLimitError, AuthError, NetworkError) as error:
             # A rate limit, a sign-in failure or an unreachable host would
@@ -1383,6 +1428,9 @@ class GitHubClient(ForgeClient):
                 if not read.future.done():
                     read.future.set_exception(error)
             return
+        else:
+            # The host answered, so earlier refusals were not repeated ones.
+            self._ci_forbidden = 0
         for read, result in zip(batch, results):
             if not read.future.done():
                 read.future.set_result(result)

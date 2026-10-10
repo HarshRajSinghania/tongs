@@ -130,22 +130,20 @@ async def test_only_rows_near_the_view_are_looked_up(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_queued_lookups_that_scroll_away_are_dropped(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(inbox_module, "_CI_LOOKUPS_IN_FLIGHT", 4)
+async def test_queued_lookups_that_scroll_away_are_dropped(tmp_path: Path) -> None:
+    # Lookups in flight are bounded by max_parallel, which is 2 here.
     client = AllOpenOnlyClient(many(["acme/a"], 300), page_size=300)
     gate = asyncio.Event()
-    first_rows = {f"sha-{number}" for number in range(1, 5)}
+    first_rows = {f"sha-{number}" for number in range(1, 3)}
     client.ci_gates = {sha: gate for sha in first_rows}
     app = build(tmp_path, client, ["acme/a"])
 
     async with app.run_test(notifications=True) as pilot:
         await settle(app)
         table = await open_all_open(pilot, app, 300)
-        await wait_until(pilot, lambda: len(client.ci_calls) == 4)
-        # Four lookups wait; the rest of the window is queued behind them.
-        assert len(app.screen._ci["all-open"].queue) == 2 * rows_in_view(table) - 4
+        await wait_until(pilot, lambda: len(client.ci_calls) == 2)
+        # Two lookups wait; the rest of the window is queued behind them.
+        assert len(app.screen._ci["all-open"].queue) == 2 * rows_in_view(table) - 2
 
         table.focus()
         table.move_cursor(row=250)

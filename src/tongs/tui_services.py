@@ -275,6 +275,24 @@ class TUIServiceAdapter:
             fresh=fresh,
         )
 
+    async def ci_lookup_limit(self, hostname: str) -> int:
+        """Return how many per-row CI lookups of a host may be in flight.
+
+        Each lookup is its own read on GitLab and on GitHub's REST fallback,
+        so ``max_parallel`` bounds them as it bounds the host's requests.
+        While GitHub batches lookups into GraphQL queries, enough for one
+        full batch may be in flight, since they become one request.
+        """
+        max_parallel = self.session.config.max_parallel
+        try:
+            client = await self.session.forge_registry.get_client(hostname)
+        except Exception:  # noqa: BLE001 - The lookup itself reports any failure.
+            return max_parallel
+        batched = getattr(client, "batched_ci_lookups", 1)
+        if type(batched) is not int or batched <= 1:
+            return max_parallel
+        return max(max_parallel, batched)
+
     def rate_limit(self, hostname: str) -> HostRateLimit | None:
         """Return the rate limit a forge host answered with, while it lasts."""
         return self.session.host_rate_limit(hostname)

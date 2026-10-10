@@ -41,14 +41,18 @@ _TAB_TABLES = {
 _TABLE_TABS = {table.removeprefix("#"): tab_id for tab_id, table in _TAB_TABLES.items()}
 
 
-# CI lookups in flight per tab. The rows near the view (about three screens)
-# are looked up at once, so GitHub answers them in full batched queries of up
-# to 50 pull requests; every request still takes a slot of the per-host
-# request limit.
-_CI_LOOKUPS_IN_FLIGHT = 200
+# CI lookups in flight per tab and host: ``max_parallel``, the host's request
+# limit, since each GitLab or GitHub REST lookup is its own read and lookups
+# beyond it would only wait for a request slot, past the point where a scroll
+# can still drop them. While GitHub batches lookups into GraphQL queries,
+# enough for one batch (about 50) may be in flight, since they become one
+# request (``TUIServiceAdapter.ci_lookup_limit``). A host's first lookup
+# learns its limit before the rest start.
 
 # Scrolling settles for this long before the rows it shows are looked up, and
-# rows that arrive within it are looked up together.
+# rows that arrive within it are looked up together. While the first All Open
+# load streams in, rows are looked up once the stream ends or pauses for this
+# long, so repositories that re-sort the list do not each look up a window.
 _CI_WINDOW_DEBOUNCE_SECONDS = 0.1
 
 # How long the All Open status line shows the rows a load more added.
@@ -72,8 +76,11 @@ class _CILookups:
     in_flight: set[str] = field(default_factory=set)
     # Rows from an explicit refresh, whose lookup reads past the CI cache.
     fresh: set[str] = field(default_factory=set)
-    workers: int = 0
+    # Lookup workers running per host.
+    workers: dict[str, int] = field(default_factory=dict)
     window_timer: Timer | None = None
+    # A first load is streaming in, so view updates wait for it to settle.
+    streaming: bool = False
     # Hosts whose rate limit this tab load already reported.
     rate_limited: set[str] = field(default_factory=set)
 
@@ -132,6 +139,8 @@ class InboxScreen(Screen):
         # The row each table last highlighted, to tell a user's cursor move
         # from a reorder that keeps the cursor on its row.
         self._highlighted: dict[str, str | None] = {}
+        # How many CI lookups of each host may be in flight, as last learned.
+        self._ci_limits: dict[str, int] = {}
         # One timer per rate-limited host, resuming its lookups at the reset.
         self._rate_limit_timers: dict[str, Timer] = {}
 
@@ -288,11 +297,12 @@ class InboxScreen(Screen):
 
         ``restart`` waits for scrolling to settle; otherwise changes that
         arrive while an update is scheduled join it, so repositories that
-        land together are looked up as one view rather than one each.
+        land together are looked up as one view rather than one each. While
+        a first load streams in, every change waits for the stream to pause.
         """
         lookups = self._ci[tab_id]
         if lookups.window_timer is not None:
-            if not restart:
+            if not restart and not lookups.streaming:
                 return
             lookups.window_timer.stop()
 
@@ -468,6 +478,27 @@ class InboxScreen(Screen):
         )
 
     async def _stream_all_open(self, table: MRTable, load: int, *, fresh: bool) -> None:
+        """Show each repository's rows, then look up CI for the rows in view.
+
+        Repositories land in any order and each re-sorts the list, so CI
+        lookups wait until the stream ends or pauses for longer than the
+        debounce; then the rows near the view are looked up once and the
+        lookups follow scrolling. Rows of an earlier load still waiting for
+        CI, kept after a failed read, get their lookups the same way.
+        """
+        lookups = self._ci["all-open"]
+        lookups.streaming = True
+        try:
+            await self._read_all_open(table, load, fresh=fresh)
+        finally:
+            if load == self._all_open_load:
+                lookups.streaming = False
+        if load == self._all_open_load:
+            # The last rows may still scroll the view to keep the cursor on
+            # its row, so the lookup waits for that to settle too.
+            self._schedule_ci_window("all-open", restart=True)
+
+    async def _read_all_open(self, table: MRTable, load: int, *, fresh: bool) -> None:
         """Show each repository's rows as soon as that repository finishes."""
         items: list[ReviewListItem] = []
         failures: list[HostFailure] = []
@@ -515,9 +546,6 @@ class InboxScreen(Screen):
                     items,
                     self.app.services.deduplicate_failures(failures),
                 )
-                # Rows still waiting for CI, earlier or new, get their
-                # lookups when they are in view.
-                self._update_ci_window("all-open")
             return
         if load != self._all_open_load:
             return
@@ -534,8 +562,6 @@ class InboxScreen(Screen):
                 if table.row_count
                 else f"{unloaded[0].upper()}{unloaded[1:]}"
             )
-            # Earlier rows still waiting for CI get their lookups again.
-            self._update_ci_window("all-open")
         else:
             self._set_all_open_status(self._all_open_summary(table))
         self._notify_failures(
@@ -678,6 +704,10 @@ class InboxScreen(Screen):
         if keys is None:
             return
         lookups = self._ci[tab_id]
+        if lookups.window_timer is not None:
+            # This update covers any that was scheduled.
+            lookups.window_timer.stop()
+            lookups.window_timer = None
         queue: deque[str] = deque()
         for key in keys:
             summary = table.get_mr(key)
@@ -696,22 +726,47 @@ class InboxScreen(Screen):
         self._start_ci_workers(tab_id, table)
 
     def _start_ci_workers(self, tab_id: str, table: MRTable) -> None:
+        """Run lookup workers for the queued rows, per host up to its limit.
+
+        A host whose limit is not known yet gets one worker, which learns it
+        and starts the rest.
+        """
         lookups = self._ci[tab_id]
-        while lookups.workers < min(_CI_LOOKUPS_IN_FLIGHT, len(lookups.queue)):
-            lookups.workers += 1
-            self.run_worker(
-                self._run_ci_lookups(tab_id, table, lookups.generation),
-                group=lookups.group,
-                exit_on_error=False,
-            )
+        queued: dict[str, int] = {}
+        for key in lookups.queue:
+            summary = table.get_mr(key)
+            if summary is not None:
+                hostname = summary.forge_host.hostname
+                queued[hostname] = queued.get(hostname, 0) + 1
+        for hostname, count in queued.items():
+            wanted = min(self._ci_limits.get(hostname, 1), count)
+            while lookups.workers.get(hostname, 0) < wanted:
+                lookups.workers[hostname] = lookups.workers.get(hostname, 0) + 1
+                self.run_worker(
+                    self._run_ci_lookups(tab_id, table, lookups.generation, hostname),
+                    group=lookups.group,
+                    exit_on_error=False,
+                )
 
     async def _run_ci_lookups(
-        self, tab_id: str, table: MRTable, generation: int
+        self, tab_id: str, table: MRTable, generation: int, hostname: str
     ) -> None:
+        """Look up the queued rows of one host, in table order."""
         lookups = self._ci[tab_id]
         try:
-            while generation == lookups.generation and lookups.queue:
-                key = lookups.queue.popleft()
+            while generation == lookups.generation:
+                limit = await self.app.services.ci_lookup_limit(hostname)
+                if generation != lookups.generation:
+                    return
+                if limit != self._ci_limits.get(hostname):
+                    self._ci_limits[hostname] = limit
+                    # More (or fewer) lookups of this host may run at once.
+                    self._start_ci_workers(tab_id, table)
+                if lookups.workers.get(hostname, 0) > limit:
+                    break
+                key = _pop_queued(lookups.queue, table, hostname)
+                if key is None:
+                    break
                 summary = table.get_mr(key)
                 if (
                     summary is None
@@ -719,7 +774,6 @@ class InboxScreen(Screen):
                     or not table.is_ci_pending(summary)
                 ):
                     continue
-                hostname = summary.forge_host.hostname
                 if self.app.services.rate_limit(hostname) is not None:
                     self._on_rate_limited(tab_id, hostname)
                     continue
@@ -755,7 +809,11 @@ class InboxScreen(Screen):
                     lookups.queue.append(key)
         finally:
             if generation == lookups.generation:
-                lookups.workers -= 1
+                left = lookups.workers.get(hostname, 0) - 1
+                if left > 0:
+                    lookups.workers[hostname] = left
+                else:
+                    lookups.workers.pop(hostname, None)
 
     def _on_rate_limited(self, tab_id: str, hostname: str) -> None:
         """Hold a host's lookups until its reset and say so once per load."""
@@ -810,7 +868,7 @@ class InboxScreen(Screen):
         lookups.generation += 1
         lookups.queue = deque()
         lookups.in_flight = set()
-        lookups.workers = 0
+        lookups.workers = {}
         if lookups.window_timer is not None:
             lookups.window_timer.stop()
             lookups.window_timer = None
@@ -827,6 +885,7 @@ class InboxScreen(Screen):
             return
         self._all_open_load += 1
         self._all_open_pending = False
+        self._ci["all-open"].streaming = False
         self.workers.cancel_group(self, "all-open")
         self.loading_all_open = False
         if self._all_open_more:
@@ -937,6 +996,16 @@ class InboxScreen(Screen):
         tabbed = self.query_one(TabbedContent)
         table_id = _TAB_TABLES.get(tabbed.active, "#reviews-table")
         return self.query_one(table_id, MRTable)
+
+
+def _pop_queued(queue: deque[str], table: MRTable, hostname: str) -> str | None:
+    """Take the first queued row of a host off the queue, if any."""
+    for index, key in enumerate(queue):
+        summary = table.get_mr(key)
+        if summary is not None and summary.forge_host.hostname == hostname:
+            del queue[index]
+            return key
+    return None
 
 
 def _summary_for(screen: InboxScreen, tab_id: str, key: str) -> MRSummary | None:
