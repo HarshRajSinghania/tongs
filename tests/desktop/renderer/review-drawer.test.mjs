@@ -8,6 +8,13 @@ import {
   clearPendingEdit,
   draftContentTranscript,
 } from "../../../desktop/dist/src/renderer/features/review/drawer.js";
+import {
+  capabilitiesReady,
+  waitForCount,
+  waitForFlag,
+  waitForList,
+  waitForText,
+} from "./wait.mjs";
 
 const desktopRequire = createRequire(
   new URL("../../../desktop/package.json", import.meta.url),
@@ -22,7 +29,7 @@ Object.assign(globalThis, {
   HTMLElement: dom.window.HTMLElement,
   Node: dom.window.Node,
 });
-const { cleanup, fireEvent, render, waitFor } = desktopRequire(
+const { cleanup, fireEvent, render } = desktopRequire(
   "@testing-library/react",
 );
 const React = desktopRequire("react");
@@ -37,6 +44,10 @@ const REVISION = {
   start_sha: null,
 };
 const DRAFT_ID = "11111111-1111-4111-8111-111111111111";
+
+/** The drawer's verdict tiles, which render only once the capability read
+ * behind them has answered. */
+const VERDICT_TILES = ".review-drawer-verdict-tiles input";
 
 /**
  * S54, end to end, on one review: start a review from the diff, add a second
@@ -69,7 +80,7 @@ test("S54 runs from the in-diff composer through the drawer to a submitted comme
     target: { value: "Guard the zero divisor" },
   });
   fireEvent.click(view.getByRole("button", { name: "Start a review" }));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
 
   // A suggestion on the same line enters the same pending review.
   fireEvent.click(
@@ -78,26 +89,25 @@ test("S54 runs from the in-diff composer through the drawer to a submitted comme
   const composer = await view.findByLabelText("Inline review comment");
   fireEvent.change(composer, { target: { value: "Raise the builtin" } });
   fireEvent.click(view.getByRole("button", { name: "Insert suggestion" }));
-  await waitFor(() =>
-    assert.equal(
-      view.getByLabelText("Inline review comment").value.includes("```suggestion"),
-      true,
-    ),
+  await waitForFlag(
+    () => view.getByLabelText("Inline review comment").value.includes("```suggestion"),
+    true,
   );
   fireEvent.click(view.getByRole("button", { name: "Add to review" }));
-  await waitFor(() => assert.equal(saves.length, 2));
+  await waitForCount(() => saves.length, 2);
 
   // The review's general comment and its verdict are the drawer's.
   fireEvent.click(view.getByRole("button", { name: /Your review/ }));
   fireEvent.change(await view.findByLabelText("Summary"), {
     target: { value: "Two small changes, otherwise good." },
   });
+  await capabilitiesReady(view.container, VERDICT_TILES);
   fireEvent.click(view.getByRole("radio", { name: "Comment" }));
   fireEvent.click(view.getByRole("button", { name: "Submit review" }));
   fireEvent.click(
     await view.findByRole("button", { name: "Confirm submit review" }),
   );
-  await waitFor(() => assert.equal(submissions.length, 1));
+  await waitForCount(() => submissions.length, 1);
 
   // Submit saves the summary and the verdict first, so the submitted version
   // is the one the store confirmed rather than the one on screen.
@@ -218,11 +228,12 @@ test("the summary and the verdict are saved on the draft's own version", async (
   fireEvent.change(await view.findByLabelText("Summary"), {
     target: { value: "Looks right to me." },
   });
+  await capabilitiesReady(view.container, VERDICT_TILES);
   fireEvent.click(view.getByRole("radio", { name: "Approve" }));
   fireEvent.click(
     view.getByRole("button", { name: "Save summary and verdict" }),
   );
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   assert.equal(saves[0].expected_version, 4);
   assert.equal(saves[0].draft_id, DRAFT_ID);
   assert.equal(saves[0].content.body, "Looks right to me.");
@@ -248,6 +259,7 @@ test("a verdict the forge or the permission withholds has no tile at all", async
   );
   fireEvent.click(await view.findByRole("button", { name: /Your review/ }));
   await view.findByLabelText("Summary");
+  await capabilitiesReady(view.container, VERDICT_TILES);
   assert.deepEqual(
     view.getAllByRole("radio").map((element) => element.value),
     ["comment"],
@@ -378,11 +390,9 @@ test("a paused submission returns to editing beside Resume without sending more"
   );
 
   fireEvent.click(returning[0]);
-  await waitFor(() =>
-    assert.equal(
-      view.queryAllByRole("button", { name: "Return draft to editing" }).length,
-      0,
-    ),
+  await waitForCount(
+    () => view.queryAllByRole("button", { name: "Return draft to editing" }).length,
+    0,
   );
   assert.equal(
     JSON.stringify(reconciles),
@@ -443,11 +453,9 @@ test("a listed paused attempt returned to editing leaves the recovery list", asy
   fireEvent.click(
     await view.findByRole("button", { name: "Return draft to editing" }),
   );
-  await waitFor(() =>
-    assert.equal(
-      view.queryAllByRole("button", { name: "Return draft to editing" }).length,
-      0,
-    ),
+  await waitForCount(
+    () => view.queryAllByRole("button", { name: "Return draft to editing" }).length,
+    0,
   );
   assert.equal(view.queryAllByLabelText("Submission steps").length, 0);
   assert.equal(
@@ -511,7 +519,7 @@ test("a refused start adopts the stored draft version before the next save", asy
   fireEvent.click(
     view.getByRole("button", { name: "Save summary and verdict" }),
   );
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   assert.equal(saves[0].expected_version, 4);
   assert.equal(saves[0].content.body, "Kept summary, revised");
   await view.findByText("Version 5");
@@ -662,7 +670,7 @@ test("a conflict raised by a drawer save is resolved in the drawer", async () =>
       name: "Keep my text and save over version 5",
     }),
   );
-  await waitFor(() => assert.equal(saves.length, 2));
+  await waitForCount(() => saves.length, 2);
   assert.equal(saves[1].expected_version, 5);
   assert.equal(saves[1].content.body, "My text");
   await view.findByText("Version 6");
@@ -688,8 +696,9 @@ test("Escape closes the drawer and hands focus back to the button", async () => 
   fireEvent.keyDown(view.getByRole("dialog", { name: "Your review" }), {
     key: "Escape",
   });
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".review-drawer").length, 0),
+  await waitForCount(
+    () => view.container.querySelectorAll(".review-drawer").length,
+    0,
   );
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
   assert.equal(
@@ -775,7 +784,7 @@ test("Delete in the drawer removes the entry from the store and from the diff", 
       name: "Delete pending comment on src/calc.py, new line 11",
     }),
   );
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   assert.equal(saves[0].expected_version, 2);
   assert.equal(
     transcript(saves[0].content),
@@ -783,11 +792,9 @@ test("Delete in the drawer removes the entry from the store and from the diff", 
       "\n",
     ),
   );
-  await waitFor(() =>
-    assert.equal(
-      view.container.querySelectorAll(".review-drawer-entry").length,
-      1,
-    ),
+  await waitForCount(
+    () => view.container.querySelectorAll(".review-drawer-entry").length,
+    1,
   );
   assert.equal(
     view.container.querySelectorAll(
@@ -878,7 +885,7 @@ test("a stale entry is listed by its stored line, editable, with no jump", async
       name: "Save pending comment on src/calc.py, new line 11",
     }),
   );
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
 
   // The body changed and nothing else did. The anchor is compared field by
   // field against the one the store held, so a retarget cannot hide in it.
@@ -953,7 +960,7 @@ test("a drawer write refused by the workflow state shows the refusal, not a read
     target: { value: "Another note" },
   });
   fireEvent.click(view.getByRole("button", { name: "Add to review" }));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
 
   // The drawer's own instance is not busy, so its Delete is pressable and the
   // state is what refuses it.
@@ -1006,19 +1013,17 @@ test("a discard refused while a save is in flight names the save on the button",
     view.getByRole("button", { name: "Save summary and verdict" }),
   );
   const discard = await view.findByRole("button", { name: "Discard review" });
-  await waitFor(() => assert.equal(discard.disabled, true));
+  await waitForFlag(() => discard.disabled, true);
   assert.equal(
     discard.getAttribute("title"),
     "A draft save is in flight. Let it settle before discarding the review.",
   );
   assert.equal(discards.length, 0);
   release();
-  await waitFor(() => assert.equal(view.getAllByText("Version 3").length, 1));
-  await waitFor(() =>
-    assert.equal(
-      view.getByRole("button", { name: "Discard review" }).disabled,
-      false,
-    ),
+  await waitForCount(() => view.getAllByText("Version 3").length, 1);
+  await waitForFlag(
+    () => view.getByRole("button", { name: "Discard review" }).disabled,
+    false,
   );
 });
 
@@ -1076,11 +1081,9 @@ test("an in-diff write refused while the drawer saves is explained on the diff",
     1,
   );
   fireEvent.click(view.getByRole("button", { name: "Dismiss" }));
-  await waitFor(() =>
-    assert.equal(
-      view.container.querySelectorAll(".diff-view .notice-error").length,
-      0,
-    ),
+  await waitForCount(
+    () => view.container.querySelectorAll(".diff-view .notice-error").length,
+    0,
   );
   release();
 });
@@ -1116,14 +1119,13 @@ test("a failure raised while the drawer is shut is still there on reopen", async
   );
   // Shut before the write settles, so the failure lands on a closed drawer.
   fireEvent.click(view.getByRole("button", { name: "Close your review" }));
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".review-drawer").length, 0),
+  await waitForCount(
+    () => view.container.querySelectorAll(".review-drawer").length,
+    0,
   );
-  await waitFor(() =>
-    assert.equal(
-      toggle.getAttribute("aria-label"),
-      "Your review, 0 pending, needs attention",
-    ),
+  await waitForText(
+    () => toggle.getAttribute("aria-label"),
+    "Your review, 0 pending, needs attention",
   );
   assert.equal(toggle.classList.contains("review-drawer-toggle-error"), true);
   fireEvent.click(toggle);
@@ -1192,7 +1194,7 @@ test("Discard review is confirmed inline and then drops the pending review", asy
       name: "Confirm discard of 1 pending comment and the summary",
     }),
   );
-  await waitFor(() => assert.equal(discards.length, 1));
+  await waitForCount(() => discards.length, 1);
   assert.equal(discards[0].draft_id, DRAFT_ID);
   assert.equal(discards[0].expected_version, 4);
 
@@ -1292,11 +1294,9 @@ test("Escape cancels an armed discard and leaves the pending review untouched", 
   fireEvent.keyDown(view.getByRole("dialog", { name: "Your review" }), {
     key: "Escape",
   });
-  await waitFor(() =>
-    assert.equal(
-      view.container.querySelectorAll(".review-drawer-confirm").length,
-      0,
-    ),
+  await waitForCount(
+    () => view.container.querySelectorAll(".review-drawer-confirm").length,
+    0,
   );
   assert.equal(discards.length, 0);
 
@@ -1314,8 +1314,9 @@ test("Escape cancels an armed discard and leaves the pending review untouched", 
   fireEvent.keyDown(view.getByRole("dialog", { name: "Your review" }), {
     key: "Escape",
   });
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".review-drawer").length, 0),
+  await waitForCount(
+    () => view.container.querySelectorAll(".review-drawer").length,
+    0,
   );
   assert.equal(discards.length, 0);
 });
@@ -1366,8 +1367,9 @@ test("the composer overflow discards the pending review and returns to Start a r
     target: { value: "Guard the zero divisor" },
   });
   fireEvent.click(view.getByRole("button", { name: "Start a review" }));
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".pending-card").length, 1),
+  await waitForCount(
+    () => view.container.querySelectorAll(".pending-card").length,
+    1,
   );
 
   // Reopened on the same line, the overflow is now offered.
@@ -1384,14 +1386,15 @@ test("the composer overflow discards the pending review and returns to Start a r
   fireEvent.click(
     view.getByRole("button", { name: "Confirm discard of 1 pending comment" }),
   );
-  await waitFor(() => assert.equal(discards.length, 1));
+  await waitForCount(() => discards.length, 1);
   assert.equal(discards[0].draft_id, DRAFT_ID);
   assert.equal(discards[0].expected_version, 2);
 
   // The diff drops its pending cards, the badge returns to zero, and the
   // composer that is still open offers to start a review again.
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".pending-card").length, 0),
+  await waitForCount(
+    () => view.container.querySelectorAll(".pending-card").length,
+    0,
   );
   assert.equal(
     view.getByRole("button", { name: /Your review/ }).getAttribute("aria-label"),
@@ -1466,19 +1469,19 @@ test("Escape in the composer cancels the armed discard, then the overflow, then 
 
   // Stage one: the armed confirmation is cancelled and nothing else moves.
   escape();
-  await waitFor(() => assert.equal(prompts(), 0));
+  await waitForCount(() => prompts(), 0);
   assert.equal(composers(), 1);
   assert.equal(overflows(), 1);
   assert.equal(discards.length, 0);
 
   // Stage two: the overflow closes, the composer stays.
   escape();
-  await waitFor(() => assert.equal(overflows(), 0));
+  await waitForCount(() => overflows(), 0);
   assert.equal(composers(), 1);
 
   // Stage three: with nothing left to answer, the composer closes as always.
   escape();
-  await waitFor(() => assert.equal(composers(), 0));
+  await waitForCount(() => composers(), 0);
   assert.equal(discards.length, 0);
   assert.equal(view.container.querySelectorAll(".pending-card").length, 1);
 });
@@ -1542,7 +1545,7 @@ test("a refused discard reports its own reason and a successful one clears the s
   fireEvent.click(
     view.getByRole("button", { name: "Save summary and verdict" }),
   );
-  await waitFor(() => assert.equal(notices().length, 1));
+  await waitForCount(() => notices().length, 1);
   assert.deepEqual(notices(), [
     "The forge could not be reached. Refresh remote state before deciding whether to retry.",
   ]);
@@ -1555,11 +1558,9 @@ test("a refused discard reports its own reason and a successful one clears the s
       name: "Confirm discard of 1 pending comment and the summary",
     }),
   );
-  await waitFor(() =>
-    assert.deepEqual(notices(), [
-      "The forge refused this action: the review changed remotely or its branch conflicts with the target. Refresh, and check for merge conflicts.",
-    ]),
-  );
+  await waitForList(() => notices(), [
+    "The forge refused this action: the review changed remotely or its branch conflicts with the target. Refresh, and check for merge conflicts.",
+  ]);
   assert.equal(view.container.querySelectorAll(".pending-card").length, 1);
 
   // The discard that lands leaves no error behind it.
@@ -1570,8 +1571,9 @@ test("a refused discard reports its own reason and a successful one clears the s
       name: "Confirm discard of 1 pending comment and the summary",
     }),
   );
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".pending-card").length, 0),
+  await waitForCount(
+    () => view.container.querySelectorAll(".pending-card").length,
+    0,
   );
   assert.deepEqual(notices(), []);
 });
@@ -1608,7 +1610,7 @@ test("a discard taken from the composer prunes the drawer recovery list", async 
 
   const toggle = await view.findByRole("button", { name: /Your review/ });
   fireEvent.click(toggle);
-  await waitFor(() => assert.equal(recoveries(), 3));
+  await waitForCount(() => recoveries(), 3);
 
   // Adopt the middle one, then leave the drawer entirely.
   fireEvent.click(
@@ -1616,8 +1618,9 @@ test("a discard taken from the composer prunes the drawer recovery list", async 
   );
   await view.findByLabelText("Summary");
   fireEvent.click(view.getByRole("button", { name: "Close your review" }));
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".review-drawer").length, 0),
+  await waitForCount(
+    () => view.container.querySelectorAll(".review-drawer").length,
+    0,
   );
 
   // Discard it from the in-diff overflow, without the drawer being open.
@@ -1630,12 +1633,12 @@ test("a discard taken from the composer prunes the drawer recovery list", async 
   fireEvent.click(
     view.getByRole("button", { name: "Confirm discard of the summary" }),
   );
-  await waitFor(() => assert.equal(discards.length, 1));
+  await waitForCount(() => discards.length, 1);
   assert.equal(discards[0].draft_id, DRAFT_ID);
 
   // The drawer offers the two that are left, and not the one that is gone.
   fireEvent.click(view.getByRole("button", { name: /Your review/ }));
-  await waitFor(() => assert.equal(recoveries(), 2));
+  await waitForCount(() => recoveries(), 2);
   assert.equal(
     [...view.container.querySelectorAll(".review-workflow-recovery button")]
       .map((element) => element.textContent)
@@ -1663,7 +1666,7 @@ test("one active-draft read answers mount adoption, the drawer and the first bin
   );
   await view.findByRole("button", { name: "Comment on new line 11" });
   await view.findByRole("button", { name: /Your review/ });
-  await waitFor(() => assert.equal(reads >= 1, true));
+  await waitForFlag(() => reads >= 1, true);
   assert.equal(reads, 1);
 });
 
