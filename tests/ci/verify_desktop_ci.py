@@ -59,64 +59,31 @@ def _load_ci_plan() -> ModuleType:
 
 CI_PLAN = _load_ci_plan()
 
-REQUIRED_GATE_JOBS: frozenset[str] = frozenset(CI_PLAN.LANE_CI_JOBS.values()) | {
-    CI_PLAN.CHANGES_JOB
-}
+REQUIRED_GATE_JOBS: frozenset[str] = CI_PLAN.AGGREGATE_JOBS
 
 
 def load_plan(path: Path) -> Any:
     """Read the effective plan file strictly."""
 
     try:
-        text = Path(path).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as error:
-        raise VerificationError(f"effective plan is unreadable: {path}") from error
-    try:
-        return CI_PLAN.Plan.from_json(text)
-    except ValueError as error:
-        raise VerificationError(f"effective plan is malformed: {error}") from error
+        return CI_PLAN.read_plan_file(path)
+    except CI_PLAN.PlanError as error:
+        raise VerificationError(str(error)) from error
 
 
 def verify_job_set(
     raw_results: str, expected: dict[str, frozenset[str]], label: str
 ) -> dict[str, str]:
-    """Require the exact job set and an allowed result for each job."""
+    """Require the exact job set and an allowed result for each job.
 
-    if not isinstance(raw_results, str) or not raw_results.strip():
-        raise VerificationError(f"{label} results are absent")
+    The policy lives in ``ci_plan.check_job_results``, shared with the
+    production gate; this keeps the aggregate's own error type.
+    """
+
     try:
-        results: Any = json.loads(raw_results)
-    except json.JSONDecodeError as error:
-        raise VerificationError(f"{label} results are malformed JSON") from error
-    if not isinstance(results, dict):
-        raise VerificationError(f"{label} results must be a JSON object")
-
-    actual_jobs = set(results)
-    if actual_jobs != set(expected):
-        missing = sorted(set(expected) - actual_jobs)
-        unexpected = sorted(actual_jobs - set(expected))
-        raise VerificationError(
-            f"{label} job set mismatch: missing={missing}, unexpected={unexpected}"
-        )
-
-    observed: dict[str, str] = {}
-    rejected: list[str] = []
-    for name in sorted(expected):
-        job = results[name]
-        if not isinstance(job, dict):
-            rejected.append(f"{name}=malformed")
-            continue
-        result = job.get("result")
-        if result not in expected[name]:
-            allowed = "|".join(sorted(expected[name]))
-            rejected.append(f"{name}={result!r} (expected {allowed})")
-            continue
-        observed[name] = result
-    if rejected:
-        raise VerificationError(
-            f"{label} jobs did not match the effective plan: " + ", ".join(rejected)
-        )
-    return observed
+        return CI_PLAN.check_job_results(raw_results, expected, label)
+    except CI_PLAN.JobResultError as error:
+        raise VerificationError(str(error)) from error
 
 
 def verify_aggregate_results(raw_results: str, plan: Any) -> None:

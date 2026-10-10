@@ -9,14 +9,22 @@ import pytest
 
 from tests.ci.verify_desktop_ci import (
     CI_PLAN,
+    REQUIRED_GATE_JOBS,
     VerificationError,
     fallback_note,
     load_plan,
     main,
     verify_aggregate_results,
+    verify_job_set,
     verify_mcp_junit,
     verify_pytest_junit,
 )
+from tests.ci.verify_desktop_production_gate import (
+    REQUIRED_CI_JOBS,
+    GateVerificationError,
+    verify_job_results,
+)
+from tests.ci.verify_desktop_production_gate import load_plan as load_gate_plan
 
 COMMIT = "1" * 40
 FULL = CI_PLAN.full_plan(COMMIT, "event 'push' is not pull_request")
@@ -196,6 +204,45 @@ def test_load_plan_rejects_a_missing_or_malformed_file(tmp_path: Path) -> None:
         load_plan(malformed)
     malformed.write_text(DOCS_ONLY.to_json())
     assert load_plan(malformed) == DOCS_ONLY
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "{broken",
+        "[]",
+        json.dumps({"changes": {"result": "success"}}),
+        json.dumps({**_results(DOCS_ONLY), "core": {"result": "success"}}),
+        json.dumps({**_results(DOCS_ONLY), "core": None}),
+    ],
+)
+def test_both_verifiers_judge_job_results_with_one_policy(raw: str) -> None:
+    # The aggregate and the production gate share ci_plan's checker: each
+    # keeps its own error type, and both report the same message.
+    expected = CI_PLAN.expected_ci_results(DOCS_ONLY)
+    with pytest.raises(CI_PLAN.JobResultError) as shared:
+        CI_PLAN.check_job_results(raw, expected, "ordinary CI")
+    with pytest.raises(VerificationError) as aggregate:
+        verify_job_set(raw, expected, "ordinary CI")
+    with pytest.raises(GateVerificationError) as gate:
+        verify_job_results(raw, expected, "ordinary CI")
+    assert str(aggregate.value) == str(gate.value) == str(shared.value)
+    assert REQUIRED_GATE_JOBS == REQUIRED_CI_JOBS == CI_PLAN.AGGREGATE_JOBS
+
+
+def test_both_verifiers_read_the_plan_file_with_one_policy(tmp_path: Path) -> None:
+    path = tmp_path / "plan.json"
+    for content in (None, "[]"):
+        if content is not None:
+            path.write_text(content)
+        with pytest.raises(CI_PLAN.PlanError) as shared:
+            CI_PLAN.read_plan_file(path)
+        with pytest.raises(VerificationError) as aggregate:
+            load_plan(path)
+        with pytest.raises(GateVerificationError) as gate:
+            load_gate_plan(path)
+        assert str(aggregate.value) == str(gate.value) == str(shared.value)
 
 
 def test_the_cli_requires_a_plan_and_verifies_against_it(
