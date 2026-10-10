@@ -426,7 +426,9 @@ def test_the_lint_job_runs_the_harness_suites_without_skips(
 #: The one site build, run by the ci.yml docs lane on every pull request that
 #: selects it and by docs.yml before each Pages deploy.
 SITE_BUILD_COMMANDS = ["npm ci --prefix site", "npm run build --prefix site"]
-SETUP_NODE = "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38"
+# Any pinned release of setup-node; the SHA pin itself is checked by the
+# workflow pin contract, so a Dependabot bump does not break this test.
+SETUP_NODE = "actions/setup-node@"
 
 
 def _run_commands(job: dict[str, Any]) -> list[str]:
