@@ -59,6 +59,9 @@ def _file_wire(file_index: int, file: DiffFile) -> JsonObject:
         "is_mode_only": file.is_mode_only,
         "is_rename_only": file.is_rename_only,
         "is_unavailable": file.is_unavailable,
+        # GitHub reports no file modes, so null is their common wire form.
+        "old_mode": file.old_mode or None,
+        "new_mode": file.new_mode or None,
     }
 
 

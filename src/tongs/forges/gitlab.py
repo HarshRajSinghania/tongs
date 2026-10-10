@@ -380,13 +380,20 @@ class GitLabClient(ForgeClient):
             return ()
 
     async def get_mr_diff(self, repo_path: str, number: int) -> list[dict]:
+        """Read every file diff from the paginated ``/diffs`` endpoint.
+
+        It replaces the deprecated ``/changes`` endpoint and returns the same
+        per-file shape, ``a_mode``/``b_mode`` included.  Whether GitLab capped
+        the changed file list is still read from the merge request's
+        ``changes_count``, so the overflow banner does not depend on this call.
+        """
         project = _encode_project(repo_path)
-        data = await request(
+        data = await paginate(
             self._http,
-            "GET",
-            f"/projects/{project}/merge_requests/{number}/changes",
+            f"/projects/{project}/merge_requests/{number}/diffs",
+            per_page=100,
         )
-        return data.get("changes", [])
+        return [change for change in data if isinstance(change, dict)]
 
     async def list_mr_commits(self, repo_path: str, number: int) -> list[Commit]:
         project = _encode_project(repo_path)

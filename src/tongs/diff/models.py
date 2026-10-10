@@ -71,6 +71,30 @@ class DiffFile:
     # residue of a withheld patch that could be either binary content or a
     # mode-only change, which its files endpoint does not distinguish.
     is_unavailable: bool = False
+    # Git file modes as the forge or the patch reports them, for example
+    # ``"100644"``.  ``None`` means the source does not report a mode, which
+    # is always the case for GitHub's files endpoint.
+    old_mode: str | None = None
+    new_mode: str | None = None
+
+    @property
+    def mode_change(self) -> str:
+        """``"mode 100644 -> 100755"`` when the file mode changed, else ``""``.
+
+        A missing mode or the all-zero mode GitLab reports for the absent side
+        of an added or deleted file is not a mode change.
+        """
+        old_mode = self.old_mode
+        new_mode = self.new_mode
+        if (
+            not old_mode
+            or not new_mode
+            or old_mode == new_mode
+            or not old_mode.strip("0")
+            or not new_mode.strip("0")
+        ):
+            return ""
+        return f"mode {old_mode} -> {new_mode}"
 
     @property
     def is_metadata_only(self) -> bool:

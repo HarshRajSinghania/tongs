@@ -4,9 +4,9 @@ This parser is forge-agnostic. Both GitHub and GitLab produce standard
 unified diff format. The parser handles:
 - Standard @@ hunk headers with optional function context
 - No-newline-at-end-of-file markers
-- File mode changes
+- File mode changes, including sections that change only the mode
 - Binary file markers
-- Renamed files (with similarity index)
+- Renamed and copied files (with similarity index)
 - Multiple files in a single diff
 """
 
@@ -26,6 +26,11 @@ FILE_HEADER_RE = re.compile(r"^--- (.+)$")
 FILE_HEADER_NEW_RE = re.compile(r"^\+\+\+ (.+)$")
 
 DIFF_GIT_RE = re.compile(r"^diff --git a/(.+) b/(.+)$")
+_DIFF_GIT_PREFIX = "diff --git "
+
+# A git file mode such as ``100644``.  Anything else on a mode line is ignored
+# rather than shown, so a header can only ever display octal digits.
+_MODE_RE = re.compile(r"[0-7]{1,7}")
 
 # Distinct file names whose language lookup is remembered.  Pygments matches a
 # lexer on the base name alone, so the cache key loses nothing.
@@ -74,34 +79,67 @@ def parse_diff(diff_text: str, *, detect_language: bool = True) -> list[DiffFile
 def _parse_git_diff_file(
     lines: list[str], start: int, detect_language: bool = True
 ) -> tuple[DiffFile | None, int]:
-    """Parse a file section starting from 'diff --git ...'."""
-    git_match = DIFF_GIT_RE.match(lines[start])
-    if not git_match:
+    """Parse a file section starting from 'diff --git ...'.
+
+    The extended header lines are authoritative where git writes them:
+    ``rename from``/``rename to`` and ``copy from``/``copy to`` name the paths
+    exactly, so they win over the ambiguous ``diff --git`` line.  A copy is
+    kept like a rename, and a section that only changes the file mode is kept
+    as a mode-only file instead of being dropped.
+    """
+    if not DIFF_GIT_RE.match(lines[start]):
         return None, 1
 
-    old_path = git_match.group(1)
-    new_path = git_match.group(2)
+    old_path, new_path = _git_header_paths(lines[start][len(_DIFF_GIT_PREFIX) :])
     i = start + 1
     is_binary = False
     status = FileStatus.MODIFIED
+    old_mode: str | None = None
+    new_mode: str | None = None
+    moved_from: str | None = None
+    moved_to: str | None = None
 
     while i < len(lines):
         line = lines[i]
 
-        if line.startswith("diff --git "):
+        if line.startswith(_DIFF_GIT_PREFIX):
             break
 
         if line.startswith("new file"):
             status = FileStatus.ADDED
+            new_mode = _header_mode(line, "new file mode ") or new_mode
             i += 1
             continue
 
         if line.startswith("deleted file"):
             status = FileStatus.DELETED
+            old_mode = _header_mode(line, "deleted file mode ") or old_mode
             i += 1
             continue
 
-        if line.startswith(("rename from", "rename to")):
+        if line.startswith("old mode "):
+            old_mode = _header_mode(line, "old mode ")
+            i += 1
+            continue
+
+        if line.startswith("new mode "):
+            new_mode = _header_mode(line, "new mode ")
+            i += 1
+            continue
+
+        if line.startswith(("rename from ", "copy from ")):
+            status = FileStatus.RENAMED
+            moved_from = line.split(" from ", 1)[1]
+            i += 1
+            continue
+
+        if line.startswith(("rename to ", "copy to ")):
+            status = FileStatus.RENAMED
+            moved_to = line.split(" to ", 1)[1]
+            i += 1
+            continue
+
+        if line.startswith(("rename from", "rename to", "copy from", "copy to")):
             status = FileStatus.RENAMED
             i += 1
             continue
@@ -121,8 +159,8 @@ def _parse_git_diff_file(
 
         if line.startswith("--- "):
             hunks, consumed = _parse_hunks_from(lines, i)
-            actual_old = _strip_prefix(lines[i][4:])
-            actual_new = (
+            actual_old = moved_from or _strip_prefix(lines[i][4:])
+            actual_new = moved_to or (
                 _strip_prefix(lines[i + 1][4:]) if i + 1 < len(lines) else new_path
             )
 
@@ -151,6 +189,11 @@ def _parse_git_diff_file(
                     deletions=deletions,
                     is_binary=is_binary,
                     language=lang,
+                    is_mode_only=_is_mode_only(
+                        status, old_mode, new_mode, bool(hunks) or is_binary
+                    ),
+                    old_mode=old_mode,
+                    new_mode=new_mode,
                 ),
                 i + consumed - start,
             )
@@ -161,10 +204,18 @@ def _parse_git_diff_file(
 
         i += 1
 
-    if is_binary or status in (
-        FileStatus.ADDED,
-        FileStatus.DELETED,
-        FileStatus.RENAMED,
+    old_path = moved_from or old_path
+    new_path = moved_to or new_path
+    is_mode_only = _is_mode_only(status, old_mode, new_mode, is_binary)
+    if (
+        is_binary
+        or is_mode_only
+        or status
+        in (
+            FileStatus.ADDED,
+            FileStatus.DELETED,
+            FileStatus.RENAMED,
+        )
     ):
         lang = _detect_language(new_path) if detect_language else ""
         return (
@@ -175,11 +226,72 @@ def _parse_git_diff_file(
                 hunks=(),
                 is_binary=is_binary,
                 language=lang,
+                is_mode_only=is_mode_only,
+                is_rename_only=(
+                    status is FileStatus.RENAMED
+                    and not is_binary
+                    and not is_mode_only
+                    and old_path != new_path
+                ),
+                old_mode=old_mode,
+                new_mode=new_mode,
             ),
             i - start,
         )
 
     return None, i - start
+
+
+def _git_header_paths(names: str) -> tuple[str, str]:
+    """Split the ``a/<old> b/<new>`` part of a ``diff --git`` line.
+
+    A path may itself contain `` b/``, so the first or last occurrence is not
+    reliable.  Without a rename or copy both names are the same path, which
+    git writes as two equal halves; that split is unambiguous and is tried
+    first.  Otherwise the last separator is used, and the caller replaces both
+    paths with the exact ``rename``/``copy`` or ``---``/``+++`` names.
+    """
+    prefix = "a/"
+    separator = " b/"
+    if names.startswith(prefix):
+        name_length = (len(names) - len(prefix) - len(separator)) // 2
+        middle = len(prefix) + name_length
+        if (
+            name_length > 0
+            and len(names) == middle + len(separator) + name_length
+            and names[middle : middle + len(separator)] == separator
+            and names[len(prefix) : middle] == names[middle + len(separator) :]
+        ):
+            path = names[len(prefix) : middle]
+            return path, path
+    match = DIFF_GIT_RE.match(_DIFF_GIT_PREFIX + names)
+    if match:
+        return match.group(1), match.group(2)
+    return names, names
+
+
+def _header_mode(line: str, prefix: str) -> str | None:
+    """Read an octal git file mode from an extended header line."""
+    if not line.startswith(prefix):
+        return None
+    mode = line[len(prefix) :].strip()
+    return mode if _MODE_RE.fullmatch(mode) else None
+
+
+def _is_mode_only(
+    status: FileStatus,
+    old_mode: str | None,
+    new_mode: str | None,
+    has_content: bool,
+) -> bool:
+    """A modified or renamed file whose only change is its mode."""
+    return (
+        not has_content
+        and status in (FileStatus.MODIFIED, FileStatus.RENAMED)
+        and old_mode is not None
+        and new_mode is not None
+        and old_mode != new_mode
+    )
 
 
 def _parse_plain_diff_file(

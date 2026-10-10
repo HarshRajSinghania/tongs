@@ -9,6 +9,7 @@ import pytest
 from textual.app import App, ComposeResult
 from textual.widgets import Static
 
+from tongs.diff.conversion import convert_forge_changes
 from tongs.diff.models import DiffFile, DiffHunk, DiffLine, FileStatus, LineType
 from tongs.forges.models import Discussion, InlineComment, User
 from tongs.state.drafts import DiffSide
@@ -831,3 +832,68 @@ async def test_n_and_shift_n_navigate_between_two_files() -> None:
         await pilot.press("N")
         await pilot.pause()
         assert panel._current_index == 0
+
+
+def _gitlab_chmod_files() -> list[DiffFile]:
+    """A GitLab ``/diffs`` page with one chmod and one plain edit (#397)."""
+    return list(
+        convert_forge_changes(
+            [
+                {
+                    "old_path": "bin/run.sh",
+                    "new_path": "bin/run.sh",
+                    "a_mode": "100644",
+                    "b_mode": "100755",
+                    "new_file": False,
+                    "renamed_file": False,
+                    "deleted_file": False,
+                    "diff": "",
+                },
+                {
+                    "old_path": "app.py",
+                    "new_path": "app.py",
+                    "a_mode": "100644",
+                    "b_mode": "100644",
+                    "new_file": False,
+                    "renamed_file": False,
+                    "deleted_file": False,
+                    "diff": "@@ -1 +1 @@\n-old\n+new\n",
+                },
+            ]
+        )
+    )
+
+
+def _file_header(app: App[None]) -> str:
+    return str(app.query_one("#diff-file-header", Static).render())
+
+
+@pytest.mark.asyncio
+async def test_gitlab_chmod_shows_the_mode_change_in_both_file_headers() -> None:
+    app = _DiffApp()
+    async with app.run_test(size=(160, 30)) as pilot:
+        panel = app.query_one(DiffPanel)
+        panel.set_files(_gitlab_chmod_files())
+        await pilot.pause()
+
+        assert "bin/run.sh" in _file_header(app)
+        assert "mode 100644 -> 100755" in _file_header(app)
+        unified = app.query_one(DiffOptionList)
+        assert str(unified.get_option_at_index(0).prompt) == "[File mode changed]"
+
+        panel.request_mode(DiffViewMode.SPLIT)
+        await pilot.pause()
+        old = app.query_one("#split-old", SplitDiffColumn)
+        new = app.query_one("#split-new", SplitDiffColumn)
+        assert str(old.get_option_at_index(0).prompt) == (
+            " OLD  bin/run.sh  mode 100644 -> 100755"
+        )
+        assert str(new.get_option_at_index(0).prompt) == (
+            " NEW  bin/run.sh  mode 100644 -> 100755"
+        )
+
+        panel.action_next_file()
+        await pilot.pause()
+        assert "app.py" in _file_header(app)
+        assert "mode" not in _file_header(app)
+        assert str(new.get_option_at_index(0).prompt) == " NEW  app.py"

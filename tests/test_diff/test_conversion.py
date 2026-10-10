@@ -632,3 +632,73 @@ def test_parse_diff_can_skip_language_detection(lexer_lookups: list[str]) -> Non
     assert lexer_lookups == []
     assert parse_diff(text)[0].language == "python"
     assert lexer_lookups == ["x.py"]
+
+
+def test_gitlab_modes_reach_the_diff_file() -> None:
+    """GitLab's ``a_mode``/``b_mode`` become the file's modes (#397)."""
+    chmod, edited, added, odd = convert_forge_changes(
+        [
+            {
+                "old_path": "bin/run.sh",
+                "new_path": "bin/run.sh",
+                "a_mode": "100644",
+                "b_mode": "100755",
+                "diff": "",
+            },
+            {
+                "old_path": "bin/build.sh",
+                "new_path": "bin/build.sh",
+                "a_mode": "100644",
+                "b_mode": "100755",
+                "diff": "@@ -1 +1 @@\n-a\n+b\n",
+            },
+            {
+                "old_path": "new.py",
+                "new_path": "new.py",
+                "a_mode": "0",
+                "b_mode": "100644",
+                "new_file": True,
+                "diff": "@@ -0,0 +1 @@\n+x\n",
+            },
+            {
+                "old_path": "odd.py",
+                "new_path": "odd.py",
+                "a_mode": "[red]",
+                "b_mode": "",
+                "diff": "@@ -1 +1 @@\n-a\n+b\n",
+            },
+        ]
+    )
+
+    assert (chmod.old_mode, chmod.new_mode) == ("100644", "100755")
+    assert chmod.is_mode_only is True
+    assert chmod.mode_change == "mode 100644 -> 100755"
+    assert edited.is_mode_only is False
+    assert edited.mode_change == "mode 100644 -> 100755"
+    assert (added.old_mode, added.new_mode) == (None, "100644")
+    assert added.mode_change == ""
+    assert (odd.old_mode, odd.new_mode) == (None, None)
+
+
+def test_github_files_carry_no_modes() -> None:
+    (file,) = convert_forge_changes(
+        [{"filename": "a.py", "status": "modified", "patch": "@@ -1 +1 @@\n-a\n+b"}]
+    )
+
+    assert (file.old_mode, file.new_mode) == (None, None)
+    assert file.mode_change == ""
+
+
+def test_git_patch_modes_are_used_when_the_forge_sends_none() -> None:
+    (file,) = convert_forge_changes(
+        [
+            {
+                "old_path": "run.sh",
+                "new_path": "run.sh",
+                "diff": "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n",
+            }
+        ]
+    )
+
+    assert (file.old_mode, file.new_mode) == ("100644", "100755")
+    assert file.is_mode_only is True

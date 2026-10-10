@@ -81,18 +81,16 @@ class _GitLab:
             return httpx.Response(200, json=[_merge_request(self.head_sha)])
         if raw_path == f"{_PREFIX}/{_NUMBER}":
             return httpx.Response(200, json=_merge_request(self.head_sha))
-        if raw_path == f"{_PREFIX}/{_NUMBER}/changes":
+        if raw_path == f"{_PREFIX}/{_NUMBER}/diffs":
             return httpx.Response(
                 200,
-                json={
-                    "changes": [
-                        {
-                            "old_path": "loader.py",
-                            "new_path": "loader.py",
-                            "diff": f"@@ -1,2 +1,2 @@\n same\n-old\n+{self.content}\n",
-                        }
-                    ]
-                },
+                json=[
+                    {
+                        "old_path": "loader.py",
+                        "new_path": "loader.py",
+                        "diff": f"@@ -1,2 +1,2 @@\n same\n-old\n+{self.content}\n",
+                    }
+                ],
             )
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
@@ -239,7 +237,7 @@ async def test_layout_switch_reuses_the_open_read_with_no_forge_request(
         "diff.open", {"review": wired.review, "layout": "unified"}
     )
     reads_after_open = len(wired.forge.requests)
-    assert wired.forge.requests.count(f"{_PREFIX}/{_NUMBER}/changes") == 1
+    assert wired.forge.requests.count(f"{_PREFIX}/{_NUMBER}/diffs") == 1
 
     split = await wired.wire.call(
         "diff.open",
@@ -289,7 +287,7 @@ async def test_open_without_a_snapshot_reads_the_forge_and_drops_the_old_read(
         },
     )
 
-    assert wired.forge.requests.count(f"{_PREFIX}/{_NUMBER}/changes") == 3
+    assert wired.forge.requests.count(f"{_PREFIX}/{_NUMBER}/diffs") == 3
     assert len(wired.forge.requests) > reads_after_refresh
     assert cast(JsonObject, refreshed["revision"])["head_sha"] == "ddd444"
     assert cast(JsonObject, stale["revision"])["head_sha"] == "ddd444"
