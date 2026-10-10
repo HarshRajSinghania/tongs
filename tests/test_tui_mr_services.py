@@ -478,17 +478,9 @@ async def test_inline_comment_keeps_the_revision_displayed_when_line_was_selecte
         editor = screen.query_one("#comment-editor", CommentEditor)
         editor.query_one("#comment-input", TextArea).text = "selected on head-7"
         editor.action_submit()
-        await _wait_until(app, lambda: bool(app.session.review_mutations._ledger))
-
-        assert not any(call[0] == "inline" for call in forge.calls)
-        records = tuple(app.session.review_mutations._ledger.values())
-        assert len(records) == 1
-        command = records[0].command
-        assert command.revision.head_sha == "head-7"  # type: ignore[union-attr]
-        assert records[0].error is not None
-        assert "revision changed" in records[0].error.message.lower()
-        # The toast follows the ledger entry on a later message-pump turn,
-        # which older Textual releases schedule a little later.
+        # The command carries the displayed head-7, so the session rejects it
+        # against head-8 before sending. Older Textual releases schedule the
+        # toast a little later.
         await _wait_until(
             app,
             lambda: any(
@@ -496,6 +488,10 @@ async def test_inline_comment_keeps_the_revision_displayed_when_line_was_selecte
                 for notification in app._notifications
             ),
         )
+
+        assert not any(call[0] == "inline" for call in forge.calls)
+        # Nothing was sent, so the rejection keeps no ledger entry.
+        assert len(app.session.review_mutations._ledger) == 0
 
 
 @pytest.mark.asyncio
@@ -644,8 +640,8 @@ async def test_cancelled_screen_mutation_retains_one_identity_and_never_replays(
         if action == "comment":
             records = app.session.review_mutations._ledger
             record = next(iter(records.values()))
-            assert record.outcome is not None
-            assert record.outcome.status is MutationStatus.UNKNOWN
+            assert record.receipt is not None
+            assert record.receipt.status is MutationStatus.UNKNOWN
             operation_id = record.command.operation_id
         elif action == "merge":
             records = app.session.mr_actions._operations
@@ -701,7 +697,7 @@ async def test_known_comment_releases_identity_for_a_deliberate_later_repeat(
         records = tuple(app.session.review_mutations._ledger.values())
         assert len(records) == 2
         assert all(
-            record.outcome is not None and record.outcome.status is MutationStatus.KNOWN
+            record.receipt is not None and record.receipt.status is MutationStatus.KNOWN
             for record in records
         )
         operation_ids = {record.command.operation_id for record in records}

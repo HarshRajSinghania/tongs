@@ -22,6 +22,7 @@ import type {
   JobMutationParams,
   PipelineMutationParams,
 } from "../../../shared/ci.js";
+import { CAPACITY_EXHAUSTED_MESSAGE } from "../../../shared/review.js";
 import type {
   AppRoute,
   FeatureContribution,
@@ -1281,6 +1282,7 @@ export function classifyMutationFailure(
   const code = errorCode(error);
   return new Set([
     "authentication_failed",
+    "capacity_exhausted",
     "closed",
     "conflict",
     "invalid_handle",
@@ -1420,10 +1422,11 @@ function mutationErrorText(error: { readonly code: string }): string {
     : "The remote result could not be confirmed. Refresh current state.";
 }
 
-function mutationFailureText(error: unknown, uncertain: boolean): string {
+export function mutationFailureText(error: unknown, uncertain: boolean): string {
   if (uncertain)
     return "The response ended after the action may have been dispatched. It will not be replayed automatically.";
   const code = errorCode(error);
+  if (code === "capacity_exhausted") return CAPACITY_EXHAUSTED_MESSAGE;
   if (code === "conflict")
     return "That operation ID is already bound to another action or target.";
   if (code === "permission_denied" || code === "authentication_failed")

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -30,6 +29,7 @@ from tongs.services.models import (
     ReviewSnapshot,
     ServiceEventKind,
 )
+from tongs.services.operation_ledger import OperationEntry, OperationLedger
 
 _OPERATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _MAX_BODY_BYTES = 65_536
@@ -226,13 +226,6 @@ class MutationOutcome:
     resync_required: bool = False
 
 
-@dataclass(slots=True)
-class _LedgerRecord:
-    command: ReviewMutationCommand
-    outcome: MutationOutcome | None = None
-    error: ServiceError | None = None
-
-
 @dataclass(frozen=True, slots=True)
 class _ResolvedAnchor:
     anchor: DiffAnchor
@@ -273,8 +266,9 @@ class ReviewMutationService:
         self._emit_change = emit_change
         self._timeout = timeout
         self._close_timeout = close_timeout
-        self._ledger_size = ledger_size
-        self._ledger: OrderedDict[str, _LedgerRecord] = OrderedDict()
+        self._ledger: OperationLedger[ReviewMutationCommand, MutationOutcome] = (
+            OperationLedger(ledger_size)
+        )
         self._lock = asyncio.Lock()
         self._refresh_tasks: set[asyncio.Task[bool]] = set()
         self._owner_tasks: set[asyncio.Task[object]] = set()
@@ -304,30 +298,41 @@ class ReviewMutationService:
             self._owner_tasks.discard(owner_task)
 
     async def execute(self, command: ReviewMutationCommand) -> MutationOutcome:
-        prior = await self._reserve(command)
-        if prior is not None:
-            return prior
+        entry, owner = await self._reserve(command)
+        if not owner:
+            return await self._ledger.wait(entry)
         owner_task = asyncio.current_task()
         if owner_task is None:
             raise RuntimeError("review mutation execution requires an asyncio task")
         try:
-            return await self._execute_owner(command)
+            return await self._execute_owner(command, entry)
         finally:
             self._owner_tasks.discard(owner_task)
 
-    async def _execute_owner(self, command: ReviewMutationCommand) -> MutationOutcome:
+    async def _execute_owner(
+        self,
+        command: ReviewMutationCommand,
+        entry: OperationEntry[ReviewMutationCommand, MutationOutcome],
+    ) -> MutationOutcome:
         try:
             client = await self._get_client(command.review, "mutate_review")
             call = await self._prepare(command, client)
         except asyncio.CancelledError:
-            self._remove_pending_now(command.operation_id)
+            self._ledger.release(
+                entry,
+                ServiceError(
+                    ServiceErrorCode.INTERNAL,
+                    "The review mutation was cancelled before it was sent.",
+                    retryable=True,
+                ),
+            )
             raise
         except ServiceError as error:
-            self._finish_error_now(command.operation_id, error)
+            self._ledger.release(entry, error)
             raise
         except Exception as error:  # noqa: BLE001 - Sanitize preparation boundary.
             safe = translate_error(error, operation="prepare_review_mutation")
-            self._finish_error_now(command.operation_id, safe)
+            self._ledger.release(entry, safe)
             raise safe from None
 
         try:
@@ -346,14 +351,14 @@ class ReviewMutationService:
                 operation="mutate_review",
                 hostname=command.review.repository.hostname,
             )
-            self._finish_error_now(command.operation_id, safe)
+            self._ledger.fail(entry, safe)
             raise safe from None
         except (asyncio.CancelledError, Exception) as error:  # noqa: BLE001
-            outcome = await self._unknown(command, client, type(error).__name__)
+            outcome = await self._unknown(entry, client, type(error).__name__)
             return outcome
 
         if not isinstance(result, ForgeMutationResult) or not result.remote_id:
-            return await self._unknown(command, client, "invalid_receipt")
+            return await self._unknown(entry, client, "invalid_receipt")
         receipt = MutationReceipt(
             command.operation_id,
             result.remote_id,
@@ -368,8 +373,7 @@ class ReviewMutationService:
             receipt,
             resync_required=resync,
         )
-        self._finish_outcome_now(command.operation_id, outcome)
-        return outcome
+        return self._ledger.complete(entry, outcome)
 
     async def _prepare(
         self, command: ReviewMutationCommand, client: ForgeClient
@@ -519,40 +523,22 @@ class ReviewMutationService:
             "The selected diff line is not commentable at this revision.",
         )
 
-    async def _reserve(self, command: ReviewMutationCommand) -> MutationOutcome | None:
+    async def _reserve(
+        self, command: ReviewMutationCommand
+    ) -> tuple[OperationEntry[ReviewMutationCommand, MutationOutcome], bool]:
+        owner_task = asyncio.current_task()
+        if owner_task is None:
+            raise RuntimeError("review mutation execution requires an asyncio task")
         async with self._lock:
             if self._closed:
                 raise ServiceError(
                     ServiceErrorCode.CLOSED,
                     "The review mutation service is closed.",
                 )
-            existing = self._ledger.get(command.operation_id)
-            if existing is not None:
-                if existing.command != command:
-                    raise ServiceError(
-                        ServiceErrorCode.CONFLICT,
-                        "The operation ID is already bound to a different mutation.",
-                    )
-                if existing.error is not None:
-                    raise existing.error
-                if existing.outcome is not None:
-                    return existing.outcome
-                raise ServiceError(
-                    ServiceErrorCode.CONFLICT,
-                    "The operation is already in progress.",
-                    retryable=True,
-                )
-            if len(self._ledger) >= self._ledger_size:
-                raise ServiceError(
-                    ServiceErrorCode.CONFLICT,
-                    "The mutation ledger is full; start a new service session.",
-                )
-            self._ledger[command.operation_id] = _LedgerRecord(command)
-            owner_task = asyncio.current_task()
-            if owner_task is None:
-                raise RuntimeError("review mutation execution requires an asyncio task")
-            self._owner_tasks.add(owner_task)
-        return None
+            entry, owner = self._ledger.reserve(command.operation_id, command)
+            if owner:
+                self._owner_tasks.add(owner_task)
+        return entry, owner
 
     async def _enter_validation(self) -> asyncio.Task[object]:
         owner_task = asyncio.current_task()
@@ -567,28 +553,23 @@ class ReviewMutationService:
             self._owner_tasks.add(owner_task)
         return owner_task
 
-    def _remove_pending_now(self, operation_id: str) -> None:
-        record = self._ledger.get(operation_id)
-        if record is not None and record.outcome is None and record.error is None:
-            del self._ledger[operation_id]
-
-    def _finish_outcome_now(self, operation_id: str, outcome: MutationOutcome) -> None:
-        self._ledger[operation_id].outcome = outcome
-
-    def _finish_error_now(self, operation_id: str, error: ServiceError) -> None:
-        self._ledger[operation_id].error = error
-
     async def _unknown(
-        self, command: ReviewMutationCommand, client: ForgeClient, reason: str
+        self,
+        entry: OperationEntry[ReviewMutationCommand, MutationOutcome],
+        client: ForgeClient,
+        reason: str,
     ) -> MutationOutcome:
-        outcome = MutationOutcome(
-            command.operation_id,
-            MutationStatus.UNKNOWN,
-            None,
-            reason=reason,
-            resync_required=True,
+        command = entry.command
+        outcome = self._ledger.complete(
+            entry,
+            MutationOutcome(
+                command.operation_id,
+                MutationStatus.UNKNOWN,
+                None,
+                reason=reason,
+                resync_required=True,
+            ),
         )
-        self._finish_outcome_now(command.operation_id, outcome)
         self._release_current_owner()
         try:
             self._emit_change(

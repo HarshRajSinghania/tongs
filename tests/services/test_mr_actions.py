@@ -44,6 +44,7 @@ from tongs.services.mr_actions import (
     SourceBranchTarget,
     UnapproveReviewCommand,
 )
+from tongs.services.operation_ledger import OperationLedger
 
 REPOSITORY = RepositoryRef("github.com", "acme/widgets")
 REVIEW = ReviewRef(REPOSITORY, 42)
@@ -187,6 +188,71 @@ async def test_fresh_revision_and_state_fail_before_dispatch(
 
     assert raised.value.code is code
     client.merge_mr.assert_not_awaited()
+    assert len(service._operations) == 0
+
+
+@pytest.mark.asyncio
+async def test_actions_rejected_for_revision_change_do_not_fill_the_ledger() -> None:
+    client = _client()
+    stale = _snapshot(revision=ReviewRevision("head-43", "base-42"))
+    service, _get_client, get_review, _emitter = _service(
+        client, snapshot=stale, size=3
+    )
+
+    for index in range(3):
+        with pytest.raises(ServiceError) as raised:
+            await service.execute(CloseReviewCommand(f"stale-{index}", _target()))
+        assert raised.value.code is ServiceErrorCode.REVISION_CHANGED
+    assert len(service._operations) == 0
+
+    get_review.return_value = _snapshot()
+    for index in range(3):
+        await service.execute(CloseReviewCommand(f"sent-{index}", _target()))
+    with pytest.raises(ServiceError) as full:
+        await service.execute(CloseReviewCommand("one-too-many", _target()))
+
+    assert full.value.code is ServiceErrorCode.CAPACITY_EXHAUSTED
+    assert full.value.retryable is False
+    assert full.value.message == (
+        "Too many write actions in this session. Restart tongs to continue."
+    )
+    assert client.close_mr.await_count == 3
+    assert (await service.execute(CloseReviewCommand("sent-0", _target()))).remote_id
+    assert client.close_mr.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_cancellation_releases_the_operation_id() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    client = _client()
+    service, _get_client, get_review, _emitter = _service(client, size=1)
+
+    async def blocked_review(_review):
+        entered.set()
+        await release.wait()
+        return _snapshot()
+
+    get_review.side_effect = blocked_review
+    command = CloseReviewCommand("cancel-before-send", _target())
+    owner = asyncio.create_task(service.execute(command))
+    await entered.wait()
+    duplicate = asyncio.create_task(service.execute(command))
+    await asyncio.sleep(0)
+    owner.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+    with pytest.raises(ServiceError) as raised:
+        await duplicate
+    assert raised.value.retryable is True
+    assert len(service._operations) == 0
+
+    get_review.side_effect = None
+    get_review.return_value = _snapshot()
+    receipt = await service.execute(command)
+    assert receipt.outcome is MRActionOutcome.KNOWN
+    client.close_mr.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -516,7 +582,7 @@ async def test_close_is_bounded_and_keeps_resistant_owner_identifiable() -> None
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await owner
-    retained = service._record_result(service._operations["never-stops"])
+    retained = OperationLedger.result(service._operations["never-stops"])
     assert retained.outcome is MRActionOutcome.KNOWN
     assert not service._owner_tasks
 
