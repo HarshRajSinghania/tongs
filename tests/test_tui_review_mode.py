@@ -11,8 +11,9 @@ import pytest
 from textual.widgets import OptionList, Static, TextArea
 
 from tests.test_tui_mr_services import _app, _settle, _wait_until
-from tongs.errors import RateLimitError
+from tongs.errors import RateLimitError, ValidationError
 from tongs.forges.models import ReviewDecision
+from tongs.services.review_submission import SubmissionFailure
 from tongs.state.drafts import (
     DiffSide,
     DraftContent,
@@ -1111,37 +1112,157 @@ async def test_leaving_detail_mid_draft_save_does_not_exit(
         assert screen not in app.screen_stack
 
 
+def _gate_verdict(forge) -> asyncio.Event:
+    """Hold the forge verdict call until the returned event is set."""
+    release = asyncio.Event()
+
+    async def gated(action: str) -> None:
+        if action == "verdict":
+            forge.mutation_started.set()
+            await release.wait()
+
+    forge._block_mutation = gated
+    return release
+
+
+async def _draft_with_comment(app, screen: MRDetailScreen, body: str) -> None:
+    screen.action_review_draft()
+    await _wait_until(app, lambda: screen._review_draft is not None)
+    screen.action_add_comment()
+    editor = screen.query_one("#comment-editor", CommentEditor)
+    editor.query_one("#comment-input", TextArea).text = body
+    editor.action_submit()
+    await _wait_until(
+        app,
+        lambda: (
+            screen._review_draft is not None and len(screen._review_draft.comments) == 1
+        ),
+    )
+
+
+async def _submit_until_paused(app, pilot, screen: MRDetailScreen) -> None:
+    screen.action_review_draft()
+    await _wait_until(app, lambda: isinstance(app.screen, ReviewSubmitScreen))
+    await pilot.press("v")
+    await pilot.press("ctrl+s")
+    # ``_draft_busy`` clears last in the submission worker, so waiting on it
+    # keeps the next key press from being dropped.
+    await _wait_until(
+        app,
+        lambda: (
+            screen._review_progress is not None
+            and screen._review_progress.outcome.value == "paused"
+            and not screen._draft_busy
+        ),
+    )
+
+
+async def _open_paused_modal(app, pilot, screen: MRDetailScreen) -> ReviewSubmitScreen:
+    screen.action_review_draft()
+    await _wait_until(app, lambda: isinstance(app.screen, ReviewSubmitScreen))
+    await pilot.pause()
+    return cast(ReviewSubmitScreen, app.screen)
+
+
+def _rendered(widget: Static) -> str:
+    return str(widget.render())
+
+
+def _messages(app) -> list[str]:
+    return [str(notification.message) for notification in app._notifications]
+
+
 @pytest.mark.asyncio
-async def test_leaving_detail_mid_submission_records_outcome_without_exiting(
+async def test_escape_mid_submission_is_refused_until_the_write_finishes(
     tmp_path: Path,
 ) -> None:
-    """Leaving the MR detail screen mid-submission must not take the app down.
+    """Escape and q must not abandon a review write the forge may still finish.
 
-    Textual cancels the submission worker from ``Widget._on_unmount``, so the
+    Leaving the screen cancels its workers, and a cancelled submission records
+    an unknown outcome for a write that was really in flight. Back navigation
+    is therefore refused while the submission worker runs, and the submission
+    completes normally once the forge answers.
+    """
+    app, forge = _app(tmp_path)
+    release = _gate_verdict(forge)
+
+    async with app.run_test(size=(160, 40), notifications=True) as pilot:
+        screen = await _open_detail(app, pilot)
+        await _draft_with_comment(app, screen, "note before leaving")
+        draft_id = screen._review_draft.id
+
+        screen.action_review_draft()
+        await _wait_until(app, lambda: isinstance(app.screen, ReviewSubmitScreen))
+        await pilot.press("v")
+        await pilot.press("ctrl+s")
+        # The worker suspends inside the gated verdict call, so the worker
+        # barrier in ``_wait_until`` cannot be used until the gate opens.
+        await asyncio.wait_for(forge.mutation_started.wait(), timeout=2)
+        await pilot.pause()
+        assert app.screen is screen
+        assert screen._draft_busy
+
+        app.clear_notifications()
+        await pilot.press("escape")
+        await pilot.pause()
+        await pilot.press("q")
+        await pilot.pause()
+
+        assert app.screen is screen
+        assert screen in app.screen_stack
+        assert (
+            _messages(app).count(
+                "Submission in progress. Wait for it to finish before leaving."
+            )
+            == 2
+        )
+        stored = await app.session.drafts.get_draft(draft_id)
+        # The comment step already has its receipt; the verdict is in flight.
+        assert stored.state is DraftState.PARTIAL
+        assert len([call for call in forge.calls if call[0] == "verdict"]) == 1
+
+        release.set()
+        await _wait_until(
+            app,
+            lambda: (
+                screen._review_draft is None
+                and screen._review_progress is None
+                and not screen._draft_busy
+            ),
+        )
+
+        stored = await app.session.drafts.get_draft(draft_id)
+        assert stored.state is DraftState.SUBMITTED
+        assert len([call for call in forge.calls if call[0] == "comment"]) == 1
+        assert len([call for call in forge.calls if call[0] == "verdict"]) == 1
+        assert app._exception is None
+
+        await pilot.press("escape")
+        await _wait_until(app, lambda: screen not in app.screen_stack)
+        assert not isinstance(app.screen, MRDetailScreen)
+
+
+@pytest.mark.asyncio
+async def test_screen_removed_mid_submission_records_outcome_without_exiting(
+    tmp_path: Path,
+) -> None:
+    """Removing the MR screen mid-submission must not take the app down.
+
+    Back navigation now refuses while a submission runs, but the screen can
+    still be removed underneath its worker, as the app exit path does. Textual
+    then cancels the submission worker from ``Widget._on_unmount``, so the
     worker's ``except asyncio.CancelledError`` recovery and its ``finally``
-    block both run after ``pop_screen`` has already removed the widgets they
-    repaint. Before the guard in ``MRDetailScreen._detached_from_app`` the
-    ``#review-draft-bar`` query raised ``NoMatches`` out of a worker that
-    defaults to ``exit_on_error=True``, which exited the whole TUI.
+    block both run after the widgets they repaint are gone. Before the guard in
+    ``MRDetailScreen._detached_from_app`` the ``#review-draft-bar`` query raised
+    ``NoMatches`` out of a worker that defaults to ``exit_on_error=True``, which
+    exited the whole TUI.
     """
     app, forge = _app(tmp_path)
     forge.blocked_mutation = "verdict"
 
     async with app.run_test(size=(160, 40), notifications=True) as pilot:
         screen = await _open_detail(app, pilot)
-        screen.action_review_draft()
-        await _wait_until(app, lambda: screen._review_draft is not None)
-        screen.action_add_comment()
-        editor = screen.query_one("#comment-editor", CommentEditor)
-        editor.query_one("#comment-input", TextArea).text = "note before leaving"
-        editor.action_submit()
-        await _wait_until(
-            app,
-            lambda: (
-                screen._review_draft is not None
-                and len(screen._review_draft.comments) == 1
-            ),
-        )
+        await _draft_with_comment(app, screen, "note before leaving")
         draft_id = screen._review_draft.id
 
         screen.action_review_draft()
@@ -1154,7 +1275,7 @@ async def test_leaving_detail_mid_submission_records_outcome_without_exiting(
         await pilot.pause()
         assert app.screen is screen
 
-        screen.action_go_back()
+        app.pop_screen()
         await _wait_until(
             app,
             lambda: (
@@ -1188,6 +1309,193 @@ async def test_leaving_detail_mid_submission_records_outcome_without_exiting(
         assert not reopened._draft_busy
         bar = reopened.query_one("#review-draft-bar", ReviewDraftBar)
         assert "unknown" in str(bar.render())
+
+
+@pytest.mark.asyncio
+async def test_retryable_pause_shows_its_reason_and_offers_resume(
+    tmp_path: Path,
+) -> None:
+    app, forge = _app(tmp_path)
+    forge.verdict_error = RateLimitError("controlled rate limit", retry_after=1)
+
+    async with app.run_test(size=(160, 40), notifications=True) as pilot:
+        screen = await _open_detail(app, pilot)
+        screen.action_review_draft()
+        await _wait_until(app, lambda: screen._review_draft is not None)
+        await _submit_until_paused(app, pilot, screen)
+
+        failure = screen._review_progress.failure
+        assert failure is not None
+        assert failure.code == "rate_limited"
+        assert failure.retryable is True
+        bar = screen.query_one("#review-draft-bar", ReviewDraftBar)
+        assert "reason: The forge rate limit was reached." in _rendered(bar)
+
+        modal = await _open_paused_modal(app, pilot, screen)
+        failure_text = _rendered(modal.query_one("#review-submit-failure", Static))
+        assert failure_text == "Paused: The forge rate limit was reached."
+        help_text = _rendered(modal.query_one("#review-submit-help", Static))
+        assert "Press r to resume confirmed remaining steps" in help_text
+        assert "2 to return unconfirmed content to editing" in help_text
+        assert modal.check_action("resume", ()) is True
+
+        forge.verdict_error = None
+        await pilot.press("r")
+        await _wait_until(
+            app,
+            lambda: (
+                screen._review_draft is None
+                and screen._review_progress is None
+                and not screen._draft_busy
+            ),
+        )
+        assert len([call for call in forge.calls if call[0] == "verdict"]) == 2
+        assert app.services._submission_failures == {}
+        assert "reason:" not in _rendered(bar)
+
+
+@pytest.mark.asyncio
+async def test_non_retryable_pause_hides_resume_and_keeps_draft_locked(
+    tmp_path: Path,
+) -> None:
+    app, forge = _app(tmp_path)
+    app.config.ascii_mode = True
+    forge.verdict_error = ValidationError(
+        "Validation failed: Can not approve your own pull request"
+    )
+
+    async with app.run_test(size=(160, 40), notifications=True) as pilot:
+        screen = await _open_detail(app, pilot)
+        await _draft_with_comment(app, screen, "confirmed comment")
+        await _submit_until_paused(app, pilot, screen)
+        attempt_id = screen._review_progress.attempt_id
+        failure = app.services.last_submission_failure(attempt_id)
+        assert failure is not None
+        assert failure.code == "invalid_input"
+        assert failure.retryable is False
+        assert screen._review_progress.failure == failure
+        verdicts = len([call for call in forge.calls if call[0] == "verdict"])
+        assert verdicts == 1
+
+        modal = await _open_paused_modal(app, pilot, screen)
+        failure_text = _rendered(modal.query_one("#review-submit-failure", Static))
+        assert failure_text == "Paused: The forge rejected this request as invalid."
+        help_text = _rendered(modal.query_one("#review-submit-help", Static))
+        assert "Submission paused" in help_text
+        assert "r to resume" not in help_text
+        assert "Press 2 to return unconfirmed content to editing" in help_text
+        assert modal.check_action("resume", ()) is False
+
+        app.clear_notifications()
+        await pilot.press("r")
+        await pilot.press("e")
+        await pilot.press("x")
+        await pilot.press("x")
+        await pilot.press("D")
+        await pilot.press("D")
+        await pilot.pause()
+
+        assert app.screen is modal
+        assert not screen._draft_busy
+        assert len([call for call in forge.calls if call[0] == "verdict"]) == verdicts
+        refusal = "Return the paused submission to editing first: press 2 twice."
+        assert _messages(app).count(refusal) == 5
+        stored = await app.session.drafts.get_draft(screen._review_draft.id)
+        assert stored.state is DraftState.PARTIAL
+        assert len(stored.comments) == 1
+
+        await pilot.press("2")
+        await pilot.press("2")
+        await _wait_until(
+            app,
+            lambda: (
+                screen._review_draft is not None
+                and screen._review_draft.state is DraftState.EDITABLE
+                and screen._review_progress is None
+                and not screen._draft_busy
+            ),
+        )
+        assert app.services.last_submission_failure(attempt_id) is None
+        bar = screen.query_one("#review-draft-bar", ReviewDraftBar)
+        assert "reason:" not in _rendered(bar)
+        assert len([call for call in forge.calls if call[0] == "verdict"]) == verdicts
+
+
+@pytest.mark.asyncio
+async def test_reopened_detail_still_shows_the_last_pause_reason(
+    tmp_path: Path,
+) -> None:
+    app, forge = _app(tmp_path)
+    forge.verdict_error = ValidationError("rejected")
+
+    async with app.run_test(size=(160, 40), notifications=True) as pilot:
+        screen = await _open_detail(app, pilot)
+        screen.action_review_draft()
+        await _wait_until(app, lambda: screen._review_draft is not None)
+        await _submit_until_paused(app, pilot, screen)
+        attempt_id = screen._review_progress.attempt_id
+        draft_id = screen._review_draft.id
+
+        await pilot.press("escape")
+        await _wait_until(app, lambda: screen not in app.screen_stack)
+        table = app.screen.query_one("#reviews-table")
+        table.focus()
+        await pilot.press("enter")
+        await _wait_until(app, lambda: isinstance(app.screen, MRDetailScreen))
+        reopened = cast(MRDetailScreen, app.screen)
+        assert reopened is not screen
+        await _wait_until(
+            app,
+            lambda: (
+                reopened._review_progress is not None
+                and reopened._review_progress.outcome.value == "paused"
+            ),
+        )
+
+        assert reopened._review_progress.attempt_id == attempt_id
+        assert reopened._review_progress.draft_id == draft_id
+        failure = reopened._review_progress.failure
+        assert failure is not None
+        assert failure.message == "The forge rejected this request as invalid."
+        bar = reopened.query_one("#review-draft-bar", ReviewDraftBar)
+        assert "reason: The forge rejected this request as invalid." in _rendered(bar)
+        modal = await _open_paused_modal(app, pilot, reopened)
+        failure_text = _rendered(modal.query_one("#review-submit-failure", Static))
+        assert failure_text == "Paused: The forge rejected this request as invalid."
+        assert modal.check_action("resume", ()) is False
+
+
+@pytest.mark.asyncio
+async def test_pause_reason_renders_as_literal_text_in_ascii_mode(
+    tmp_path: Path,
+) -> None:
+    app, forge = _app(tmp_path)
+    app.config.ascii_mode = True
+    forge.verdict_error = ValidationError("rejected")
+    literal = "Fix [/] [bold]x[/bold] $title [link=https://x]y[/link]\nsecond line"
+
+    async with app.run_test(size=(200, 40), notifications=True) as pilot:
+        screen = await _open_detail(app, pilot)
+        screen.action_review_draft()
+        await _wait_until(app, lambda: screen._review_draft is not None)
+        await _submit_until_paused(app, pilot, screen)
+        progress = screen._review_progress
+        screen._review_progress = replace(
+            progress,
+            failure=SubmissionFailure("invalid_input", literal, False),
+        )
+        screen._refresh_draft_ui()
+        await pilot.pause()
+
+        bar = screen.query_one("#review-draft-bar", ReviewDraftBar)
+        assert (
+            "reason: Fix [/] [bold]x[/bold] $title [link=https://x]y[/link] "
+            "second line" in _rendered(bar)
+        )
+        modal = await _open_paused_modal(app, pilot, screen)
+        failure_text = _rendered(modal.query_one("#review-submit-failure", Static))
+        assert failure_text == f"Paused: {literal}"
+        assert app._exception is None
 
 
 @pytest.mark.asyncio

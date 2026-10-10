@@ -73,6 +73,7 @@ class ReviewSubmitScreen(ModalScreen[ReviewSubmitAction | None]):
     }
     ReviewSubmitScreen #review-submit-title,
     ReviewSubmitScreen #review-submit-status,
+    ReviewSubmitScreen #review-submit-failure,
     ReviewSubmitScreen #review-submit-verdict,
     ReviewSubmitScreen #review-submit-help {
         height: auto;
@@ -83,6 +84,10 @@ class ReviewSubmitScreen(ModalScreen[ReviewSubmitAction | None]):
     }
     ReviewSubmitScreen #review-submit-body {
         height: 6;
+    }
+    ReviewSubmitScreen #review-submit-failure {
+        color: $warning;
+        display: none;
     }
     """
 
@@ -128,6 +133,27 @@ class ReviewSubmitScreen(ModalScreen[ReviewSubmitAction | None]):
         self._pending_confirmation: str | None = None
 
     @property
+    def paused(self) -> bool:
+        return (
+            self.progress is not None
+            and self.progress.outcome is SubmissionOutcome.PAUSED
+        )
+
+    @property
+    def can_resume(self) -> bool:
+        """Is resuming offered for this paused attempt?
+
+        A failure the forge marked non-retryable would only be rejected again,
+        so the draft must return to editing instead. A paused attempt whose
+        failure this app never saw keeps the resume it always had.
+        """
+        if not self.paused:
+            return False
+        assert self.progress is not None
+        failure = self.progress.failure
+        return failure is None or failure.retryable
+
+    @property
     def stale(self) -> bool:
         return (
             self.current_revision is None
@@ -138,6 +164,7 @@ class ReviewSubmitScreen(ModalScreen[ReviewSubmitAction | None]):
         with Vertical():
             yield Static("[bold]Review draft[/]", id="review-submit-title")
             yield Static("", id="review-submit-status")
+            yield Static("", id="review-submit-failure")
             yield OptionList(id="review-submit-comments")
             yield Static("", id="review-submit-verdict")
             yield TextArea(
@@ -214,6 +241,22 @@ class ReviewSubmitScreen(ModalScreen[ReviewSubmitAction | None]):
         self.query_one("#review-submit-verdict", Static).update(
             f"Verdict: [bold]{escape(self._verdict.value)}[/]  (v cycles)"
         )
+        failure_widget = self.query_one("#review-submit-failure", Static)
+        failure = (
+            self.progress.failure if self.paused and self.progress is not None else None
+        )
+        if failure is not None:
+            # The message is passed as a variable, so Content inserts it
+            # literally instead of parsing it as markup.
+            failure_widget.update(
+                Content.from_markup(
+                    "[bold]Paused:[/] $message", message=failure.message
+                )
+            )
+            failure_widget.display = True
+        else:
+            failure_widget.update("")
+            failure_widget.display = False
         if (
             self.progress is not None
             and self.progress.outcome is SubmissionOutcome.UNKNOWN
@@ -222,13 +265,15 @@ class ReviewSubmitScreen(ModalScreen[ReviewSubmitAction | None]):
                 "Unknown outcome: 1 retry remaining (may duplicate), "
                 "2 return editable, 3 mark submitted after inspection. Press twice."
             )
-        elif (
-            self.progress is not None
-            and self.progress.outcome is SubmissionOutcome.PAUSED
-        ):
+        elif self.paused and self.can_resume:
             help_text = (
                 "Submission paused. Press r to resume confirmed remaining steps, "
                 "or 2 to return unconfirmed content to editing. Press 2 twice."
+            )
+        elif self.paused:
+            help_text = (
+                "Submission paused and resuming would be rejected again. "
+                "Press 2 to return unconfirmed content to editing. Press 2 twice."
             )
         elif self.stale:
             help_text = "Press N for a separate current-revision draft; old inline text stays here."
@@ -288,11 +333,18 @@ class ReviewSubmitScreen(ModalScreen[ReviewSubmitAction | None]):
         )
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "resume":
+            return self.can_resume
         return action != "submit" or self.supports_submission
+
+    def _not_editable_message(self) -> str:
+        if self.paused:
+            return "Return the paused submission to editing first: press 2 twice."
+        return "This draft is not editable while submission is active."
 
     def action_edit_comment(self) -> None:
         if self.draft.state is not DraftState.EDITABLE:
-            self.notify("This draft is not editable while submission is active.")
+            self.notify(self._not_editable_message())
             return
         comment_id = self._selected_comment_id()
         if comment_id is not None:
@@ -307,7 +359,7 @@ class ReviewSubmitScreen(ModalScreen[ReviewSubmitAction | None]):
 
     def action_remove_comment(self) -> None:
         if self.draft.state is not DraftState.EDITABLE:
-            self.notify("This draft is not editable while submission is active.")
+            self.notify(self._not_editable_message())
             return
         comment_id = self._selected_comment_id()
         if comment_id is None:
@@ -326,7 +378,11 @@ class ReviewSubmitScreen(ModalScreen[ReviewSubmitAction | None]):
 
     def action_discard(self) -> None:
         if self.draft.state is not DraftState.EDITABLE:
-            self.notify("Reconcile the active submission before discarding.")
+            self.notify(
+                self._not_editable_message()
+                if self.paused
+                else "Reconcile the active submission before discarding."
+            )
             return
         if not self._confirm(
             "discard", "Press D again to discard this local review draft."
@@ -339,10 +395,7 @@ class ReviewSubmitScreen(ModalScreen[ReviewSubmitAction | None]):
             self.dismiss(self._action(ReviewSubmitActionKind.NEW_REVISION))
 
     def action_resume(self) -> None:
-        if (
-            self.progress is not None
-            and self.progress.outcome is SubmissionOutcome.PAUSED
-        ):
+        if self.progress is not None and self.can_resume:
             self.dismiss(
                 self._action(
                     ReviewSubmitActionKind.RESUME,
