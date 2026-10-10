@@ -344,7 +344,9 @@ def _parse_patch(patch: str) -> list[DiffFile]:
     new_header = "__tongs_new__"
     clean_patch = patch.rstrip("\n")
     text = f"--- a/{old_header}\n+++ b/{new_header}\n{clean_patch}"
-    return parse_diff(text)
+    # The placeholder names have no language; the caller detects it from the
+    # real path, so the parser skips a lookup that could only miss.
+    return parse_diff(text, detect_language=False)
 
 
 def _json_count(value: object) -> int | None:

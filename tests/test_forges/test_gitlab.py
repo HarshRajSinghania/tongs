@@ -1015,3 +1015,24 @@ class TestLazyCI:
         assert detail.head_commit_sha == "listed-head"
         assert detail.head_sha == _mr_api_json()["diff_refs"]["head_sha"]
         assert without_sha.head_commit_sha == _mr_api_json()["diff_refs"]["head_sha"]
+
+
+@pytest.mark.asyncio
+async def test_get_mr_revision_reads_only_the_merge_request() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.raw_path.decode())
+        if request.url.raw_path == b"/api/v4/projects/acme%2Fwidgets/merge_requests/42":
+            return httpx.Response(200, json=_mr_api_json())
+        return httpx.Response(500, json={"message": "unexpected request"})
+
+    client, http = _make_gitlab_client(handler)
+    async with http:
+        detail = await client.get_mr_revision("acme/widgets", 42)
+
+    assert paths == ["/api/v4/projects/acme%2Fwidgets/merge_requests/42"]
+    assert detail.number == 42
+    assert detail.head_sha == "ccc333"
+    assert detail.base_sha == "aaa111"
+    assert detail.start_sha == "bbb222"

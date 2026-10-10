@@ -94,6 +94,18 @@ class ForgeClient(ABC):
         """Read MR detail without a response-cache result when supported."""
         return await self.get_mr(repo_path, number)
 
+    async def get_mr_revision(self, repo_path: str, number: int) -> MRDetail:
+        """Read the review resource alone, fresh, for its revision SHAs.
+
+        Revision checks only need the head, base and start SHAs, so forge
+        clients override this with the single pull or merge request read and
+        skip the CI, review and approval requests of a full detail read. The
+        result may then lack ``ci_status`` and ``approvals``, so it serves
+        revision checks and never display. This fallback keeps third-party
+        clients working with a full fresh read.
+        """
+        return await self.get_mr_fresh(repo_path, number)
+
     @abstractmethod
     async def get_mr_diff(self, repo_path: str, number: int) -> list[dict]: ...
 
@@ -340,3 +352,17 @@ async def read_mr_ci_status(
     if lookup is None:
         return CIStatus.UNKNOWN
     return await lookup(repo_path, number, head_sha)
+
+
+async def read_mr_revision(
+    client: ForgeClient, repo_path: str, number: int
+) -> MRDetail:
+    """Read one review's revision-only detail from any client.
+
+    A client without ``get_mr_revision`` (a duck-typed test double or an older
+    plugin) falls back to its fresh full detail read.
+    """
+    lookup = getattr(client, "get_mr_revision", None)
+    if lookup is None:
+        return await client.get_mr_fresh(repo_path, number)
+    return await lookup(repo_path, number)

@@ -12,7 +12,11 @@ unified diff format. The parser handles:
 
 from __future__ import annotations
 
+import os
 import re
+from functools import lru_cache
+
+from pygments.lexers import get_lexer_for_filename
 
 from tongs.diff.models import DiffFile, DiffHunk, DiffLine, FileStatus, LineType
 
@@ -23,9 +27,17 @@ FILE_HEADER_NEW_RE = re.compile(r"^\+\+\+ (.+)$")
 
 DIFF_GIT_RE = re.compile(r"^diff --git a/(.+) b/(.+)$")
 
+# Distinct file names whose language lookup is remembered.  Pygments matches a
+# lexer on the base name alone, so the cache key loses nothing.
+_LANGUAGE_CACHE_SIZE = 4096
 
-def parse_diff(diff_text: str) -> list[DiffFile]:
-    """Parse a unified diff string into a list of DiffFile objects."""
+
+def parse_diff(diff_text: str, *, detect_language: bool = True) -> list[DiffFile]:
+    """Parse a unified diff string into a list of DiffFile objects.
+
+    ``detect_language`` false leaves every file's language empty, for a caller
+    whose header paths are placeholders and that detects the language itself.
+    """
     if not diff_text or not diff_text.strip():
         return []
 
@@ -38,7 +50,7 @@ def parse_diff(diff_text: str) -> list[DiffFile]:
 
         git_match = DIFF_GIT_RE.match(line)
         if git_match:
-            file, consumed = _parse_git_diff_file(lines, i)
+            file, consumed = _parse_git_diff_file(lines, i, detect_language)
             if file:
                 files.append(file)
             i += consumed
@@ -48,7 +60,7 @@ def parse_diff(diff_text: str) -> list[DiffFile]:
         if old_match and i + 1 < len(lines):
             new_match = FILE_HEADER_NEW_RE.match(lines[i + 1])
             if new_match:
-                file, consumed = _parse_plain_diff_file(lines, i)
+                file, consumed = _parse_plain_diff_file(lines, i, detect_language)
                 if file:
                     files.append(file)
                 i += consumed
@@ -59,7 +71,9 @@ def parse_diff(diff_text: str) -> list[DiffFile]:
     return files
 
 
-def _parse_git_diff_file(lines: list[str], start: int) -> tuple[DiffFile | None, int]:
+def _parse_git_diff_file(
+    lines: list[str], start: int, detect_language: bool = True
+) -> tuple[DiffFile | None, int]:
     """Parse a file section starting from 'diff --git ...'."""
     git_match = DIFF_GIT_RE.match(lines[start])
     if not git_match:
@@ -119,8 +133,12 @@ def _parse_git_diff_file(lines: list[str], start: int) -> tuple[DiffFile | None,
                 1 for h in hunks for dl in h.lines if dl.line_type == LineType.DELETION
             )
 
-            lang = _detect_language(
-                actual_new if actual_new != "/dev/null" else actual_old
+            lang = (
+                _detect_language(
+                    actual_new if actual_new != "/dev/null" else actual_old
+                )
+                if detect_language
+                else ""
             )
 
             return (
@@ -148,7 +166,7 @@ def _parse_git_diff_file(lines: list[str], start: int) -> tuple[DiffFile | None,
         FileStatus.DELETED,
         FileStatus.RENAMED,
     ):
-        lang = _detect_language(new_path)
+        lang = _detect_language(new_path) if detect_language else ""
         return (
             DiffFile(
                 old_path=old_path,
@@ -164,7 +182,9 @@ def _parse_git_diff_file(lines: list[str], start: int) -> tuple[DiffFile | None,
     return None, i - start
 
 
-def _parse_plain_diff_file(lines: list[str], start: int) -> tuple[DiffFile | None, int]:
+def _parse_plain_diff_file(
+    lines: list[str], start: int, detect_language: bool = True
+) -> tuple[DiffFile | None, int]:
     """Parse a file section starting from '--- ...' (no git prefix)."""
     old_path = _strip_prefix(lines[start][4:])
     new_path = _strip_prefix(lines[start + 1][4:])
@@ -184,7 +204,11 @@ def _parse_plain_diff_file(lines: list[str], start: int) -> tuple[DiffFile | Non
     elif new_path == "/dev/null":
         status = FileStatus.DELETED
 
-    lang = _detect_language(new_path if new_path != "/dev/null" else old_path)
+    lang = (
+        _detect_language(new_path if new_path != "/dev/null" else old_path)
+        if detect_language
+        else ""
+    )
 
     return (
         DiffFile(
@@ -376,10 +400,14 @@ def _detect_language(path: str) -> str:
     """Detect programming language from file path using Pygments."""
     if path == "/dev/null":
         return ""
-    try:
-        from pygments.lexers import get_lexer_for_filename
+    return _language_for_name(os.path.basename(path))
 
-        lexer = get_lexer_for_filename(path)
+
+@lru_cache(maxsize=_LANGUAGE_CACHE_SIZE)
+def _language_for_name(name: str) -> str:
+    """Look up one base name's lexer once; Pygments matches on it alone."""
+    try:
+        lexer = get_lexer_for_filename(name)
         return lexer.aliases[0] if lexer.aliases else lexer.name.lower()
     except Exception:  # noqa: BLE001 - Third-party lexer failures must leave the diff readable.
         return ""

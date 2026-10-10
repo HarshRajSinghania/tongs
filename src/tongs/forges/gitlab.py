@@ -358,6 +358,14 @@ class GitLabClient(ForgeClient):
             )
         return detail
 
+    async def get_mr_revision(self, repo_path: str, number: int) -> MRDetail:
+        """Read only the merge request, without its approvals."""
+        project = _encode_project(repo_path)
+        data = await request(
+            self._http, "GET", f"/projects/{project}/merge_requests/{number}"
+        )
+        return self._parse_mr_detail(data, repo_path)
+
     async def _fetch_approvals(self, project: str, number: int) -> tuple[User, ...]:
         try:
             data = await request(

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+import tongs.services.review_mutations as review_mutations_module
 from tongs.cache.cached_client import CachedForgeClient
 from tongs.errors import AuthError, NetworkError, ValidationError
 from tongs.forges.models import (
@@ -36,9 +37,11 @@ from tongs.services.models import (
 )
 from tongs.services.review_mutations import (
     DiffAnchor,
+    DiffScope,
     DiffSide,
     GeneralComment,
     InlineComment,
+    InlineDraft,
     MutationStatus,
     Reply,
     Resolve,
@@ -792,3 +795,121 @@ async def test_repeated_cancellation_settles_review_owner_as_unknown() -> None:
     assert service._ledger[command.operation_id].receipt is outcome
     assert service._owner_tasks == set()
     client.add_comment.assert_awaited_once()
+
+
+def _inline_drafts(count: int) -> tuple[InlineDraft, ...]:
+    anchors = (
+        DiffAnchor("old.py", "new.py", 11, DiffSide.RIGHT),
+        DiffAnchor("old.py", "new.py", 11, DiffSide.LEFT),
+        DiffAnchor("old.py", "new.py", 10, DiffSide.RIGHT),
+    )
+    return tuple(
+        InlineDraft(anchors[index % len(anchors)], f"note {index}")
+        for index in range(count)
+    )
+
+
+@pytest.mark.asyncio
+async def test_thirty_anchor_review_reads_and_converts_the_diff_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversions = 0
+    convert = review_mutations_module.convert_forge_changes
+
+    def counting_convert(changes):
+        nonlocal conversions
+        conversions += 1
+        return convert(changes)
+
+    monkeypatch.setattr(
+        review_mutations_module, "convert_forge_changes", counting_convert
+    )
+    client = _client()
+    service, get_review, get_diff, *_ = _service(client, forge=ForgeType.GITHUB)
+    command = ReviewVerdict(
+        "verdict-thirty",
+        REF,
+        REVISION,
+        ReviewDecision.COMMENTED,
+        inline_comments=_inline_drafts(30),
+    )
+
+    outcome = await service.execute(command)
+
+    assert outcome.status == MutationStatus.KNOWN
+    get_diff.assert_awaited_once_with(REF)
+    assert conversions == 1
+    assert get_review.await_count == 2
+    assert len(client.submit_review.await_args.args[4]) == 30
+
+
+@pytest.mark.asyncio
+async def test_shared_scope_serves_validate_and_execute_from_one_diff_read() -> None:
+    client = _client()
+    service, get_review, get_diff, *_ = _service(client, ledger_size=64)
+    scope = DiffScope()
+    commands = [
+        InlineComment(f"inline-scope-{index}", REF, REVISION, draft.anchor, draft.body)
+        for index, draft in enumerate(_inline_drafts(30))
+    ]
+
+    for command in commands:
+        await service.validate(command, diff_scope=scope)
+    for command in commands:
+        outcome = await service.execute(command, diff_scope=scope)
+        assert outcome.status == MutationStatus.KNOWN
+
+    get_diff.assert_awaited_once_with(REF)
+    # Each command keeps its own cheap revision checks as the race guard.
+    assert get_review.await_count == 2 * 2 * len(commands)
+    assert client.create_inline_comment.await_count == 30
+
+
+@pytest.mark.asyncio
+async def test_scope_rejects_and_does_not_keep_a_diff_from_another_revision() -> None:
+    client = _client()
+    service, _get_review, get_diff, *_ = _service(client)
+    stale = RawDiffSnapshot(REF, ReviewRevision("old-head", "base", "start"), (PATCH,))
+    current = RawDiffSnapshot(REF, REVISION, (PATCH,))
+    get_diff.side_effect = [stale, current]
+    scope = DiffScope()
+    command = InlineComment(
+        "inline-stale-scope",
+        REF,
+        REVISION,
+        DiffAnchor("old.py", "new.py", 11, DiffSide.RIGHT),
+        "body",
+    )
+
+    with pytest.raises(ServiceError) as raised:
+        await service.validate(command, diff_scope=scope)
+    assert raised.value.code == ServiceErrorCode.REVISION_CHANGED
+
+    await service.validate(command, diff_scope=scope)
+    await service.validate(command, diff_scope=scope)
+    assert get_diff.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_scoped_anchor_outside_the_diff_is_still_rejected() -> None:
+    client = _client()
+    service, *_ = _service(client)
+    scope = DiffScope()
+    valid = InlineComment(
+        "inline-scope-valid",
+        REF,
+        REVISION,
+        DiffAnchor("old.py", "new.py", 11, DiffSide.RIGHT),
+        "body",
+    )
+    for anchor in (
+        DiffAnchor("old.py", "new.py", 99, DiffSide.RIGHT),
+        DiffAnchor("other.py", "new.py", 11, DiffSide.RIGHT),
+    ):
+        await service.validate(valid, diff_scope=scope)
+        with pytest.raises(ServiceError) as raised:
+            await service.validate(
+                InlineComment("inline-scope-bad", REF, REVISION, anchor, "body"),
+                diff_scope=scope,
+            )
+        assert raised.value.code == ServiceErrorCode.INVALID_INPUT
