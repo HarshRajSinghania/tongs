@@ -10,9 +10,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
+import httpx
 import pytest
 
-from tongs.errors import AuthError, NetworkError
+from tongs.errors import AuthError, NetworkError, ValidationError
+from tongs.forges.github import GitHubClient
 from tongs.forges.models import (
     CIStatus,
     Discussion,
@@ -52,6 +54,8 @@ from tongs.state.drafts import (
     DiffSide,
     DraftConflictError,
     DraftContent,
+    DraftNotFoundError,
+    DraftSnapshot,
     DraftState,
     DraftStateError,
     DraftStore,
@@ -1029,3 +1033,273 @@ async def test_second_start_during_submission_is_refused_and_posts_once(
         await store.close()
     assert submitted.outcome is SubmissionOutcome.SUBMITTED
     assert client.add_comment.await_count == 1
+
+
+def _assert_draft_content(saved: DraftSnapshot, content: DraftContent) -> None:
+    assert saved.body == content.body
+    assert saved.verdict is content.verdict
+    assert saved.comments == content.comments
+
+
+@pytest.mark.asyncio
+async def test_github_self_approval_422_returns_to_editing_without_another_request(
+    tmp_path: Path,
+) -> None:
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        return httpx.Response(
+            422,
+            json={
+                "message": "Unprocessable Entity",
+                "errors": ["Can not approve your own pull request"],
+            },
+        )
+
+    content = _content(
+        InlineDraftComment(uuid4(), "inline note", _anchor()),
+        body="looks good",
+        verdict=DraftVerdict.APPROVE,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.github.com"
+    ) as http:
+        client = GitHubClient(
+            ForgeHost("github.com", ForgeType.GITHUB, "https://api.github.com"), http
+        )
+        store, service, _, _, draft = await _services(
+            tmp_path / "drafts.db", content, client=client
+        )
+        paused = await service.start(draft.id, draft.version)
+
+        assert paused.outcome is SubmissionOutcome.PAUSED
+        assert paused.failure is not None
+        assert paused.failure.retryable is False
+        assert requests == [("POST", "/repos/acme/widgets/pulls/42/reviews")]
+        assert store.holds_attempt(paused.attempt_id)
+
+        editable = await service.reconcile(
+            paused.attempt_id, ReconciliationResolution.RETURN_EDITABLE
+        )
+
+        assert editable.outcome is SubmissionOutcome.EDITABLE
+        assert editable.attempt_id == paused.attempt_id
+        assert editable.draft_id == draft.id
+        assert editable.frozen_version == draft.version
+        assert len(requests) == 1
+    saved = await store.get_draft(draft.id)
+    assert saved.state is DraftState.EDITABLE
+    assert saved.version == draft.version + 2
+    _assert_draft_content(saved, content)
+    assert not store.holds_attempt(paused.attempt_id)
+    # The rejected attempt never reached the forge, so nothing durable remains.
+    with pytest.raises(DraftNotFoundError):
+        await store.get_attempt(paused.attempt_id)
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_never_dispatched_paused_attempt_returns_to_editing_by_cancelling(
+    tmp_path: Path,
+) -> None:
+    content = _content(GeneralDraftComment(uuid4(), "comment"), body="summary")
+    store, service, client, _, draft = await _services(tmp_path / "drafts.db", content)
+    store.begin_dispatch = AsyncMock(  # type: ignore[method-assign]
+        side_effect=DraftStoreError("journal unavailable")
+    )
+    paused = await service.start(draft.id, draft.version)
+    del store.begin_dispatch
+
+    assert paused.outcome is SubmissionOutcome.PAUSED
+    assert paused.failure and paused.failure.code == "storage_failed"
+
+    editable = await service.reconcile(
+        paused.attempt_id, ReconciliationResolution.RETURN_EDITABLE
+    )
+
+    assert editable.outcome is SubmissionOutcome.EDITABLE
+    saved = await store.get_draft(draft.id)
+    assert saved.state is DraftState.EDITABLE
+    _assert_draft_content(saved, content)
+    client.add_comment.assert_not_awaited()
+    client.submit_review.assert_not_awaited()
+    with pytest.raises(DraftNotFoundError):
+        await store.get_attempt(paused.attempt_id)
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_receipt_bearing_paused_attempt_returns_only_editable_remainder(
+    tmp_path: Path,
+) -> None:
+    comment = GeneralDraftComment(uuid4(), "confirmed comment")
+    verdict = AsyncMock(side_effect=ValidationError("Validation failed: 400"))
+    client = _client(submit_review=verdict)
+    store, service, _, _, draft = await _services(
+        tmp_path / "drafts.db",
+        _content(comment, body="summary", verdict=DraftVerdict.APPROVE),
+        forge=ForgeType.GITLAB,
+        client=client,
+    )
+    paused = await service.start(draft.id, draft.version)
+
+    assert paused.outcome is SubmissionOutcome.PAUSED
+    assert paused.completed_step_ids == (f"comment:{comment.id.hex}", "body")
+    assert client.add_comment.await_count == 2
+    assert verdict.await_count == 1
+
+    editable = await service.reconcile(
+        paused.attempt_id, ReconciliationResolution.RETURN_EDITABLE
+    )
+
+    assert editable.outcome is SubmissionOutcome.EDITABLE
+    saved = await store.get_draft(draft.id)
+    assert saved.state is DraftState.EDITABLE
+    assert saved.comments == ()
+    assert saved.body == ""
+    assert saved.verdict is DraftVerdict.APPROVE
+    historical = await store.get_attempt(paused.attempt_id)
+    assert historical.snapshot.comments == (comment,)
+    assert [receipt.step_id for receipt in historical.receipts] == [
+        f"comment:{comment.id.hex}",
+        "body",
+    ]
+    assert [item.resolution for item in historical.reconciliations] == [
+        ReconciliationResolution.RETURN_EDITABLE
+    ]
+    assert historical.unknown_outcomes == ()
+    assert client.add_comment.await_count == 2
+    assert verdict.await_count == 1
+    assert not store.holds_attempt(paused.attempt_id)
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_paused_return_to_editing_keeps_journaled_dispatch_as_unknown(
+    tmp_path: Path,
+) -> None:
+    content = _content(body="summary", verdict=DraftVerdict.APPROVE)
+    verdict = AsyncMock(side_effect=ValidationError("Validation failed: 422"))
+    store, service, _, _, draft = await _services(
+        tmp_path / "drafts.db", content, client=_client(submit_review=verdict)
+    )
+    paused = await service.start(draft.id, draft.version)
+    # A journaled dispatch whose remote result is not known must survive.
+    await store.begin_dispatch(paused.attempt_id, "batch", "journaled-op")
+
+    editable = await service.reconcile(
+        paused.attempt_id, ReconciliationResolution.RETURN_EDITABLE
+    )
+
+    assert editable.outcome is SubmissionOutcome.EDITABLE
+    assert editable.unknown_step_ids == ("batch",)
+    historical = await store.get_attempt(paused.attempt_id)
+    assert [item.step_id for item in historical.unknown_outcomes] == ["batch"]
+    saved = await store.get_draft(draft.id)
+    assert saved.state is DraftState.EDITABLE
+    _assert_draft_content(saved, content)
+    assert verdict.await_count == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_second_transition_leaves_a_valid_unknown_attempt(
+    tmp_path: Path,
+) -> None:
+    comment = GeneralDraftComment(uuid4(), "confirmed comment")
+    verdict = AsyncMock(side_effect=ValidationError("Validation failed: 400"))
+    client = _client(submit_review=verdict)
+    store, service, _, _, draft = await _services(
+        tmp_path / "drafts.db",
+        _content(comment, verdict=DraftVerdict.APPROVE),
+        forge=ForgeType.GITLAB,
+        client=client,
+    )
+    paused = await service.start(draft.id, draft.version)
+    store.reconcile_attempt = AsyncMock(  # type: ignore[method-assign]
+        side_effect=DraftStoreError("disk full")
+    )
+
+    stopped = await service.reconcile(
+        paused.attempt_id, ReconciliationResolution.RETURN_EDITABLE
+    )
+    del store.reconcile_attempt
+
+    assert stopped.outcome is SubmissionOutcome.UNKNOWN
+    assert stopped.failure and stopped.failure.code == "storage_failed"
+    assert (await store.get_attempt(paused.attempt_id)).state is DraftState.UNKNOWN
+    assert (await store.get_draft(draft.id)).state is DraftState.UNKNOWN
+    assert [item.id for item in await store.list_recovery_attempts()] == [
+        paused.attempt_id
+    ]
+
+    editable = await service.reconcile(
+        paused.attempt_id, ReconciliationResolution.RETURN_EDITABLE
+    )
+
+    assert editable.outcome is SubmissionOutcome.EDITABLE
+    saved = await store.get_draft(draft.id)
+    assert saved.comments == ()
+    assert saved.verdict is DraftVerdict.APPROVE
+    assert client.add_comment.await_count == 1
+    assert verdict.await_count == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resolution",
+    [ReconciliationResolution.RETRY_REMAINING, ReconciliationResolution.MARK_SUBMITTED],
+)
+async def test_paused_attempt_admits_only_return_to_editing(
+    tmp_path: Path, resolution: ReconciliationResolution
+) -> None:
+    verdict = AsyncMock(side_effect=ValidationError("Validation failed: 422"))
+    store, service, _, _, draft = await _services(
+        tmp_path / "drafts.db",
+        _content(verdict=DraftVerdict.APPROVE),
+        client=_client(submit_review=verdict),
+    )
+    paused = await service.start(draft.id, draft.version)
+
+    with pytest.raises(ServiceError) as raised:
+        await service.reconcile(paused.attempt_id, resolution)
+
+    assert raised.value.code is ServiceErrorCode.CONFLICT
+    assert (await store.get_draft(draft.id)).state is DraftState.SUBMITTING
+    assert store.holds_attempt(paused.attempt_id)
+    assert verdict.await_count == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_paused_attempt_owned_by_another_process_is_not_returned(
+    tmp_path: Path,
+) -> None:
+    verdict = AsyncMock(side_effect=ValidationError("Validation failed: 422"))
+    store, service, _, snapshot, draft = await _services(
+        tmp_path / "drafts.db",
+        _content(verdict=DraftVerdict.APPROVE),
+        client=_client(submit_review=verdict),
+    )
+    paused = await service.start(draft.id, draft.version)
+    other_store = DraftStore(tmp_path / "drafts.db")
+    await other_store.open()
+    other = ReviewSubmissionService(
+        store=other_store,
+        mutations=_mutation_service(_client(), snapshot),
+        get_review=AsyncMock(return_value=snapshot),
+    )
+
+    with pytest.raises(ServiceError) as raised:
+        await other.reconcile(
+            paused.attempt_id, ReconciliationResolution.RETURN_EDITABLE
+        )
+
+    assert raised.value.code is ServiceErrorCode.CONFLICT
+    assert not other_store.holds_attempt(paused.attempt_id)
+    assert store.holds_attempt(paused.attempt_id)
+    assert (await store.get_draft(draft.id)).state is DraftState.SUBMITTING
+    await other_store.close()
+    await store.close()

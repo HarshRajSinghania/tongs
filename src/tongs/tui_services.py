@@ -66,6 +66,7 @@ from tongs.services.review_submission import SubmissionProgress
 from tongs.services.session import ApplicationSession
 from tongs.state.drafts import (
     DraftContent,
+    DraftNotFoundError,
     DraftSnapshot,
     ReconciliationResolution,
 )
@@ -321,8 +322,14 @@ class TUIServiceAdapter:
         )
         recoveries: list[TUIDraftRecovery] = []
         for attempt_id in attempt_ids:
-            attempt = await self.session.drafts.get_attempt(attempt_id)
-            progress = await self.session.review_submissions.get(attempt_id)
+            try:
+                attempt = await self.session.drafts.get_attempt(attempt_id)
+                progress = await self.session.review_submissions.get(attempt_id)
+            except DraftNotFoundError:
+                # A paused attempt that never reached the forge is deleted when
+                # it returns to editing, so there is nothing left to recover.
+                self._forget_draft_attempt(attempt_id)
+                continue
             actual_target = TUIDraftTarget(
                 attempt.snapshot.review, attempt.snapshot.revision
             )
@@ -345,7 +352,12 @@ class TUIServiceAdapter:
         attempt_id: UUID,
         resolution: ReconciliationResolution,
     ) -> SubmissionProgress:
-        """Record an explicit resolution for an outcome-unknown attempt."""
+        """Record an explicit resolution for an unknown or paused attempt.
+
+        The result always passes through the attempt registry, so an attempt
+        that returned to editing (and may no longer exist) is forgotten before
+        the next draft load asks for it.
+        """
         await self._require_attempt_target(target, attempt_id)
         progress = await self.session.review_submissions.reconcile(
             attempt_id, resolution
@@ -559,6 +571,11 @@ class TUIServiceAdapter:
             self._known_draft_attempts.pop(key, None)
         else:
             self._known_draft_attempts[key] = progress.attempt_id
+
+    def _forget_draft_attempt(self, attempt_id: UUID) -> None:
+        for key, known in tuple(self._known_draft_attempts.items()):
+            if known == attempt_id:
+                del self._known_draft_attempts[key]
 
     async def _revision(self, summary: MRSummary) -> ReviewRevision:
         ref = self.review_ref(summary)

@@ -509,7 +509,7 @@ export function useReviewDrawer(
       const attempt = held.current.submission.progress;
       if (!attempt) return;
       try {
-        apply((state) => beginSubmission(state, mode));
+        apply((state) => beginSubmission(state, mode, resolution));
       } catch (reason) {
         setMessage(drawerFailureMessage(reason));
         return;
@@ -1634,11 +1634,21 @@ function SubmissionProgress({
         <>
           <p>
             Confirmed steps stay excluded. Resume retries the next definitely
-            unconfirmed step.
+            unconfirmed step. Returning the draft to editing sends nothing more
+            and keeps everything the forge has not confirmed.
           </p>
-          <button className="button" disabled={pending} onClick={resume}>
-            Resume confirmed attempt
-          </button>
+          <div className="review-workflow-row">
+            <button className="button" disabled={pending} onClick={resume}>
+              Resume confirmed attempt
+            </button>
+            <button
+              className="button button-secondary"
+              disabled={pending}
+              onClick={() => reconcile("return_editable")}
+            >
+              Return draft to editing
+            </button>
+          </div>
         </>
       )}
       {progress.outcome === "unknown" && (

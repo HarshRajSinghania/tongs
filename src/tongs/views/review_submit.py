@@ -227,7 +227,8 @@ class ReviewSubmitScreen(ModalScreen[ReviewSubmitAction | None]):
             and self.progress.outcome is SubmissionOutcome.PAUSED
         ):
             help_text = (
-                "Submission paused. Press r to resume confirmed remaining steps."
+                "Submission paused. Press r to resume confirmed remaining steps, "
+                "or 2 to return unconfirmed content to editing. Press 2 twice."
             )
         elif self.stale:
             help_text = "Press N for a separate current-revision draft; old inline text stays here."
@@ -359,9 +360,12 @@ class ReviewSubmitScreen(ModalScreen[ReviewSubmitAction | None]):
         self._reconcile(ReconciliationResolution.MARK_SUBMITTED)
 
     def _reconcile(self, resolution: ReconciliationResolution) -> None:
-        if (
-            self.progress is None
-            or self.progress.outcome is not SubmissionOutcome.UNKNOWN
+        if self.progress is None:
+            return
+        outcome = self.progress.outcome
+        if outcome is not SubmissionOutcome.UNKNOWN and not (
+            outcome is SubmissionOutcome.PAUSED
+            and resolution is ReconciliationResolution.RETURN_EDITABLE
         ):
             return
         warning = {

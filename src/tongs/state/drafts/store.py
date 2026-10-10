@@ -1886,6 +1886,14 @@ class DraftStore:
                 caller_content=caller_content,
             )
 
+    def holds_attempt(self, attempt_id: UUID) -> bool:
+        """Return whether this process holds the live lock for an attempt.
+
+        Ownership is process-local and is never persisted, so the answer is
+        only meaningful to the process that asks it.
+        """
+        return attempt_id in self._held_attempt_locks
+
     def _require_owned(self, attempt_id: UUID) -> None:
         if attempt_id not in self._held_attempt_locks:
             raise DraftAttemptOwnedError(
