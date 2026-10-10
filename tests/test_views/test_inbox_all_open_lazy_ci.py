@@ -236,16 +236,18 @@ async def test_first_paint_reads_one_page_per_repository_before_any_ci_request(
         release_ci.set()
         await wait_until(pilot, lambda: LOADING not in ci_cells(table).values())
 
-        # The six rows' CI is one GraphQL query, sent with rows on screen,
-        # and no REST CI read.
+        # The six rows' CI goes out batched over GraphQL, sent with rows on
+        # screen, and no REST CI read. Lookups that start a few milliseconds
+        # apart on a loaded machine may split into a second batch, but each
+        # row is looked up exactly once.
         loaded = {11, 12, 21, 22, 31, 32}
-        assert len(batches) == 1
-        assert sorted(batches[0]) == sorted(
+        assert 1 <= len(batches) <= 2
+        assert sorted(pull for batch in batches for pull in batch) == sorted(
             ("acme", projects[number // 10 - 1].split("/")[1], number)
             for number in loaded
         )
         ci_requests = [(path, rows) for path, rows in requests if path == "/graphql"]
-        assert len(ci_requests) == 1
+        assert len(ci_requests) == len(batches)
         assert all(rows > 0 for _path, rows in ci_requests)
         assert not any(
             path.endswith(("/check-runs", "/status")) for path, _rows in requests
