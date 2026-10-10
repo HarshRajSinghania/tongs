@@ -48,6 +48,9 @@ SYNTAX_THEME = "monokai"
 _TOKEN_SPLIT = re.compile(r"(\s+)")
 """Word diff tokens: runs of non-space text and the whitespace between them."""
 
+_TAB_SIZE = 4
+"""Tab stop the lexers expand tabs to: Rich's ``Syntax`` default."""
+
 
 class CommentMode(Enum):
     """Mode for inline comment creation."""
@@ -1047,37 +1050,35 @@ class DiffRenderer:
         TintedOptionList.render_line().
         """
         dl = old_dl if is_old else new_dl
-        old_text = self._content_text(old_dl)
-        new_text = self._content_text(new_dl)
-        old_tokens = _tokenize(old_text.plain)
-        new_tokens = _tokenize(new_text.plain)
-        sm = difflib.SequenceMatcher(None, old_tokens, new_tokens, autojunk=False)
-
         line = Text()
         line.append_text(self._gutter(dl))
-
         if is_old:
             line.append("-", Style(color="red"))
-            content = old_text.copy()
-            tokens = old_tokens
         else:
             line.append("+", Style(color="green"))
-            content = new_text.copy()
-            tokens = new_tokens
+
+        content = self._content_text(dl).copy()
         highlight = Style(bold=True, underline=True)
         if not content.spans:
             # Without syntax colours, colour the change like the line marker.
             highlight += Style(color="red" if is_old else "green")
 
-        offsets = [0]
-        for token in tokens:
-            offsets.append(offsets[-1] + len(token))
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
-            if tag == "equal":
-                continue
-            start, end = (i1, i2) if is_old else (j1, j2)
+        # Compare the raw contents, so a tab replaced by the spaces the lexer
+        # expands it to still shows as a change, then map the changed ranges
+        # onto the highlighted text.
+        ranges = _changed_ranges(old_dl.content, new_dl.content, is_old)
+        offsets = _raw_offsets(dl.content, content.plain)
+        if offsets is None:
+            ranges = _changed_ranges(
+                self._content_text(old_dl).plain,
+                self._content_text(new_dl).plain,
+                is_old,
+            )
+        for start, end in ranges:
+            if offsets is not None:
+                start, end = offsets[start], offsets[end]
             if start < end:
-                content.stylize(highlight, offsets[start], offsets[end])
+                content.stylize(highlight, start, end)
 
         line.append_text(content)
         return line
@@ -1241,6 +1242,52 @@ def _render_thread_block(discussions: list[Discussion]) -> list[Text]:
 def _tokenize(content: str) -> list[str]:
     """Split a line into word and whitespace tokens that join back exactly."""
     return [token for token in _TOKEN_SPLIT.split(content) if token]
+
+
+def _changed_ranges(old: str, new: str, is_old: bool) -> list[tuple[int, int]]:
+    """Return the character ranges of one side that a word diff changed."""
+    old_tokens = _tokenize(old)
+    new_tokens = _tokenize(new)
+    tokens = old_tokens if is_old else new_tokens
+    offsets = [0]
+    for token in tokens:
+        offsets.append(offsets[-1] + len(token))
+    matcher = difflib.SequenceMatcher(None, old_tokens, new_tokens, autojunk=False)
+    ranges: list[tuple[int, int]] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        start, end = (i1, i2) if is_old else (j1, j2)
+        if tag != "equal" and start < end:
+            ranges.append((offsets[start], offsets[end]))
+    return ranges
+
+
+def _raw_offsets(raw: str, plain: str) -> list[int] | None:
+    """Map every offset of a line's raw content onto its highlighted text.
+
+    The lexer expands a tab to the next tab stop and reads a lone carriage
+    return as a line break, and a line highlighted on its own loses its
+    trailing whitespace. The result has ``len(raw) + 1`` entries, or is None
+    when the two texts do not line up.
+    """
+    offsets: list[int] = []
+    j = 0
+    for index, char in enumerate(raw):
+        offsets.append(j)
+        if j < len(plain) and (plain[j] == char or (char == "\r" and plain[j] == "\n")):
+            j += 1
+            continue
+        if char == "\t":
+            column = j - plain.rfind("\n", 0, j) - 1
+            width = _TAB_SIZE - column % _TAB_SIZE
+            if plain[j : j + width] == " " * width:
+                j += width
+                continue
+        if j == len(plain) and raw[index:].isspace():
+            offsets.extend([j] * (len(raw) - index - 1))
+            break
+        return None
+    offsets.append(j)
+    return offsets
 
 
 def _without_background(style: Style) -> Style:

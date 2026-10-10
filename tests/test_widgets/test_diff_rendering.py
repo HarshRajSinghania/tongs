@@ -133,6 +133,55 @@ def test_word_diff_marks_changed_indentation_and_keeps_syntax_colour() -> None:
     assert all(colour.name != "green" for colour in keyword_colours)
 
 
+def _underlined(text: Text, marker: str) -> list[tuple[int, int]]:
+    """Underlined ranges relative to the line content after the marker."""
+    content_start = text.plain.index(marker) + 1
+    return [
+        (span.start - content_start, span.end - content_start)
+        for span in text.spans
+        if not isinstance(span.style, str) and span.style.underline
+    ]
+
+
+@pytest.mark.parametrize("with_map", [True, False], ids=["map", "no-map"])
+def test_word_diff_marks_a_tab_reindented_to_spaces(with_map: bool) -> None:
+    lines = (
+        _line(1, None, "\treturn x", LineType.DELETION),
+        _line(None, 1, "    return x", LineType.ADDITION),
+    )
+    file = DiffFile(
+        "m.py",
+        "m.py",
+        FileStatus.MODIFIED,
+        (DiffHunk("@@ -1 +1 @@", 1, 1, 1, 1, lines),),
+        language="python",
+    )
+    old, new = lines
+    renderer = DiffRenderer(
+        "python", highlight_map=_build_highlight_map(file) if with_map else None
+    )
+
+    old_text = renderer._render_word_diff_line(old, new, is_old=True)
+    new_text = renderer._render_word_diff_line(old, new, is_old=False)
+
+    # The lexer expands the tab to the same four spaces, yet the indent
+    # changed, so it is underlined on both sides and "return x" is not.
+    assert old_text.plain.endswith("-    return x")
+    assert _underlined(old_text, "-") == [(0, 4)]
+    assert _underlined(new_text, "+") == [(0, 4)]
+
+
+def test_word_diff_maps_a_change_after_a_tab_onto_the_expanded_text() -> None:
+    old = _line(1, None, "a\tb = 1", LineType.DELETION)
+    new = _line(None, 1, "a\tb = 2", LineType.ADDITION)
+
+    text = DiffRenderer("python")._render_word_diff_line(old, new, is_old=True)
+
+    content = text.plain[text.plain.index("-") + 1 :]
+    assert content == "a   b = 1"
+    assert [content[start:end] for start, end in _underlined(text, "-")] == ["1"]
+
+
 def test_word_diff_colours_changes_when_there_is_no_syntax() -> None:
     old = _line(1, None, "alpha beta", LineType.DELETION)
     new = _line(None, 1, "alpha gamma", LineType.ADDITION)
