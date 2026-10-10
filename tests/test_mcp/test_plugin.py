@@ -6,6 +6,7 @@ import os
 import shlex
 import subprocess
 import sys
+from importlib.util import find_spec
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -53,7 +54,7 @@ def test_the_command_is_hidden_without_the_extra(
 
 
 def test_the_installed_extra_is_detected() -> None:
-    assert plugin._mcp_available() is True
+    assert plugin._mcp_available() is (find_spec("mcp") is not None)
 
 
 @pytest.mark.asyncio

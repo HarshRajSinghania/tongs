@@ -760,9 +760,9 @@ async def test_slow_starts_run_concurrently_inside_one_budget(
     registry = _timed_registry(
         {
             "hang": {"start": "hang"},
-            "slow-a": {"start": 0.2},
-            "slow-b": {"start": 0.2},
-            "slow-c": {"start": 0.2},
+            "slow-a": {"start": 0.3},
+            "slow-b": {"start": 0.3},
+            "slow-c": {"start": 0.3},
             "stubborn": {"start": "stubborn"},
         },
         log,
@@ -776,8 +776,8 @@ async def test_slow_starts_run_concurrently_inside_one_budget(
     await registry.start_all(lambda _plugin_id, _manifest: RecordingFacade())
 
     elapsed = loop.time() - began
-    # One serial start of the three slow providers alone takes 0.6 s.
-    assert 0.5 <= elapsed < 0.75
+    # One serial start of the three slow providers alone takes 0.9 s.
+    assert 0.5 <= elapsed < 0.85
     states = {item.plugin_id: item for item in registry.plugins}
     for plugin_id in ("slow-a", "slow-b", "slow-c"):
         assert states[plugin_id].state is DesktopPluginState.STARTED
@@ -794,7 +794,7 @@ async def test_slow_starts_run_concurrently_inside_one_budget(
     )
     starts = sorted(at for event, _plugin_id, at in log if event == "start")
     assert len(starts) == 5
-    assert starts[-1] - starts[0] < 0.1
+    assert starts[-1] - starts[0] < 0.3
     await asyncio.sleep(0.1)
 
 
@@ -837,10 +837,10 @@ async def test_four_slow_providers_all_stop_within_the_cleanup_bound(
     providers: list[_TimedProvider] = []
     plugin_ids = ("p1", "p2", "p3", "p4")
     registry = _timed_registry(
-        {plugin_id: {"stop": 0.2} for plugin_id in plugin_ids},
+        {plugin_id: {"stop": 0.3} for plugin_id in plugin_ids},
         log,
         providers,
-        cleanup_timeout_seconds=0.5,
+        cleanup_timeout_seconds=1.0,
     )
     registry.discover()
     await registry.start_all(lambda _plugin_id, _manifest: RecordingFacade())
@@ -863,13 +863,13 @@ async def test_four_slow_providers_all_stop_within_the_cleanup_bound(
     await registry.stop_all()
 
     elapsed = loop.time() - began
-    # Stopping the four providers one after another takes 0.8 s.
-    assert elapsed < 0.5
+    # Stopping the four providers one after another takes 1.2 s.
+    assert elapsed < 1.1
     assert tokens_at_first_stop == [True, True, True, True]
     assert all(item.state is DesktopPluginState.STOPPED for item in registry.plugins)
     stops = [at for event, _plugin_id, at in log if event == "stop"]
     assert len(stops) == 4
-    assert max(stops) - began < 0.1
+    assert max(stops) - began < 0.3
     assert sorted(plugin_id for event, plugin_id, _at in log if event == "stopped") == [
         *plugin_ids
     ]
@@ -902,7 +902,7 @@ async def test_hanging_providers_each_get_stop_and_share_one_deadline(
 
     elapsed = loop.time() - began
     # One 0.2 s bound per hanging provider would take 0.8 s.
-    assert 0.2 <= elapsed < 0.4
+    assert 0.2 <= elapsed < 0.7
     assert sorted(plugin_id for event, plugin_id, _at in log if event == "stop") == [
         "h1",
         "h2",

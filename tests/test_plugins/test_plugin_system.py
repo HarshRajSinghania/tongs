@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tongs.mcp import plugin as mcp_plugin
 from tongs.plugins.base import TongsPlugin
 from tongs.plugins.context import PluginContext
 from tongs.plugins.registry import PluginRegistry
@@ -339,3 +341,22 @@ class TestGuardedPluginCommands:
         with pytest.raises(asyncio.CancelledError):
             await self._run(cancelled, app)
         app.notify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_mcp_setup_command_is_offered_and_starts_no_process(monkeypatch):
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("the MCP plugin must not start a process")
+
+    monkeypatch.setattr(mcp_plugin, "_mcp_available", lambda: True)
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+    app = MagicMock()
+    plugin = mcp_plugin.MCPPlugin()
+    await plugin.on_app_ready(PluginContext(app))
+
+    ((display, _help, callback),) = plugin.get_commands()
+    callback()
+
+    assert display == "MCP Server Setup"
+    app.notify.assert_called_once()
+    assert app.notify.call_args.kwargs == {"severity": "information"}
