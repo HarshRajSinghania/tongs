@@ -16,7 +16,11 @@ from tongs.plugins.desktop import (
     DesktopModule,
     DesktopPluginManifest,
 )
-from tongs.plugins.desktop_resources import find_asset, validate_asset_resources
+from tongs.plugins.desktop_resources import (
+    find_asset,
+    validate_asset_resources,
+    validate_resource_containment,
+)
 
 
 def resource_manifest(package: str, root: str = "assets") -> DesktopPluginManifest:
@@ -75,6 +79,18 @@ def test_bundle_root_symlink_outside_package_is_rejected(
 
     with pytest.raises(ValueError, match="symlink"):
         validate_asset_resources(resource_manifest("root_link_fixture"))
+
+
+@pytest.mark.parametrize("root_parts", [("..",), ("assets", "..", "..")])
+def test_bundle_root_outside_package_is_rejected_without_asset_check(
+    tmp_path: Path, root_parts: tuple[str, ...]
+) -> None:
+    package = make_package(tmp_path, "root_escape_fixture")
+
+    with pytest.raises(ValueError, match="escapes its declared package root"):
+        validate_resource_containment(
+            package, package.joinpath(*root_parts), root_parts
+        )
 
 
 def test_bundle_root_symlinked_ancestor_is_rejected(
