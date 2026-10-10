@@ -122,12 +122,23 @@ def _parse_changes_count(value: object) -> int:
     """Parse GitLab's ``changes_count``, a string such as ``"12"`` or ``"1000+"``.
 
     GitLab appends ``+`` when the MR overflows its diff limits; the number is
-    then a lower bound. Anything else unparsable counts as zero.
+    then a lower bound. Anything else unparsable, including a boolean, counts
+    as zero.
     """
+    if isinstance(value, bool):
+        return 0
     if isinstance(value, int):
         return value
     digits = str(value or "").strip().removesuffix("+")
     return int(digits) if digits.isdecimal() else 0
+
+
+def _changes_overflowed(value: object) -> bool:
+    """Return whether GitLab's ``changes_count`` is a capped ``"N+"`` lower bound."""
+    if not isinstance(value, str):
+        return False
+    count, plus, rest = value.strip().partition("+")
+    return bool(plus) and not rest and count.isdecimal()
 
 
 def _parse_user(data: dict | None) -> User:
@@ -773,6 +784,7 @@ class GitLabClient(ForgeClient):
         reviewers = [_parse_user(r) for r in data.get("reviewers", [])]
         assignees = [_parse_user(a) for a in data.get("assignees", [])]
         approvals = [_parse_user(a.get("user", a)) for a in data.get("approved_by", [])]
+        raw_changes_count = data.get("changes_count")
         return MRDetail(
             **{f.name: getattr(summary, f.name) for f in fields(summary)},
             description=data.get("description", "") or "",
@@ -780,11 +792,12 @@ class GitLabClient(ForgeClient):
             approvals=tuple(approvals),
             reviewers=tuple(reviewers),
             assignees=tuple(assignees),
-            changes_count=_parse_changes_count(data.get("changes_count")),
+            changes_count=_parse_changes_count(raw_changes_count),
             head_sha=diff_refs.get("head_sha", ""),
             base_sha=diff_refs.get("base_sha", ""),
             start_sha=diff_refs.get("start_sha") or None,
             detailed_merge_status=data.get("detailed_merge_status"),
+            changes_overflow=_changes_overflowed(raw_changes_count),
         )
 
     def _parse_note(self, data: dict) -> InlineComment:

@@ -148,6 +148,9 @@ class MRDetail(MRSummary):
     head_sha: str = ""
     base_sha: str = ""
     start_sha: str | None = None
+    # True when the forge capped the changed-file list, so changes_count is a
+    # lower bound and the diff is partial. Appended for positional compatibility.
+    changes_overflow: bool = False
 
 
 @dataclass(frozen=True)
