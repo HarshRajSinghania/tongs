@@ -41,12 +41,14 @@ _TAB_TABLES = {
 _TABLE_TABS = {table.removeprefix("#"): tab_id for tab_id, table in _TAB_TABLES.items()}
 
 
-# CI lookups in flight per tab. GitHub answers the lookups that run together
-# in one batched query of up to 50 pull requests, so this many keep a batch
-# full; every request still takes a slot of the per-host request limit.
-_CI_LOOKUPS_IN_FLIGHT = 50
+# CI lookups in flight per tab. The rows near the view (about three screens)
+# are looked up at once, so GitHub answers them in full batched queries of up
+# to 50 pull requests; every request still takes a slot of the per-host
+# request limit.
+_CI_LOOKUPS_IN_FLIGHT = 200
 
-# Scrolling settles for this long before the rows it shows are looked up.
+# Scrolling settles for this long before the rows it shows are looked up, and
+# rows that arrive within it are looked up together.
 _CI_WINDOW_DEBOUNCE_SECONDS = 0.1
 
 # How long the All Open status line shows the rows a load more added.
@@ -278,10 +280,20 @@ class InboxScreen(Screen):
     def _viewport_changed(self, message: MRTable.ViewportChanged) -> None:
         """Look up the rows a scroll or resize brought into view, debounced."""
         tab_id = _TABLE_TABS.get(message.table.id or "")
-        if tab_id is None:
-            return
+        if tab_id is not None:
+            self._schedule_ci_window(tab_id, restart=True)
+
+    def _schedule_ci_window(self, tab_id: str, *, restart: bool) -> None:
+        """Update a tab's CI lookups shortly, once for a burst of changes.
+
+        ``restart`` waits for scrolling to settle; otherwise changes that
+        arrive while an update is scheduled join it, so repositories that
+        land together are looked up as one view rather than one each.
+        """
         lookups = self._ci[tab_id]
         if lookups.window_timer is not None:
+            if not restart:
+                return
             lookups.window_timer.stop()
 
         def update() -> None:
@@ -646,7 +658,7 @@ class InboxScreen(Screen):
         """
         if fresh:
             self._ci[tab_id].fresh.update(mr_row_key(summary) for summary in summaries)
-        self._update_ci_window(tab_id)
+        self._schedule_ci_window(tab_id, restart=False)
 
     def _update_ci_window(self, tab_id: str) -> None:
         """Queue lookups for the rows near the view that still wait for CI.

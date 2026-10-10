@@ -99,9 +99,9 @@ async def open_all_open(pilot: Pilot, app: TongsApp, rows: int) -> MRTable:
 
 @pytest.mark.asyncio
 async def test_only_rows_near_the_view_are_looked_up(tmp_path: Path) -> None:
-    projects = ["acme/a", "acme/b", "acme/c"]
-    client = AllOpenOnlyClient(many(projects, 100))
-    app = build(tmp_path, client, projects)
+    # One repository lands in one step, so the first view is final.
+    client = AllOpenOnlyClient(many(["acme/a"], 300), page_size=300)
+    app = build(tmp_path, client, ["acme/a"])
 
     async with app.run_test(notifications=True) as pilot:
         await settle(app)
@@ -220,9 +220,16 @@ async def test_github_all_open_cost_is_one_query_per_fifty_rows_in_view(
             "labels": [],
         }
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    shown: list[MRTable] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
         paths.append(path)
+        if path.endswith("/pulls") and path != f"/repos/{projects[0]}/pulls":
+            # The newest repository lands first, so the older ones' rows
+            # arrive below it and never push looked-up rows out of view.
+            while not shown or shown[0].row_count < 100:
+                await asyncio.sleep(0.01)
         if path == "/search/issues":
             return httpx.Response(200, json={"items": [], "total_count": 0})
         if is_ci_batch(request):
@@ -254,6 +261,7 @@ async def test_github_all_open_cost_is_one_query_per_fifty_rows_in_view(
     async with app.run_test(size=(100, 80), notifications=True) as pilot:
         await settle(app)
         paths.clear()
+        shown.append(app.screen.query_one("#all-open-table", MRTable))
         table = await open_all_open(pilot, app, 300)
         view = rows_in_view(table)
         window = numbers(table)[: 2 * view]
