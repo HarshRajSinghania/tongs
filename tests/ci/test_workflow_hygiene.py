@@ -11,7 +11,11 @@ that apply to every file, not only to the release workflows:
 * every job that runs steps sets ``timeout-minutes``, so a hung job cannot
   hold a runner, or a token, for the six-hour default;
 * the manual packaging workflows run only on ``workflow_dispatch`` with
-  read-only tokens and check out the exact candidate commit.
+  read-only tokens and check out the exact candidate commit;
+* every workflow a release tag push triggers runs the release gate
+  (``.github/scripts/release_gate.py``) before any job of it can upload or
+  publish, with read scopes only, and the token reaches only the gate's
+  read-only ``gh api`` fetch.
 
 ``test_release_lock.py`` holds every install under a write token to the
 hash-locked release lock.
@@ -19,6 +23,7 @@ hash-locked release lock.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +33,19 @@ import yaml
 from tests.ci.verify_desktop_production_gate import ROOT
 
 WORKFLOW_DIRECTORY = ROOT / ".github/workflows"
+RELEASE_GATE = ".github/scripts/release_gate.py"
+TAG_PUSH = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
+#: Actions that upload, attest or publish something.
+_PUBLISHING_ACTIONS = (
+    "actions/upload-artifact@",
+    "actions/attest@",
+    "pypa/gh-action-pypi-publish@",
+)
+_GH_CALL = re.compile(r"(^|[\s;&|(])gh\s+(\S+)(.*)")
+#: gh api options that turn a read into a write.
+_GH_WRITE_OPTIONS = re.compile(
+    r"(^|\s)(-X|--method|-f|-F|--field|--raw-field|--input)(\s|=|$)"
+)
 
 #: The dispatch-only packaging workflows and the exact read scopes each holds.
 MANUAL_PACKAGING_WORKFLOWS = {
@@ -140,3 +158,126 @@ def test_manual_packaging_workflows_are_dispatch_only_and_read_only(
                 checkouts += 1
                 assert step["with"]["ref"] == "${{ env.TONGS_HEAD_SHA }}", name
     assert checkouts, name
+
+
+def _triggers(document: dict[str, Any]) -> dict[str, Any]:
+    triggers = document.get("on", document.get(True)) or {}
+    if isinstance(triggers, str):
+        return {triggers: None}
+    if isinstance(triggers, list):
+        return dict.fromkeys(triggers)
+    return triggers
+
+
+def _runs_gate(step: dict[str, Any]) -> bool:
+    return RELEASE_GATE in (step.get("run") or "")
+
+
+def _publishes(step: dict[str, Any]) -> bool:
+    uses = str(step.get("uses", ""))
+    run = " ".join((step.get("run") or "").split())
+    return uses.startswith(_PUBLISHING_ACTIONS) or "gh release" in run
+
+
+def _gated_jobs(document: dict[str, Any]) -> set[str]:
+    """Return the jobs that cannot run a step unless the gate passed.
+
+    A job is gated when it runs the gate unconditionally for a tag push, or
+    when it needs a gated job and its condition cannot bypass that job's
+    failure.
+    """
+
+    jobs = document["jobs"]
+    gated = set()
+    for job_id, job in jobs.items():
+        for step in job.get("steps", []):
+            if _runs_gate(step):
+                condition = " ".join(str(step.get("if", TAG_PUSH)).split())
+                if condition == TAG_PUSH:
+                    gated.add(job_id)
+    changed = True
+    while changed:
+        changed = False
+        for job_id, job in jobs.items():
+            if job_id in gated:
+                continue
+            needs = job.get("needs") or []
+            needs = [needs] if isinstance(needs, str) else needs
+            condition = " ".join(str(job.get("if", "")).split())
+            if any(
+                word in condition for word in ("always()", "failure()", "cancelled()")
+            ):
+                continue
+            for need in needs:
+                if need in gated and (
+                    not condition or f"needs.{need}.result == 'success'" in condition
+                ):
+                    gated.add(job_id)
+                    changed = True
+                    break
+    return gated
+
+
+def test_every_tag_push_workflow_gates_what_it_publishes(
+    workflows: dict[str, dict[str, Any]],
+) -> None:
+    tag_workflows = 0
+    for name, document in workflows.items():
+        push = _triggers(document).get("push") or {}
+        if not push.get("tags"):
+            continue
+        tag_workflows += 1
+        gated = _gated_jobs(document)
+        assert gated, f"{name} runs on a tag push without the release gate"
+        for job_id, job in document["jobs"].items():
+            steps = job.get("steps", [])
+            publishing = [index for index, step in enumerate(steps) if _publishes(step)]
+            if not publishing:
+                continue
+            label = f"{name}:{job_id}"
+            assert job_id in gated, f"{label} can publish without the release gate"
+            gate = [index for index, step in enumerate(steps) if _runs_gate(step)]
+            if gate:
+                assert max(gate) < min(publishing), label
+    # publish.yml and release-desktop.yml.
+    assert tag_workflows == 2
+
+
+def test_the_release_gate_token_is_read_only_and_reaches_only_its_fetch(
+    workflows: dict[str, dict[str, Any]],
+) -> None:
+    gate_jobs = 0
+    for name, document in workflows.items():
+        for job_id, job in document["jobs"].items():
+            steps = job.get("steps", [])
+            gate = [index for index, step in enumerate(steps) if _runs_gate(step)]
+            if not gate:
+                continue
+            gate_jobs += 1
+            label = f"{name}:{job_id}"
+            assert job["permissions"] == {"contents": "read", "actions": "read"}, label
+            assert "GH_TOKEN" not in (document.get("env") or {}), label
+            assert "GH_TOKEN" not in (job.get("env") or {}), label
+            assert "GH_TOKEN" not in (steps[gate[0]].get("env") or {}), label
+            fetches = 0
+            for step in steps:
+                script = (step.get("run") or "").replace("\\\n", " ")
+                calls = [
+                    match
+                    for line in script.splitlines()
+                    if (match := _GH_CALL.search(line.split("#", 1)[0]))
+                ]
+                # Only steps that call gh hold the token, and every call there
+                # is a gh api read.
+                has_token = "GH_TOKEN" in (step.get("env") or {})
+                assert has_token == bool(calls), (label, step.get("name"))
+                fetches += bool(calls)
+                for call in calls:
+                    assert call.group(2) == "api", (label, call.group(0))
+                    assert not _GH_WRITE_OPTIONS.search(call.group(3)), (
+                        label,
+                        call.group(0),
+                    )
+            assert fetches == 1, label
+    # publish.yml build and release-desktop.yml candidate-archive.
+    assert gate_jobs == 2

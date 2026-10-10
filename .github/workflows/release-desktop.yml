@@ -60,6 +60,15 @@ jobs:
     env:
       TONGS_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
+      # A dry run is a rehearsal of main.  The candidate jobs skip any other
+      # ref by their conditions, so without this a dispatch from another
+      # branch would build nothing and still report success.
+      - name: Refuse a manual dispatch from any ref other than main
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "dispatch this workflow from main, not $GITHUB_REF" >&2
+            exit 1
+          fi
       - name: Check out exact validation source without persisted credentials
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -124,8 +133,10 @@ jobs:
         github.ref == 'refs/heads/main'))
     runs-on: ubuntu-24.04
     timeout-minutes: 70
+    # actions: read lets the release gate read main's ci.yml runs.
     permissions:
       contents: read
+      actions: read
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
@@ -140,6 +151,34 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
+      # The release gate, on a tag push only; a dry run publishes nothing.
+      # Every later job needs this one, so nothing is built, signed or
+      # published unless the tagged commit is on main, its release notes
+      # exist and main's ci.yml push run on it is green.  The compare API
+      # proves ancestry without deepening this one-commit checkout.  This
+      # step is the only one that sees the token, and it only reads.
+      - name: Fetch main ancestry and main CI runs for the tagged commit
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...main" \
+            > "$RUNNER_TEMP/release-gate-compare.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?event=push&branch=main&head_sha=$GITHUB_SHA&per_page=100" \
+            > "$RUNNER_TEMP/release-gate-runs.json"
+      - name: Require the tag on main, its release notes and green main CI
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -I .github/scripts/release_gate.py \
+            --tag "$GITHUB_REF_NAME" \
+            --sha "$GITHUB_SHA" \
+            --repository-id "$GITHUB_REPOSITORY_ID" \
+            --compare "$RUNNER_TEMP/release-gate-compare.json" \
+            --runs "$RUNNER_TEMP/release-gate-runs.json" \
+            --notes "docs/releases/$GITHUB_REF_NAME.md"
       - name: Initialize runner-scoped candidate paths
         run: |
           printf 'CANDIDATE_ROOT=%s/tongs-desktop-candidate\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"

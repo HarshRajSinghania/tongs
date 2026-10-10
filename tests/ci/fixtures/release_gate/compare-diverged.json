@@ -1,0 +1,200 @@
+{
+  "url": "https://api.github.com/repos/andre-motta/tongs/compare/790f75838b9e60a00412d2c5e06ab4531c19b537...main",
+  "html_url": "https://github.com/andre-motta/tongs/compare/790f75838b9e60a00412d2c5e06ab4531c19b537...main",
+  "permalink_url": "https://github.com/andre-motta/tongs/compare/andre-motta:790f758...andre-motta:e98791e",
+  "diff_url": "https://github.com/andre-motta/tongs/compare/790f75838b9e60a00412d2c5e06ab4531c19b537...main.diff",
+  "patch_url": "https://github.com/andre-motta/tongs/compare/790f75838b9e60a00412d2c5e06ab4531c19b537...main.patch",
+  "base_commit": {
+    "sha": "790f75838b9e60a00412d2c5e06ab4531c19b537",
+    "node_id": "C_kwDOTc4RItoAKDc5MGY3NTgzOGI5ZTYwYTAwNDEyZDJjNWUwNmFiNDUzMWMxOWI1Mzc",
+    "commit": {
+      "author": {
+        "name": "André Lustosa",
+        "email": "30708955+andre-motta@users.noreply.github.com",
+        "date": "2026-09-27T17:17:41Z"
+      },
+      "committer": {
+        "name": "GitHub",
+        "email": "noreply@github.com",
+        "date": "2026-09-27T17:17:41Z"
+      },
+      "message": "Merge pull request #349 from andre-motta/claude/v103\n\nPage the desktop inbox and fix crashes from damaged drafts, long discussions and bracketed titles",
+      "tree": {
+        "sha": "f870c9d9f8419cc066eb9aa56afd30620d1e7e12",
+        "url": "https://api.github.com/repos/andre-motta/tongs/git/trees/f870c9d9f8419cc066eb9aa56afd30620d1e7e12"
+      },
+      "url": "https://api.github.com/repos/andre-motta/tongs/git/commits/790f75838b9e60a00412d2c5e06ab4531c19b537",
+      "comment_count": 0,
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\nwsFcBAABCAAQBQJquU+1CRC1aQ7uu5UhlAAAVHQQADTd8f0Zn9+EnMDcwPGSLjbz\nGAQlecYN1YaNhniEFG5i3xrvOdxm0eSDMWMPCL8CenEiltZqNYeY4fkyQbMAu4vL\npFXR6NLF5W7pGqxIlUq3KAeyknQ6Tg/3gXeCbX2L3knTJZgxkel6WjleVkxmOhKA\nLMjrBZeVv+KiTG84ArBJXifTfYjPoEZIHEpcVFV43AFfcrLK+X6A6GdF8wuRix4z\nex0UOXJRMVdEhBpg+M9n0mUjxSvPH6FzHHDz/R6wmAOCPx0v1PZxgeVhty3oehhw\npiN5PV1xy4jum6u0KK2I0SLqjboQ3jCLCnS8lIJAyBoUbCzuJ6NvkcAdGvuvgt6k\nybBNUAwDRIovXgLDJgXaoOz7hQ0eUQ7UsuTlTREDEP4v5ec3pPYyxmQCLu+i+6F/\nLtlrP74ID8W3JHKD9AY69p37A2FTm0BfLRMmUtN2Sx16Q2SRZ5TB9sj8nrnVGizt\nlp7beVJUuggs618gNE1QBT/fl7E9eM2sHfb6kbmlBByDPjzAsyCyvBx/yfghPhM2\ngyvbb207m2o+qkicDbLs2MCn6Mq0mg3franUJXSYb7EQevN0X7LRbtAzIVjVYmcN\ntW+R/p7vyLFKzoapAaZtRfE0EhV8L5Dd2CoFrlgKmftS3Lez0m8RoBLYv7yjTydn\nKchN4x55WEertzljLPC1\n=32Bz\n-----END PGP SIGNATURE-----\n",
+        "payload": "tree f870c9d9f8419cc066eb9aa56afd30620d1e7e12\nparent f4506f1631577c603deb2f6ca412d159414569d1\nparent 24908053af723429cb25a37591fd2cbe24650806\nauthor André Lustosa <30708955+andre-motta@users.noreply.github.com> 1790529461 -0400\ncommitter GitHub <noreply@github.com> 1790529461 -0400\n\nMerge pull request #349 from andre-motta/claude/v103\n\nPage the desktop inbox and fix crashes from damaged drafts, long discussions and bracketed titles",
+        "verified_at": "2026-09-27T17:17:42Z"
+      }
+    },
+    "url": "https://api.github.com/repos/andre-motta/tongs/commits/790f75838b9e60a00412d2c5e06ab4531c19b537",
+    "html_url": "https://github.com/andre-motta/tongs/commit/790f75838b9e60a00412d2c5e06ab4531c19b537",
+    "comments_url": "https://api.github.com/repos/andre-motta/tongs/commits/790f75838b9e60a00412d2c5e06ab4531c19b537/comments",
+    "author": {
+      "login": "andre-motta",
+      "id": 30708955,
+      "node_id": "MDQ6VXNlcjMwNzA4OTU1",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "committer": {
+      "login": "web-flow",
+      "id": 19864447,
+      "node_id": "MDQ6VXNlcjE5ODY0NDQ3",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "parents": [
+      {
+        "sha": "f4506f1631577c603deb2f6ca412d159414569d1",
+        "url": "https://api.github.com/repos/andre-motta/tongs/commits/f4506f1631577c603deb2f6ca412d159414569d1",
+        "html_url": "https://github.com/andre-motta/tongs/commit/f4506f1631577c603deb2f6ca412d159414569d1"
+      },
+      {
+        "sha": "24908053af723429cb25a37591fd2cbe24650806",
+        "url": "https://api.github.com/repos/andre-motta/tongs/commits/24908053af723429cb25a37591fd2cbe24650806",
+        "html_url": "https://github.com/andre-motta/tongs/commit/24908053af723429cb25a37591fd2cbe24650806"
+      }
+    ]
+  },
+  "merge_base_commit": {
+    "sha": "0df1094a9f0e92ca4fa4689e54de26ea057d0ada",
+    "node_id": "C_kwDOTc4RItoAKDBkZjEwOTRhOWYwZTkyY2E0ZmE0Njg5ZTU0ZGUyNmVhMDU3ZDBhZGE",
+    "commit": {
+      "author": {
+        "name": "Andre Lustosa",
+        "email": "alustosa@redhat.com",
+        "date": "2026-09-27T17:37:35Z"
+      },
+      "committer": {
+        "name": "Andre Lustosa",
+        "email": "alustosa@redhat.com",
+        "date": "2026-09-27T17:37:35Z"
+      },
+      "message": "Wait for the recorded inbox depth in the paging tests\n\nRead the remembered depth and focus target through waitFor, since they can land a commit after the rows render.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nSigned-off-by: Andre Lustosa <alustosa@redhat.com>",
+      "tree": {
+        "sha": "175adb6d65cdff4db95e8f1c502c7c88847bd0df",
+        "url": "https://api.github.com/repos/andre-motta/tongs/git/trees/175adb6d65cdff4db95e8f1c502c7c88847bd0df"
+      },
+      "url": "https://api.github.com/repos/andre-motta/tongs/git/commits/0df1094a9f0e92ca4fa4689e54de26ea057d0ada",
+      "comment_count": 0,
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niHUEABYKAB0WIQSKVNmCnmsEILgVjDwOUY3RwiGtlQUCarlUXwAKCRAOUY3RwiGt\nlcihAQC02EgAKE6SIkgRdzNtsJB4Tr6BG5WjfbtIUoYwCw9h5AEA1bNPRSOTQDKb\nf+FPS4ONRxZ5mc1yEW1Lg29u/zF78gY=\n=7DOw\n-----END PGP SIGNATURE-----",
+        "payload": "tree 175adb6d65cdff4db95e8f1c502c7c88847bd0df\nparent 790f75838b9e60a00412d2c5e06ab4531c19b537\nauthor Andre Lustosa <alustosa@redhat.com> 1790530655 -0400\ncommitter Andre Lustosa <alustosa@redhat.com> 1790530655 -0400\n\nWait for the recorded inbox depth in the paging tests\n\nRead the remembered depth and focus target through waitFor, since they can land a commit after the rows render.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nSigned-off-by: Andre Lustosa <alustosa@redhat.com>\n",
+        "verified_at": "2026-09-27T17:39:04Z"
+      }
+    },
+    "url": "https://api.github.com/repos/andre-motta/tongs/commits/0df1094a9f0e92ca4fa4689e54de26ea057d0ada",
+    "html_url": "https://github.com/andre-motta/tongs/commit/0df1094a9f0e92ca4fa4689e54de26ea057d0ada",
+    "comments_url": "https://api.github.com/repos/andre-motta/tongs/commits/0df1094a9f0e92ca4fa4689e54de26ea057d0ada/comments",
+    "author": {
+      "login": "andre-motta",
+      "id": 30708955,
+      "node_id": "MDQ6VXNlcjMwNzA4OTU1",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "committer": {
+      "login": "andre-motta",
+      "id": 30708955,
+      "node_id": "MDQ6VXNlcjMwNzA4OTU1",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "parents": [
+      {
+        "sha": "790f75838b9e60a00412d2c5e06ab4531c19b537",
+        "url": "https://api.github.com/repos/andre-motta/tongs/commits/790f75838b9e60a00412d2c5e06ab4531c19b537",
+        "html_url": "https://github.com/andre-motta/tongs/commit/790f75838b9e60a00412d2c5e06ab4531c19b537"
+      }
+    ]
+  },
+  "status": "diverged",
+  "ahead_by": 43,
+  "behind_by": 1,
+  "total_commits": 43,
+  "commits": [
+    {
+      "sha": "0df1094a9f0e92ca4fa4689e54de26ea057d0ada",
+      "node_id": "C_kwDOTc4RItoAKDBkZjEwOTRhOWYwZTkyY2E0ZmE0Njg5ZTU0ZGUyNmVhMDU3ZDBhZGE",
+      "commit": {
+        "author": {
+          "name": "Andre Lustosa",
+          "email": "alustosa@redhat.com",
+          "date": "2026-09-27T17:37:35Z"
+        },
+        "committer": {
+          "name": "Andre Lustosa",
+          "email": "alustosa@redhat.com",
+          "date": "2026-09-27T17:37:35Z"
+        },
+        "message": "Wait for the recorded inbox depth in the paging tests\n\nRead the remembered depth and focus target through waitFor, since they can land a commit after the rows render.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nSigned-off-by: Andre Lustosa <alustosa@redhat.com>",
+        "tree": {
+          "sha": "175adb6d65cdff4db95e8f1c502c7c88847bd0df",
+          "url": "https://api.github.com/repos/andre-motta/tongs/git/trees/175adb6d65cdff4db95e8f1c502c7c88847bd0df"
+        },
+        "url": "https://api.github.com/repos/andre-motta/tongs/git/commits/0df1094a9f0e92ca4fa4689e54de26ea057d0ada",
+        "comment_count": 0,
+        "verification": {
+          "verified": true,
+          "reason": "valid",
+          "signature": "-----BEGIN PGP SIGNATURE-----\n\niHUEABYKAB0WIQSKVNmCnmsEILgVjDwOUY3RwiGtlQUCarlUXwAKCRAOUY3RwiGt\nlcihAQC02EgAKE6SIkgRdzNtsJB4Tr6BG5WjfbtIUoYwCw9h5AEA1bNPRSOTQDKb\nf+FPS4ONRxZ5mc1yEW1Lg29u/zF78gY=\n=7DOw\n-----END PGP SIGNATURE-----",
+          "payload": "tree 175adb6d65cdff4db95e8f1c502c7c88847bd0df\nparent 790f75838b9e60a00412d2c5e06ab4531c19b537\nauthor Andre Lustosa <alustosa@redhat.com> 1790530655 -0400\ncommitter Andre Lustosa <alustosa@redhat.com> 1790530655 -0400\n\nWait for the recorded inbox depth in the paging tests\n\nRead the remembered depth and focus target through waitFor, since they can land a commit after the rows render.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nSigned-off-by: Andre Lustosa <alustosa@redhat.com>\n",
+          "verified_at": "2026-09-27T17:39:04Z"
+        }
+      },
+      "url": "https://api.github.com/repos/andre-motta/tongs/commits/0df1094a9f0e92ca4fa4689e54de26ea057d0ada",
+      "html_url": "https://github.com/andre-motta/tongs/commit/0df1094a9f0e92ca4fa4689e54de26ea057d0ada",
+      "comments_url": "https://api.github.com/repos/andre-motta/tongs/commits/0df1094a9f0e92ca4fa4689e54de26ea057d0ada/comments",
+      "author": {
+        "login": "andre-motta",
+        "id": 30708955,
+        "node_id": "MDQ6VXNlcjMwNzA4OTU1",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "committer": {
+        "login": "andre-motta",
+        "id": 30708955,
+        "node_id": "MDQ6VXNlcjMwNzA4OTU1",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "parents": [
+        {
+          "sha": "790f75838b9e60a00412d2c5e06ab4531c19b537",
+          "url": "https://api.github.com/repos/andre-motta/tongs/commits/790f75838b9e60a00412d2c5e06ab4531c19b537",
+          "html_url": "https://github.com/andre-motta/tongs/commit/790f75838b9e60a00412d2c5e06ab4531c19b537"
+        }
+      ]
+    }
+  ],
+  "files": [
+    {
+      "sha": "b3103f8a2ce8d37bd051081c2e05b5cccb873ecc",
+      "filename": ".agents/ci/README.md",
+      "status": "modified",
+      "additions": 63,
+      "deletions": 50,
+      "changes": 113,
+      "blob_url": "https://github.com/andre-motta/tongs/blob/e98791e01bafe791fddda16968f967d740e5792e/.agents%2Fci%2FREADME.md",
+      "raw_url": "https://github.com/andre-motta/tongs/raw/e98791e01bafe791fddda16968f967d740e5792e/.agents%2Fci%2FREADME.md",
+      "contents_url": "https://api.github.com/repos/andre-motta/tongs/contents/.agents%2Fci%2FREADME.md?ref=e98791e01bafe791fddda16968f967d740e5792e",
+      "patch": "@@ -16,8 +16,8 @@ pytest tests/ --ignore=tests/test_mcp -v\n pytest tests/test_mcp -v --junitxml=\"/tmp/tongs-mcp-$$.junit.xml\"\n python tests/ci/verify_desktop_ci.py mcp-report \\\n   --path \"/tmp/tongs-mcp-$$.junit.xml\""
+    }
+  ]
+}
