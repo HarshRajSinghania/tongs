@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from enum import Enum
 from uuid import UUID
@@ -48,6 +49,9 @@ from tongs.state.drafts.reconciliation import (
 from tongs.state.drafts.store import DraftStore
 
 _CLOSE_TIMEOUT = 1.0
+_NOT_OWNED_MESSAGE = (
+    "The submission is not running in any tongs process. Restart tongs to recover it."
+)
 _ACTIVE_STATES = frozenset({DraftState.SUBMITTING, DraftState.PARTIAL})
 
 
@@ -208,9 +212,14 @@ class ReviewSubmissionService:
                     and attempt.state in _ACTIVE_STATES
                 ):
                     if not self._store.holds_attempt(attempt_id):
+                        if self._store.attempt_held_elsewhere(attempt_id):
+                            raise ServiceError(
+                                ServiceErrorCode.CONFLICT,
+                                "The submission is active in another tongs process.",
+                            )
                         raise ServiceError(
                             ServiceErrorCode.CONFLICT,
-                            "The submission is active in another tongs process.",
+                            _NOT_OWNED_MESSAGE,
                         )
                     return await self._return_paused_to_editing(attempt)
                 if attempt.state != DraftState.UNKNOWN:
@@ -242,7 +251,11 @@ class ReviewSubmissionService:
                         SubmissionOutcome.SUBMITTED,
                     )
                 if cancelled:
-                    await self._park_unknown(attempt_id, "retry_cancelled")
+                    # Ownership is released even when this write fails, and
+                    # startup recovery finds the attempt; the caller's
+                    # cancellation is what propagates.
+                    with suppress(DraftStoreError):
+                        await self._park_unknown(attempt_id, "retry_cancelled")
                     raise asyncio.CancelledError
                 try:
                     reconciled, plan = await self._preflight(reconciled)
@@ -254,7 +267,12 @@ class ReviewSubmissionService:
             self._active_tasks.discard(operation)
 
     async def get(self, attempt_id: UUID) -> SubmissionProgress:
-        """Read durable attempt state without dispatching or authorizing work."""
+        """Read durable attempt state without dispatching or authorizing work.
+
+        An outcome-unknown attempt that its draft no longer points at was
+        already returned to editing (its row keeps the unknown state as
+        history), so it is reported as editable rather than unresolved.
+        """
         operation = await self._enter_operation()
         try:
             attempt = await self._store.get_attempt(attempt_id)
@@ -262,9 +280,22 @@ class ReviewSubmissionService:
                 DraftState.SUBMITTED: SubmissionOutcome.SUBMITTED,
                 DraftState.UNKNOWN: SubmissionOutcome.UNKNOWN,
             }.get(attempt.state, SubmissionOutcome.PAUSED)
+            if outcome is SubmissionOutcome.UNKNOWN and not (
+                await self._store.is_active_attempt(attempt.id)
+            ):
+                outcome = SubmissionOutcome.EDITABLE
             return self._progress(attempt, self._stored_plan(attempt), outcome)
         finally:
             self._active_tasks.discard(operation)
+
+    def is_running(self, attempt_id: UUID) -> bool:
+        """Return whether a call of this service is working on an attempt now.
+
+        A running attempt is being started, sent, retried or reconciled, so
+        it is not one that needs recovery. The answer is process-local.
+        """
+        lock = self._attempt_locks.get(attempt_id)
+        return lock is not None and lock.locked()
 
     async def close(self) -> None:
         """Reject new work and settle all service-owned calls within a fixed bound."""
@@ -481,7 +512,9 @@ class ReviewSubmissionService:
                     attempt.id, step.id, command.operation_id
                 )
             except asyncio.CancelledError:
-                await self._mark_unknown(attempt, step, "dispatch_journal_cancelled")
+                await self._mark_unknown_cancelled(
+                    attempt, step, "dispatch_journal_cancelled"
+                )
                 raise
             except DraftStoreError:
                 latest = await self._store.get_attempt(attempt.id)
@@ -499,7 +532,7 @@ class ReviewSubmissionService:
             try:
                 outcome = await self._mutations.execute(command)
             except asyncio.CancelledError:
-                await self._mark_unknown(attempt, step, "cancelled")
+                await self._mark_unknown_cancelled(attempt, step, "cancelled")
                 raise
             except ServiceError as error:
                 try:
@@ -624,6 +657,20 @@ class ReviewSubmissionService:
             self._store.mark_attempt_unknown(attempt.id, step_id=step.id, reason=reason)
         )
 
+    async def _mark_unknown_cancelled(
+        self,
+        attempt: SubmissionAttempt,
+        step: SubmissionStep,
+        reason: str,
+    ) -> None:
+        """Record a cancelled step as unknown without hiding the cancellation.
+
+        Ownership is released even when the write fails, so startup recovery
+        finds the attempt; the caller re-raises its own cancellation.
+        """
+        with suppress(DraftStoreError):
+            await self._mark_unknown(attempt, step, reason)
+
     async def _cancel_predispatch(self, attempt_id: UUID) -> None:
         await _finish_critical(self._store.cancel_submission(attempt_id))
 
@@ -662,6 +709,11 @@ class ReviewSubmissionService:
         retry stops before any dispatch, the attempt returns to the same
         outcome-unknown state the user decided from. Ownership is released
         even when the write fails.
+
+        The reason is stored only when a journaled dispatch is turned into an
+        unknown marker. Every caller runs before any dispatch of the current
+        decision, so in practice the reason is not stored; it names the call
+        site for readers of this code.
         """
         await _finish_critical(
             self._store.mark_attempt_unknown(attempt_id, reason=reason)
@@ -709,9 +761,25 @@ class ReviewSubmissionService:
                 plan,
                 SubmissionOutcome.EDITABLE,
             )
-        unknown, cancelled = await _finish_critical_state(
-            self._store.mark_attempt_unknown(attempt.id, reason="return_editable")
-        )
+        try:
+            unknown, cancelled = await _finish_critical_state(
+                self._store.mark_attempt_unknown(attempt.id, reason="return_editable")
+            )
+        except DraftStoreError:
+            # The failed write still released this process's ownership, so
+            # the attempt is left paused with no owner until startup recovery
+            # records it as outcome-unknown.
+            return self._progress(
+                attempt,
+                plan,
+                SubmissionOutcome.PAUSED,
+                failure=SubmissionFailure(
+                    "storage_failed",
+                    "The draft could not be returned to editing. "
+                    "Restart tongs to recover it.",
+                    False,
+                ),
+            )
         content = editable_remainder(unknown, self._confirmed_content(unknown))
         try:
             reconciled, reconcile_cancelled = await _finish_critical_state(

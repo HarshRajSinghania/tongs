@@ -1096,6 +1096,55 @@ async def test_submission_list_includes_an_owned_paused_attempt(setup) -> None:
 
 
 @pytest.mark.asyncio
+async def test_submission_list_leaves_out_an_attempt_still_being_sent(
+    setup,
+) -> None:
+    operations, session, handles = setup
+    draft = await session.drafts.create_draft(
+        REVIEW, REVISION, DraftContent(body="summary", verdict=DraftVerdict.APPROVE)
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def held_review(*_args: object, **_kwargs: object) -> object:
+        entered.set()
+        await release.wait()
+        raise ValidationError("Validation failed: 422")
+
+    session.client.submit_review.side_effect = held_review
+    # The fixture bounds forge calls at 0.1 s; this one is held on purpose.
+    session.review_mutations._timeout = 5.0
+    started = asyncio.create_task(
+        operations.start_submission(
+            {
+                "review": handles["review"],
+                "draft_id": str(draft.id),
+                "expected_version": draft.version,
+            },
+            _context(),
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 2)
+
+    # A drawer reopened mid-submit must not offer recovery for work in
+    # progress, even though this process owns the attempt.
+    during = await operations.list_submissions(
+        {"review": handles["review"], "max_items": 10}, _context()
+    )
+    release.set()
+    paused = await asyncio.wait_for(started, 2)
+    after = await operations.list_submissions(
+        {"review": handles["review"], "max_items": 10}, _context()
+    )
+
+    assert during["attempts"] == []
+    assert during["next_cursor"] is None
+    assert paused["outcome"] == "paused"
+    assert [item["attempt_id"] for item in after["attempts"]] == [paused["attempt_id"]]
+    assert session.client.submit_review.await_count == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("payload", "message"),
     [

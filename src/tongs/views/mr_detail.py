@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import ClassVar
@@ -107,6 +108,8 @@ from tongs.widgets.review_draft import (
 from tongs.widgets.split_diff import DiffSelection
 from tongs.widgets.two_press import TwoPressConfirm
 
+log = logging.getLogger(__name__)
+
 
 def _ci_label(status: CIStatus) -> str:
     labels = {
@@ -161,6 +164,10 @@ def _merge_readiness(mr: MRDetail) -> Content:
 
 
 _SUBMIT_WORKER_GROUP = "review-draft-submit"
+
+_RELOAD_WARNING = (
+    "The review drafts could not be reloaded. Reopen the review to refresh them."
+)
 
 
 def _reload_note(reloaded: bool) -> str:
@@ -901,7 +908,10 @@ class MRDetailScreen(Screen):
         if progress.outcome is SubmissionOutcome.EDITABLE:
             self._review_progress = None
             self._review_progress_by_draft.pop(draft_id, None)
-        await self._recover_submission_state(target, draft_id)
+        # The service call already returned its result, so a failed reload is
+        # reported on its own instead of as a stopped submission.
+        if not await self._try_recover_submission_state(target, draft_id):
+            self.notify(_RELOAD_WARNING, severity="warning")
 
     async def _try_recover_submission_state(
         self, target: TUIDraftTarget, draft_id: UUID | None
@@ -913,7 +923,9 @@ class MRDetailScreen(Screen):
         """
         try:
             await self._recover_submission_state(target, draft_id)
-        except Exception:  # noqa: BLE001 - The caller reports the original failure.
+        except Exception as exc:  # noqa: BLE001 - The caller reports the failure.
+            # Only the type is logged: messages can carry forge or draft text.
+            log.debug("Review draft state reload failed: %s", type(exc).__name__)
             return False
         return True
 

@@ -1733,6 +1733,25 @@ class DraftStore:
                 ownership.release()
 
     @_serialized
+    async def is_active_attempt(self, attempt_id: UUID) -> bool:
+        """Return whether a draft still points at this submission attempt.
+
+        An attempt returned to editing keeps its unknown state as history but
+        is detached from its draft, so it no longer needs a decision.
+        """
+        db = self._connection()
+        try:
+            row = await (
+                await db.execute(
+                    "SELECT 1 FROM drafts WHERE active_attempt_id = ? LIMIT 1",
+                    (str(attempt_id),),
+                )
+            ).fetchone()
+        except sqlite3.Error as error:
+            raise DraftStoreError("draft database read failed") from error
+        return row is not None
+
+    @_serialized
     async def get_attempt(self, attempt_id: UUID) -> SubmissionAttempt:
         """Load a submission attempt, its frozen snapshot, receipts and decisions."""
         db = self._connection()
@@ -1933,6 +1952,21 @@ class DraftStore:
         only meaningful to the process that asks it.
         """
         return attempt_id in self._held_attempt_locks
+
+    def attempt_held_elsewhere(self, attempt_id: UUID) -> bool:
+        """Return whether another live process holds an attempt's lock.
+
+        The probe takes the attempt's lock file and releases it at once, so
+        an attempt whose owner exited, or whose ownership this process
+        released after a failed write, reports ``False``.
+        """
+        if attempt_id in self._held_attempt_locks:
+            return False
+        probe = AttemptLock.try_acquire(self._lock_dir, str(attempt_id))
+        if probe is None:
+            return True
+        probe.release()
+        return False
 
     def _require_owned(self, attempt_id: UUID) -> None:
         if attempt_id not in self._held_attempt_locks:

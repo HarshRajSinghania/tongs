@@ -569,7 +569,14 @@ class ReviewOperations:
             )
         except DraftStoreError as error:
             raise _draft_service_error(error) from None
-        admitted = tuple(item for item in attempts if item.snapshot.review == review)
+        # An attempt a service call is still working on is in progress, not
+        # one that needs recovery, so the drawer is never offered it.
+        running = self._session.review_submissions.is_running
+        admitted = tuple(
+            item
+            for item in attempts
+            if item.snapshot.review == review and not running(item.id)
+        )
         page, next_cursor = _slice(admitted, cursor, max_items)
         progress: list[JsonObject] = []
         for attempt in page:

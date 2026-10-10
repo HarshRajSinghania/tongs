@@ -15,7 +15,9 @@ from tongs.state.drafts import (
     DraftContent,
     DraftState,
     DraftStore,
+    DraftStoreError,
     GeneralDraftComment,
+    ReconciliationResolution,
     RecoveryWarning,
     SubmissionAttempt,
 )
@@ -325,3 +327,48 @@ def test_recovery_warning_describe_names_review_and_attempt() -> None:
             "Attempt 11111111-2222-4333-8444-555555555555."
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_failed_unknown_write_releases_an_attempt_for_recovery(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = DraftStore(db_path)
+    await store.open()
+    draft = await store.create_draft(_review(1), REVISION, _content())
+    attempt = await store.lock_submission(draft.id, draft.version)
+    live = DraftStore(db_path)
+    await live.open()
+    other_draft = await live.create_draft(_review(2), REVISION, _content())
+    other = await live.lock_submission(other_draft.id, other_draft.version)
+
+    async def disk_full(*_args: object, **_kwargs: object) -> object:
+        raise DraftStoreError("disk full")
+
+    monkeypatch.setattr(store, "_transition_owned", disk_full)
+    with pytest.raises(DraftStoreError):
+        await store.mark_attempt_unknown(attempt.id, reason="return_editable")
+    monkeypatch.undo()
+
+    # The failed write still released ownership, and no other process
+    # holds the attempt, so it is not "active in another tongs process".
+    assert not store.holds_attempt(attempt.id)
+    assert store.attempt_held_elsewhere(attempt.id) is False
+    assert store.attempt_held_elsewhere(other.id) is True
+    assert live.attempt_held_elsewhere(other.id) is False
+    assert (await store.get_draft(draft.id)).state is DraftState.SUBMITTING
+    assert await store.is_active_attempt(attempt.id) is True
+
+    (recovered,) = await store.recover_incomplete_attempts()
+    assert recovered.id == attempt.id
+    assert recovered.state is DraftState.UNKNOWN
+    assert await store.is_active_attempt(attempt.id) is True
+
+    await store.reconcile_attempt(attempt.id, ReconciliationResolution.RETURN_EDITABLE)
+
+    # The attempt row keeps its unknown state, but its draft moved on.
+    assert (await store.get_attempt(attempt.id)).state is DraftState.UNKNOWN
+    assert await store.is_active_attempt(attempt.id) is False
+    assert (await store.get_draft(draft.id)).state is DraftState.EDITABLE
+    await live.close()
+    await store.close()

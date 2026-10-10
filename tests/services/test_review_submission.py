@@ -1300,6 +1300,7 @@ async def test_paused_attempt_owned_by_another_process_is_not_returned(
         )
 
     assert raised.value.code is ServiceErrorCode.CONFLICT
+    assert "another tongs process" in raised.value.message
     assert not other_store.holds_attempt(paused.attempt_id)
     assert store.holds_attempt(paused.attempt_id)
     assert (await store.get_draft(draft.id)).state is DraftState.SUBMITTING
@@ -1542,3 +1543,188 @@ async def test_persisted_stale_anchor_is_judged_by_its_revision_alone(
         assert (await store.get_draft(draft.id)).state is DraftState.EDITABLE
         client.submit_review.assert_not_awaited()
     await store.close()
+
+
+def _fail_unknown_writes(
+    store: DraftStore, monkeypatch: pytest.MonkeyPatch, *, times: int = 1
+) -> list[int]:
+    """Make the next outcome-unknown transitions fail like a full disk.
+
+    The real ``mark_attempt_unknown`` still runs around the failing write, so
+    ownership is released exactly as it is after a real storage failure.
+    """
+    original = store._transition_owned
+    failures: list[int] = []
+
+    async def failing(
+        attempt_id: object, target: DraftState, **kwargs: object
+    ) -> object:
+        if target is DraftState.UNKNOWN and len(failures) < times:
+            failures.append(1)
+            raise DraftStoreError("disk full")
+        return await original(attempt_id, target, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "_transition_owned", failing)
+    return failures
+
+
+@pytest.mark.asyncio
+async def test_failed_first_return_transition_says_a_restart_recovers_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "drafts.db"
+    comment = GeneralDraftComment(uuid4(), "confirmed comment")
+    verdict = AsyncMock(side_effect=ValidationError("Validation failed: 400"))
+    client = _client(submit_review=verdict)
+    store, service, _, snapshot, draft = await _services(
+        path,
+        _content(comment, verdict=DraftVerdict.APPROVE),
+        forge=ForgeType.GITLAB,
+        client=client,
+    )
+    paused = await service.start(draft.id, draft.version)
+    failures = _fail_unknown_writes(store, monkeypatch)
+
+    stopped = await service.reconcile(
+        paused.attempt_id, ReconciliationResolution.RETURN_EDITABLE
+    )
+
+    assert failures == [1]
+    assert stopped.outcome is SubmissionOutcome.PAUSED
+    assert stopped.failure is not None
+    assert stopped.failure.code == "storage_failed"
+    assert stopped.failure.retryable is False
+    assert "could not be returned to editing" in stopped.failure.message
+    assert "Restart tongs" in stopped.failure.message
+    assert not store.holds_attempt(paused.attempt_id)
+    assert (await store.get_draft(draft.id)).state is DraftState.PARTIAL
+
+    with pytest.raises(ServiceError) as raised:
+        await service.reconcile(
+            paused.attempt_id, ReconciliationResolution.RETURN_EDITABLE
+        )
+
+    assert raised.value.code is ServiceErrorCode.CONFLICT
+    assert "another tongs process" not in raised.value.message
+    assert "Restart tongs" in raised.value.message
+    await store.close()
+
+    restarted = DraftStore(path)
+    await restarted.open()
+    (recovered,) = await restarted.recover_incomplete_attempts()
+    restarted_service = ReviewSubmissionService(
+        store=restarted,
+        mutations=_mutation_service(client, snapshot),
+        get_review=AsyncMock(return_value=snapshot),
+    )
+    editable = await restarted_service.reconcile(
+        recovered.id, ReconciliationResolution.RETURN_EDITABLE
+    )
+
+    assert editable.outcome is SubmissionOutcome.EDITABLE
+    saved = await restarted.get_draft(draft.id)
+    assert saved.state is DraftState.EDITABLE
+    assert saved.comments == ()
+    assert saved.verdict is DraftVerdict.APPROVE
+    assert client.add_comment.await_count == 1
+    assert verdict.await_count == 1
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_get_reports_editable_once_an_unknown_attempt_returned_to_editing(
+    tmp_path: Path,
+) -> None:
+    add = AsyncMock(side_effect=NetworkError("timeout"))
+    store, service, _, _, draft = await _services(
+        tmp_path / "drafts.db",
+        _content(GeneralDraftComment(uuid4(), "comment")),
+        client=_client(add_comment=add),
+    )
+    unknown = await service.start(draft.id, draft.version)
+    before = await service.get(unknown.attempt_id)
+
+    await service.reconcile(
+        unknown.attempt_id, ReconciliationResolution.RETURN_EDITABLE
+    )
+    # A caller that lost the reconcile response reads the attempt again.
+    after = await service.get(unknown.attempt_id)
+
+    assert before.outcome is SubmissionOutcome.UNKNOWN
+    assert (await store.get_attempt(unknown.attempt_id)).state is DraftState.UNKNOWN
+    assert after.outcome is SubmissionOutcome.EDITABLE
+    assert after.unknown_step_ids == before.unknown_step_ids
+    assert (await store.get_draft(draft.id)).state is DraftState.EDITABLE
+    assert add.await_count == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_retry_whose_unknown_write_fails_propagates_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "drafts.db"
+    add = AsyncMock(side_effect=NetworkError("timeout"))
+    store, service, _, _, draft = await _services(
+        path,
+        _content(GeneralDraftComment(uuid4(), "comment")),
+        client=_client(add_comment=add),
+    )
+    unknown = await service.start(draft.id, draft.version)
+    failures = _fail_unknown_writes(store, monkeypatch)
+
+    task = await _cancel_while_gated(
+        store,
+        "reconcile_attempt",
+        lambda: service.reconcile(
+            unknown.attempt_id, ReconciliationResolution.RETRY_REMAINING
+        ),
+    )
+
+    assert task.cancelled()
+    assert failures == [1]
+    assert not store.holds_attempt(unknown.attempt_id)
+    assert add.await_count == 1
+    await store.close()
+
+    restarted = DraftStore(path)
+    await restarted.open()
+    recovered = await restarted.recover_incomplete_attempts()
+    assert [item.id for item in recovered] == [unknown.attempt_id]
+    assert recovered[0].state is DraftState.UNKNOWN
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_dispatch_whose_unknown_write_fails_propagates_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "drafts.db"
+    store, service, client, _, draft = await _services(
+        path, _content(GeneralDraftComment(uuid4(), "comment"))
+    )
+    failures = _fail_unknown_writes(store, monkeypatch)
+
+    task = await _cancel_while_gated(
+        store,
+        "begin_dispatch",
+        lambda: service.start(draft.id, draft.version),
+    )
+
+    assert task.cancelled()
+    assert failures == [1]
+    client.add_comment.assert_not_awaited()
+    # Ownership is released, so the attempt waits for startup recovery.
+    assert store._held_attempt_locks == {}
+    assert (await store.get_draft(draft.id)).state is DraftState.SUBMITTING
+    await store.close()
+
+    restarted = DraftStore(path)
+    await restarted.open()
+    (recovered,) = await restarted.recover_incomplete_attempts()
+    # The journaled dispatch survives as an unknown marker, never a replay.
+    assert recovered.state is DraftState.UNKNOWN
+    assert [item.step_id for item in recovered.unknown_outcomes] == [
+        f"comment:{draft.comments[0].id.hex}"
+    ]
+    await restarted.close()
