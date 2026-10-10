@@ -126,7 +126,7 @@ async def post_comment(repo_path: str, number: int, body: str) -> str:
 
 
 @mcp.tool()
-async def approve_mr(repo_path: str, number: int, head_sha: str = "") -> str:
+async def approve_mr(repo_path: str, number: int, head_sha: str) -> str:
     """Approve a merge request at the head commit you reviewed.
 
     head_sha is required: call get_mr first and pass the head_sha it

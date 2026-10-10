@@ -190,8 +190,14 @@ class TestErrors:
         with pytest.raises(server.ToolError) as excinfo:
             await server.mcp.call_tool("list_mrs", {"repo_path": REPO, "state": "all"})
         assert "state must be one of: open, closed, merged." in str(excinfo.value)
+        # The schema requires head_sha, so the SDK refuses a call without it.
         with pytest.raises(server.ToolError) as excinfo:
             await server.mcp.call_tool("approve_mr", {"repo_path": REPO, "number": 7})
+        assert "head_sha" in str(excinfo.value)
+        with pytest.raises(server.ToolError) as excinfo:
+            await server.mcp.call_tool(
+                "approve_mr", {"repo_path": REPO, "number": 7, "head_sha": ""}
+            )
         assert tools.HEAD_SHA_MISSING in str(excinfo.value)
         forbid_token_lookup.assert_not_called()
 
@@ -250,6 +256,11 @@ class TestRegisteredTools:
             "limit",
         ]
         assert list(listed["approve_mr"].inputSchema["properties"]) == [
+            "repo_path",
+            "number",
+            "head_sha",
+        ]
+        assert listed["approve_mr"].inputSchema["required"] == [
             "repo_path",
             "number",
             "head_sha",

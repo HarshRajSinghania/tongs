@@ -112,18 +112,18 @@ Defined in `src/tongs/mcp/server.py`. Runs as a separate process (not inside the
 
 | Tool | Method | Description |
 |---|---|---|
-| `list_mrs` | GET | List MRs for a repo (filtered by state) |
+| `list_mrs` | GET | List MRs for a repo: `state` open, closed or merged; `limit` 1 to 100, default 30 |
 | `get_mr` | GET | Get detailed MR information |
-| `get_mr_diff` | GET | Get unified diff text |
+| `get_mr_diff` | GET | Unified diff for every file, with markers for files without a patch; capped at 256 KiB |
 | `post_comment` | POST | Post a general comment |
-| `approve_mr` | POST | Approve an MR |
+| `approve_mr` | POST | Approve an MR at the `head_sha` returned by `get_mr` (required) |
 | `list_pipelines` | GET | List pipelines for an MR |
 
-**Input format:** All tools take `repo_path` as `hostname/owner/repo` (e.g., `github.com/acme/app`). Validated by `_parse_host_repo()` with regex.
+**Input format:** All tools take `repo_path` as `hostname/owner/repo` (e.g., `github.com/acme/app`). Validated by `parse_repo_path()` in `src/tongs/mcp/tools.py`, which also requires the host to be configured.
 
 **Security:** Destructive actions (merge, close, reopen, cancel) are excluded. No raw API exposure. No auth in tool I/O.
 
-**Registry:** `_get_registry()` lazily creates a `ForgeRegistry` from `load_config()` on first tool call.
+**Session:** `SessionHolder` in `src/tongs/mcp/tools.py` starts one `ApplicationSession` from `load_config()` on the first tool call; every tool goes through its services (approvals pinned to `head_sha`, bounded lists and diffs, shared error messages). See [docs/extend/mcp.md](../../docs/extend/mcp.md) for the tool arguments and limits.
 
 ## Writing a New Plugin
 

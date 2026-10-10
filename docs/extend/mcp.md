@@ -232,7 +232,10 @@ try again, because the comment or approval may have been applied.
   and CI statuses can come from the tongs response cache for the configured
   lifetime (`mr_list_ttl`); review detail, diffs and every write go to the
   forge directly. The first call to a repository makes one small list read
-  to check that it exists and that you can read it.
+  to check that it exists and that you can read it. On its first tool call
+  the server also opens the local review drafts store, as the other apps do,
+  so if that store cannot be opened every tool call fails with a startup
+  error.
 
 ## The palette command
 
