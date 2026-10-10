@@ -1558,13 +1558,16 @@ class DiffPanel(Widget):
             file_discs = self._discussions_by_file.get(file.new_path, [])
 
             header = self.query_one("#diff-file-header", Static)
+            mode_change = file.mode_change
             header.update(
                 Content.from_markup(
                     "[bold]$path[/]  [green]+$additions[/] [red]-$deletions[/]  "
-                    "[dim]$language[/]",
+                    + ("[yellow]$mode[/]  " if mode_change else "")
+                    + "[dim]$language[/]",
                     path=file.new_path,
                     additions=file.additions,
                     deletions=file.deletions,
+                    mode=mode_change,
                     language=file.language or "",
                 )
             )

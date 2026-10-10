@@ -1106,6 +1106,7 @@ function DiffRowView({
       <header className="diff-file" role="listitem">
         <strong className="file-path">{path}</strong>
         <span className="file-status">{row.status}</span>
+        <FileMode file={row} />
         <FileBadges file={row} />
         <PendingFileCount pending={pending} file={row} />
         <ThreadFileCount threads={threads} file={row} />
@@ -1617,6 +1618,7 @@ function SplitPaneRow({
           {side === "old" ? row.old_path : row.new_path}
         </strong>
         <span className="file-status">{row.status}</span>
+        <FileMode file={row} />
         <FileBadges file={row} />
         {side === "new" && <PendingFileCount pending={pending} file={row} />}
         {side === "new" && <ThreadFileCount threads={threads} file={row} />}
@@ -1747,6 +1749,20 @@ const FILE_BADGES: ReadonlyArray<
     "The forge sent no diff content for this file and did not report whether it is a binary or a mode-only change.",
   ],
 ];
+
+// GitLab and git patches report file modes; GitHub's files endpoint does not,
+// so its rows carry null and show nothing here.
+function fileModeChange(file: DiffFileRow): string {
+  const oldMode = file.old_mode ?? null;
+  const newMode = file.new_mode ?? null;
+  if (oldMode === null || newMode === null || oldMode === newMode) return "";
+  return `mode ${oldMode} -> ${newMode}`;
+}
+
+function FileMode({ file }: { readonly file: DiffFileRow }): ReactNode {
+  const change = fileModeChange(file);
+  return change ? <span className="file-status file-mode">{change}</span> : null;
+}
 
 function FileBadges({ file }: { readonly file: DiffFileRow }): ReactNode {
   return FILE_BADGES.map(

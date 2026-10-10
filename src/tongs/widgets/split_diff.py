@@ -637,14 +637,17 @@ class SplitDiffView(Widget):
         for column in (old_column, new_column):
             column.reset(file, self._expanded_threads)
 
+        mode_suffix = f"  {file.mode_change}" if file.mode_change else ""
         old_options = [
             Option(
-                _single_line(f" OLD  {file.old_path}", Style(bold=True)), disabled=True
+                _single_line(f" OLD  {file.old_path}{mode_suffix}", Style(bold=True)),
+                disabled=True,
             )
         ]
         new_options = [
             Option(
-                _single_line(f" NEW  {file.new_path}", Style(bold=True)), disabled=True
+                _single_line(f" NEW  {file.new_path}{mode_suffix}", Style(bold=True)),
+                disabled=True,
             )
         ]
         option_index = 1

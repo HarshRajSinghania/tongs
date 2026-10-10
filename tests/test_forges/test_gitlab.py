@@ -1036,3 +1036,85 @@ async def test_get_mr_revision_reads_only_the_merge_request() -> None:
     assert detail.head_sha == "ccc333"
     assert detail.base_sha == "aaa111"
     assert detail.start_sha == "bbb222"
+
+
+def _diff_entry(index: int) -> dict:
+    path = f"src/file_{index}.py"
+    return {
+        "old_path": path,
+        "new_path": path,
+        "a_mode": "100644",
+        "b_mode": "100644",
+        "new_file": False,
+        "renamed_file": False,
+        "deleted_file": False,
+        "diff": "@@ -1 +1 @@\n-old\n+new\n",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_mr_diff_reads_every_page_of_the_diffs_endpoint() -> None:
+    """``/diffs`` replaces the deprecated ``/changes`` and is paginated."""
+    seen: list[tuple[str, str, str]] = []
+    pages = {
+        "1": [_diff_entry(index) for index in range(100)],
+        "2": [_diff_entry(index) for index in range(100, 130)],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        seen.append(
+            (
+                request.url.raw_path.decode().split("?", 1)[0],
+                params.get("page", ""),
+                params.get("per_page", ""),
+            )
+        )
+        return httpx.Response(200, json=pages.get(params.get("page", ""), []))
+
+    client, http = _make_gitlab_client(handler)
+    async with http:
+        changes = await client.get_mr_diff("acme/widgets", 42)
+
+    path = "/api/v4/projects/acme%2Fwidgets/merge_requests/42/diffs"
+    assert seen == [(path, "1", "100"), (path, "2", "100")]
+    assert [change["new_path"] for change in changes] == [
+        f"src/file_{index}.py" for index in range(130)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_mr_diff_keeps_the_file_modes_gitlab_reports() -> None:
+    chmod = {
+        **_diff_entry(0),
+        "new_path": "bin/run.sh",
+        "old_path": "bin/run.sh",
+        "b_mode": "100755",
+        "diff": "",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[chmod])
+
+    client, http = _make_gitlab_client(handler)
+    async with http:
+        changes = await client.get_mr_diff("acme/widgets", 42)
+
+    assert changes == [chmod]
+    assert (changes[0]["a_mode"], changes[0]["b_mode"]) == ("100644", "100755")
+
+
+@pytest.mark.asyncio
+async def test_overflow_signal_still_comes_from_the_merge_request() -> None:
+    """Moving to ``/diffs`` keeps the capped ``changes_count`` overflow signal."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.raw_path.decode().endswith("/approvals"):
+            return httpx.Response(200, json={"approved_by": []})
+        return httpx.Response(200, json=_mr_api_json({"changes_count": "1000+"}))
+
+    client, http = _make_gitlab_client(handler)
+    async with http:
+        detail = await client.get_mr("acme/widgets", 42)
+
+    assert detail.changes_overflow is True

@@ -150,6 +150,27 @@ async def test_withheld_patch_projects_the_state_the_forge_determines(
 
 
 @pytest.mark.asyncio
+async def test_file_modes_reach_the_wire_where_the_forge_reports_them() -> None:
+    """GitLab's chmod arrives with both modes; GitHub reports none (#397).
+
+    GitLab's ``"0"`` for the absent side of an added or deleted file is not a
+    mode, so it projects as null like every mode GitHub withholds.
+    """
+    gitlab = {cast(str, row["new_path"]): row for row in await _file_rows("gitlab")}
+    github = await _file_rows("github")
+
+    assert (gitlab["src/tool.sh"]["old_mode"], gitlab["src/tool.sh"]["new_mode"]) == (
+        "100644",
+        "100755",
+    )
+    added = gitlab["src/empty_placeholder.py"]
+    deleted = gitlab["src/obsolete.py"]
+    assert (added["old_mode"], added["new_mode"]) == (None, "100644")
+    assert (deleted["old_mode"], deleted["new_mode"]) == ("100644", None)
+    assert all(row["old_mode"] is None and row["new_mode"] is None for row in github)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("forge", ["github", "gitlab"])
 async def test_captured_renderer_page_equals_what_the_sidecar_projects(
     forge: str,

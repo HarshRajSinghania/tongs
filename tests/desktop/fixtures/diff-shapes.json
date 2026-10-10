@@ -194,7 +194,9 @@
         "is_empty": false,
         "is_mode_only": false,
         "is_rename_only": false,
-        "is_unavailable": false
+        "is_unavailable": false,
+        "old_mode": null,
+        "new_mode": null
       },
       {
         "kind": "file",
@@ -210,7 +212,9 @@
         "is_empty": false,
         "is_mode_only": false,
         "is_rename_only": false,
-        "is_unavailable": false
+        "is_unavailable": false,
+        "old_mode": null,
+        "new_mode": null
       },
       {
         "kind": "hunk",
@@ -309,7 +313,9 @@
         "is_empty": false,
         "is_mode_only": false,
         "is_rename_only": false,
-        "is_unavailable": false
+        "is_unavailable": false,
+        "old_mode": null,
+        "new_mode": null
       },
       {
         "kind": "hunk",
@@ -453,7 +459,9 @@
         "is_empty": true,
         "is_mode_only": false,
         "is_rename_only": false,
-        "is_unavailable": false
+        "is_unavailable": false,
+        "old_mode": null,
+        "new_mode": null
       },
       {
         "kind": "file",
@@ -469,7 +477,9 @@
         "is_empty": false,
         "is_mode_only": false,
         "is_rename_only": false,
-        "is_unavailable": false
+        "is_unavailable": false,
+        "old_mode": null,
+        "new_mode": null
       },
       {
         "kind": "hunk",
@@ -532,7 +542,9 @@
         "is_empty": false,
         "is_mode_only": false,
         "is_rename_only": false,
-        "is_unavailable": false
+        "is_unavailable": false,
+        "old_mode": null,
+        "new_mode": null
       },
       {
         "kind": "hunk",
@@ -586,7 +598,9 @@
         "is_empty": false,
         "is_mode_only": false,
         "is_rename_only": true,
-        "is_unavailable": false
+        "is_unavailable": false,
+        "old_mode": null,
+        "new_mode": null
       },
       {
         "kind": "file",
@@ -602,7 +616,9 @@
         "is_empty": false,
         "is_mode_only": false,
         "is_rename_only": false,
-        "is_unavailable": true
+        "is_unavailable": true,
+        "old_mode": null,
+        "new_mode": null
       }
     ]
   },
@@ -631,7 +647,9 @@
         "is_empty": false,
         "is_mode_only": false,
         "is_rename_only": false,
-        "is_unavailable": false
+        "is_unavailable": false,
+        "old_mode": "100644",
+        "new_mode": "100644"
       },
       {
         "kind": "file",
@@ -647,7 +665,9 @@
         "is_empty": false,
         "is_mode_only": false,
         "is_rename_only": false,
-        "is_unavailable": false
+        "is_unavailable": false,
+        "old_mode": "100644",
+        "new_mode": "100644"
       },
       {
         "kind": "hunk",
@@ -746,7 +766,9 @@
         "is_empty": false,
         "is_mode_only": false,
         "is_rename_only": false,
-        "is_unavailable": false
+        "is_unavailable": false,
+        "old_mode": "100644",
+        "new_mode": "100644"
       },
       {
         "kind": "hunk",
@@ -890,7 +912,9 @@
         "is_empty": true,
         "is_mode_only": false,
         "is_rename_only": false,
-        "is_unavailable": false
+        "is_unavailable": false,
+        "old_mode": null,
+        "new_mode": "100644"
       },
       {
         "kind": "file",
@@ -906,7 +930,9 @@
         "is_empty": false,
         "is_mode_only": false,
         "is_rename_only": false,
-        "is_unavailable": false
+        "is_unavailable": false,
+        "old_mode": "100644",
+        "new_mode": "100644"
       },
       {
         "kind": "hunk",
@@ -969,7 +995,9 @@
         "is_empty": false,
         "is_mode_only": false,
         "is_rename_only": false,
-        "is_unavailable": false
+        "is_unavailable": false,
+        "old_mode": "100644",
+        "new_mode": null
       },
       {
         "kind": "hunk",
@@ -1023,7 +1051,9 @@
         "is_empty": false,
         "is_mode_only": false,
         "is_rename_only": true,
-        "is_unavailable": false
+        "is_unavailable": false,
+        "old_mode": "100644",
+        "new_mode": "100644"
       },
       {
         "kind": "file",
@@ -1039,7 +1069,9 @@
         "is_empty": false,
         "is_mode_only": true,
         "is_rename_only": false,
-        "is_unavailable": false
+        "is_unavailable": false,
+        "old_mode": "100644",
+        "new_mode": "100755"
       }
     ]
   }
