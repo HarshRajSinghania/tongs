@@ -130,6 +130,73 @@ test("All reviews fans the selected scope out only to discovered handles", async
   ]);
 });
 
+test("Refresh reviews asks for a fresh first page and later reads do not", async () => {
+  const calls = [];
+  const bridge = baseBridge({
+    listReviews: (params) => {
+      calls.push(params);
+      return read({
+        items: [reviewItem(`read-${calls.length}`, "open")],
+        failures: [],
+      });
+    },
+  });
+  const feature = createInboxFeature();
+  const view = render(
+    feature.render(featureContext(bridge), {
+      kind: "inbox",
+      repository: repository("repo", "Repository"),
+    }),
+  );
+
+  await view.findByText("read-1");
+  fireEvent.click(view.getByRole("button", { name: "Refresh reviews" }));
+  await view.findByText("read-2");
+  // A scope change after the refresh is an ordinary read again.
+  fireEvent.click(view.getByRole("button", { name: "My Reviews" }));
+  await view.findByText("read-3");
+
+  assert.deepEqual(calls, [
+    { scope: "all_open", state: "open", repository: "repo" },
+    { scope: "all_open", state: "open", repository: "repo", fresh: true },
+    { scope: "my_reviews", state: "open", repository: "repo" },
+  ]);
+});
+
+test("a fresh combined read marks only first pages as fresh", async () => {
+  const calls = [];
+  const bridge = baseBridge({
+    listReviews: (params) => {
+      calls.push(params);
+      return read({
+        items: [],
+        failures: [],
+        next_cursor: params.cursor === undefined ? "rc1.2.abc" : null,
+      });
+    },
+  });
+  const combined = listDiscoveredReviews(
+    bridge,
+    [{ handle: "github-local" }],
+    "all_open",
+    "open",
+    undefined,
+    undefined,
+    new Map([["github-local", 2]]),
+    true,
+  );
+  await combined.result;
+  assert.deepEqual(calls, [
+    { scope: "all_open", state: "open", repository: "github-local", fresh: true },
+    {
+      scope: "all_open",
+      state: "open",
+      repository: "github-local",
+      cursor: "rc1.2.abc",
+    },
+  ]);
+});
+
 test("scope-specific empty and retained refresh failure states stay explicit", async () => {
   let personalReads = 0;
   const bridge = baseBridge({

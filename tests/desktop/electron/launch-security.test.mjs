@@ -39,6 +39,17 @@ test("runtime parameter boundary rejects unknown, malformed, and oversized value
   assert.throws(() => assertParams("plugins.invoke", { plugin: "p", method: "m", params: { body: "x".repeat(300_000) } }));
 });
 
+test("reviews.list accepts only a boolean fresh flag for an explicit refresh", () => {
+  assertParams("reviews.list", { scope: "all_open", repository: "r", fresh: true });
+  assertParams("reviews.list", { scope: "my_reviews", repository: "r", fresh: false });
+  for (const fresh of ["true", "", 1, 0, null, [], {}]) {
+    assert.throws(() => assertParams("reviews.list", { scope: "all_open", repository: "r", fresh }), /Invalid desktop boolean parameter/, String(fresh));
+  }
+  // The flag belongs to the review list only.
+  assert.throws(() => assertParams("reviews.get", { review: "r", fresh: true }), /Invalid desktop parameter fields/);
+  assert.throws(() => assertParams("pipelines.list", { repository: "r", fresh: true }), /Invalid desktop parameter fields/);
+});
+
 test("runtime result boundary validates operation-specific DTOs", () => {
   assertResult("reviews.list", { next_cursor: null, items: [], failures: [] });
   assertResult("reviews.list", { next_cursor: "rc1.2.0123456789abcdef0123456789abcdef", items: [], failures: [] });

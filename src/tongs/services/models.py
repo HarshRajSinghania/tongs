@@ -166,6 +166,9 @@ class ReviewQuery:
     # from the ``next_cursor`` a previous page returned.
     paged: bool = False
     cursor: str | None = None
+    # An explicit refresh: skip any cached list or first page, store what the
+    # forge returns, and look up again a sign-in that failed recently.
+    fresh: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, ReviewScope) or not isinstance(
@@ -191,6 +194,8 @@ class ReviewQuery:
                 raise ValueError("hostnames must not contain duplicates")
         if not isinstance(self.paged, bool):
             raise TypeError("paged must be a boolean")
+        if not isinstance(self.fresh, bool):
+            raise TypeError("fresh must be a boolean")
         if self.cursor is not None:
             review_cursor_page(self.cursor)
             if (

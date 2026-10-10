@@ -37,7 +37,7 @@ export function assertParams(method: string, value: unknown): asserts value is J
   const specs: Record<string, { required: readonly string[]; optional?: readonly string[] }> = {
     "repositories.discover": { required: [] },
     "repositories.open": { required: ["hostname", "project_path"] },
-    "reviews.list": { required: ["scope"], optional: ["repository", "state", "per_page", "cursor"] },
+    "reviews.list": { required: ["scope"], optional: ["repository", "state", "per_page", "cursor", "fresh"] },
     "reviews.get": { required: ["review"] }, "discussions.list": { required: ["review"] },
     "commits.list": { required: ["review"] }, "jobs.list": { required: ["pipeline"] },
     "diff.open": { required: ["review"], optional: ["layout", "max_items"] },
@@ -59,6 +59,9 @@ export function assertParams(method: string, value: unknown): asserts value is J
     if (method === "reviews.list" && key === "cursor") {
       // An opaque cursor the service sealed; the service rejects forged ones.
       if (item !== null && (typeof item !== "string" || !/^[A-Za-z0-9._-]{1,64}$/.test(item))) throw new Error("Invalid desktop cursor parameter");
+    } else if (method === "reviews.list" && key === "fresh") {
+      // An explicit refresh that reads past the service's list cache.
+      if (typeof item !== "boolean") throw new Error("Invalid desktop boolean parameter");
     } else if (["per_page", "max_items", "cursor"].includes(key)) {
       const maximum = key === "cursor" ? Number.MAX_SAFE_INTEGER : key === "per_page" ? 100 : 1000;
       if (!Number.isSafeInteger(item) || Number(item) < (key === "cursor" ? 0 : 1) || Number(item) > maximum) throw new Error("Invalid desktop numeric parameter");

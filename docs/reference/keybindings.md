@@ -21,7 +21,7 @@ These keys work on the inbox, the repository list and MR detail.
 |-----|--------|
 | ++q++ | Quit from the inbox, or go back one screen |
 | ++escape++ | Go back one screen (on the inbox, only from a repository's inbox) |
-| ++ctrl+r++ | Refresh the current screen |
+| ++ctrl+r++ | Refresh the current screen; in the inbox, read the tab from the forge instead of the cache |
 | ++o++ | Open the current item in the browser (inbox and MR detail) |
 
 ### Inbox
