@@ -599,7 +599,10 @@ export class SidecarTransport extends EventEmitter {
     this.pending.clear();
     if (!child.killed) child.kill("SIGTERM");
     this.setState("stopped");
-    this.emit("crash", error);
+    // A failure while a deliberate stop or restart runs is not a crash: the
+    // stop already ends this session, and reporting it would spend one of the
+    // recovery policy's automatic restarts.
+    if (!this.expectedExit) this.emit("crash", error);
   }
 
   private onExit(child: ChildProcessWithoutNullStreams, generation: number, code: number | null, signal: NodeJS.Signals | null): void {

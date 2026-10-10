@@ -629,6 +629,28 @@ test("a read during shutdown or a deliberate stop does not ask for a restart", a
   assert.deepEqual(lost, []);
 });
 
+test("an invalid frame while a restart stops the old service does not spend a restart", async () => {
+  const fake = harness({ delayedShutdown: true });
+  const transport = transportFor(fake, 50);
+  await transport.start();
+  const { policy, detach } = recovering(transport);
+  const crashes = watchCrashes(transport);
+  const old = fake.children[0];
+  // The old service answers the restart's shutdown request with garbage.
+  old.stdin.on("data", (chunk) => {
+    if (String(chunk).includes('"method":"shutdown"')) old.stdout.write("garbage\n");
+  });
+  await transport.restart();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(crashes, []);
+  assert.equal(policy.restartCount, 0);
+  assert.equal(policy.state, "idle");
+  assert.equal(fake.children.length, 2);
+  assert.equal(transport.serviceState, "connected");
+  detach();
+  await transport.stop();
+});
+
 test("a service that keeps crashing is restarted three times, then left stopped", async () => {
   const fake = harness();
   // Every service after the first exits before its handshake completes.
