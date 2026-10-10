@@ -304,13 +304,15 @@ that build job. `tests/ci/test_workflow_hygiene.py` shares its install scanner
 and allows a follow-up `--no-deps` install without hashes only for local wheels
 and local source trees built with `--no-build-isolation`.
 
-`.github/dependabot.yml` proposes weekly updates to the action pins,
+`.github/dependabot.yml` proposes monthly updates to the action pins,
 `pyproject.toml` (the lint extra included) and the `desktop`, `site` and
-`.github/linters` npm lockfiles. Minor and patch updates are grouped per
-ecosystem and directory, majors arrive alone, and Electron always gets its own
-pull request. Dependabot cannot regenerate the uv-compiled hash locks in
-`requirements/`, so their inputs are excluded; regenerate those locks by hand
-with the command at the top of each.
+`.github/linters` npm lockfiles. Per ecosystem, minor and patch updates arrive
+as one pull request and majors as another. Dependabot adds no labels, because a
+label would rerun CI through the `labeled` event and cancel the first run.
+Electron is not updated by Dependabot: bump it by hand together with the
+pinned version and digests under `packaging/desktop/archive`. Dependabot cannot
+regenerate the uv-compiled hash locks in `requirements/`, so their inputs are
+excluded; regenerate those locks by hand with the command at the top of each.
 
 ## Re-running a hosted check
 
