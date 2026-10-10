@@ -266,14 +266,18 @@ async def test_timed_out_call_retains_id_until_provider_task_finishes(
 
     assert timed_out.error.code is DesktopPluginErrorCode.CALL_TIMEOUT  # type: ignore[union-attr]
     assert duplicate.error.code is DesktopPluginErrorCode.INVALID_DATA  # type: ignore[union-attr]
-    await asyncio.sleep(0.12)
-    recovery = await registry.call(
-        "good",
-        "echo",
-        {},
-        DesktopCallContext("retained-id", DesktopCancellation()),
-    )
-    assert recovery.ok
+    async with asyncio.timeout(2):
+        while True:
+            recovery = await registry.call(
+                "good",
+                "echo",
+                {},
+                DesktopCallContext("retained-id", DesktopCancellation()),
+            )
+            if recovery.ok:
+                break
+            assert recovery.error.code is DesktopPluginErrorCode.INVALID_DATA  # type: ignore[union-attr]
+            await asyncio.sleep(0.01)
 
 
 @pytest.mark.asyncio
