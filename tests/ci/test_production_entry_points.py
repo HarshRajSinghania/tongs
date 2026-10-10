@@ -70,6 +70,12 @@ INSTALL_PROVIDES: dict[str, frozenset[str]] = {
     "--disable-pip-version-check --require-hashes --only-binary=:all: "
     "-r requirements/release.lock": (CORE_MODULES - frozenset({"tongs"}))
     | frozenset({"jsonschema"}),
+    # The PyPI build job installs the same hash-locked closure, and no tongs.
+    "python -I -m pip install --isolated --disable-pip-version-check "
+    "--require-hashes --only-binary=:all: -r requirements/release.lock": (
+        CORE_MODULES - frozenset({"tongs"})
+    )
+    | frozenset({"jsonschema"}),
     '"$CANDIDATE_PYTHON" -I -m pip install --isolated '
     "--disable-pip-version-check --no-deps --no-build-isolation -e .": frozenset(
         {"tongs"}
@@ -115,6 +121,11 @@ class EntryPoint:
 
 
 ENTRY_POINTS: tuple[EntryPoint, ...] = (
+    EntryPoint(
+        program=".github/scripts/release_gate.py",
+        jobs=("publish.yml:build", "release-desktop.yml:candidate-archive"),
+        note="the release gate runs as python3 -I before anything is installed",
+    ),
     EntryPoint(
         program="tests/ci/ci_plan.py",
         jobs=("ci.yml:changes", "ci.yml:desktop-pr-gate"),

@@ -16,7 +16,8 @@ inputs from their sources instead of restating them:
 * the documentation the tests read, from the path literals in tests/, mapped
   to the lane of the job that runs the reading test;
 * the files the Fedora Podman probe reads, from ``probe.py`` itself;
-* the Python files the lint job checks, from its ``ruff check`` command;
+* the Python files the lint job checks, from its ``ruff check`` command, and
+  in reverse every Python file that selects the lint lane;
 * every tracked file, which must match an explicit rule unless it is on the
   allowlist below with a reason.
 
@@ -821,13 +822,25 @@ def test_the_fedora_probe_inputs_rule_is_what_the_probe_reads() -> None:
     assert stale == []
 
 
-def _ruff_check_paths() -> list[str]:
+def _ruff_paths(command: list[str]) -> list[str]:
     lint = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]["lint-and-format"]
     for step in lint["steps"]:
         words = (step.get("run") or "").split()
-        if words[:2] == ["ruff", "check"]:
-            return [word.rstrip("/") for word in words[2:] if not word.startswith("-")]
-    raise AssertionError("the lint job runs no ruff check")
+        if words[: len(command)] == command:
+            return [
+                word.rstrip("/")
+                for word in words[len(command) :]
+                if not word.startswith("-")
+            ]
+    raise AssertionError(f"the lint job runs no {' '.join(command)}")
+
+
+def _ruff_check_paths() -> list[str]:
+    return _ruff_paths(["ruff", "check"])
+
+
+def _inside_ruff_scope(path: str, roots: list[str]) -> bool:
+    return any(path.startswith(root + "/") for root in roots)
 
 
 @pytest.mark.needs_git
@@ -837,9 +850,27 @@ def test_every_python_file_the_lint_job_checks_selects_lint() -> None:
     paths = {
         path: "ruff check"
         for path in TRACKED
-        if path.endswith(".py") and any(path.startswith(root + "/") for root in roots)
+        if path.endswith(".py") and _inside_ruff_scope(path, roots)
     }
     assert _offenders(paths, "lint") == []
+
+
+@pytest.mark.needs_git
+def test_every_python_file_that_selects_lint_is_in_the_ruff_scope() -> None:
+    """The reverse direction: a tracked Python file whose edit runs the lint
+    job must be one that job checks, or the lane runs and lints nothing of it.
+    Both Ruff commands name the same scope."""
+
+    roots = _ruff_check_paths()
+    assert _ruff_paths(["ruff", "format", "--check"]) == roots
+    outside = sorted(
+        path
+        for path in TRACKED
+        if path.endswith(".py")
+        and _selects(path, "lint")
+        and not _inside_ruff_scope(path, roots)
+    )
+    assert outside == [], f"add these to both Ruff commands in ci.yml: {outside}"
 
 
 # (4) Every tracked path matches an explicit rule.

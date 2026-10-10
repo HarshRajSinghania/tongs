@@ -169,7 +169,7 @@ async def test_database_and_sidecars_are_private(db_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_save_against_changed_revision_keeps_anchor_without_retargeting(
+async def test_save_against_changed_revision_returns_stale_anchor_without_retargeting(
     db_path: Path,
 ) -> None:
     store = DraftStore(db_path)
@@ -186,6 +186,12 @@ async def test_save_against_changed_revision_keeps_anchor_without_retargeting(
     assert isinstance(inline, InlineDraftComment)
     assert inline.anchor.revision == REVISION
     assert saved.version == 2
+    # The saved snapshot is assessed against the caller's current revision.
+    assert inline.anchor.stale is True
+    # The stored version is not retargeted, so a plain read is not stale.
+    stored = (await store.get_draft(draft.id)).comments[1]
+    assert isinstance(stored, InlineDraftComment)
+    assert stored.anchor.stale is False
     # Staleness is derived from the revisions, never read back from storage.
     assessed = saved.assessed_against(changed).comments[1]
     assert isinstance(assessed, InlineDraftComment)

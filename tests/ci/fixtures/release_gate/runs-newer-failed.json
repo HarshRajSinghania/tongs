@@ -1,0 +1,227 @@
+{
+  "total_count": 2,
+  "workflow_runs": [
+    {
+      "id": 36399999999,
+      "name": "CI",
+      "node_id": "WFR_kwLOTc4RIs8AAAAIddF0zw",
+      "head_branch": "main",
+      "head_sha": "790f75838b9e60a00412d2c5e06ab4531c19b537",
+      "path": ".github/workflows/ci.yml",
+      "display_title": "Merge pull request #349 from andre-motta/claude/v103",
+      "run_number": 589,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "failure",
+      "workflow_id": 315977117,
+      "check_suite_id": 98389746238,
+      "check_suite_node_id": "CS_kwDOTc4RIs8AAAAW6HxiPg",
+      "url": "https://api.github.com/repos/andre-motta/tongs/actions/runs/36399999999",
+      "html_url": "https://github.com/andre-motta/tongs/actions/runs/36399999999",
+      "pull_requests": [],
+      "created_at": "2026-09-27T17:17:44Z",
+      "updated_at": "2026-09-27T17:38:15Z",
+      "actor": {
+        "login": "andre-motta",
+        "id": 30708955,
+        "node_id": "MDQ6VXNlcjMwNzA4OTU1",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "run_attempt": 1,
+      "referenced_workflows": [
+        {
+          "path": "andre-motta/tongs/.github/workflows/desktop-podman-probe.yml@790f75838b9e60a00412d2c5e06ab4531c19b537",
+          "sha": "790f75838b9e60a00412d2c5e06ab4531c19b537",
+          "ref": "refs/heads/main"
+        },
+        {
+          "path": "andre-motta/tongs/.github/workflows/desktop-production.yml@790f75838b9e60a00412d2c5e06ab4531c19b537",
+          "sha": "790f75838b9e60a00412d2c5e06ab4531c19b537",
+          "ref": "refs/heads/main"
+        }
+      ],
+      "run_started_at": "2026-09-27T17:36:33Z",
+      "triggering_actor": {
+        "login": "andre-motta",
+        "id": 30708955,
+        "node_id": "MDQ6VXNlcjMwNzA4OTU1",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "jobs_url": "https://api.github.com/repos/andre-motta/tongs/actions/runs/36399999999/jobs",
+      "logs_url": "https://api.github.com/repos/andre-motta/tongs/actions/runs/36399999999/logs",
+      "check_suite_url": "https://api.github.com/repos/andre-motta/tongs/check-suites/98389746238",
+      "artifacts_url": "https://api.github.com/repos/andre-motta/tongs/actions/runs/36399999999/artifacts",
+      "cancel_url": "https://api.github.com/repos/andre-motta/tongs/actions/runs/36399999999/cancel",
+      "rerun_url": "https://api.github.com/repos/andre-motta/tongs/actions/runs/36399999999/rerun",
+      "previous_attempt_url": null,
+      "workflow_url": "https://api.github.com/repos/andre-motta/tongs/actions/workflows/315977117",
+      "head_commit": {
+        "id": "790f75838b9e60a00412d2c5e06ab4531c19b537",
+        "tree_id": "f870c9d9f8419cc066eb9aa56afd30620d1e7e12",
+        "message": "Merge pull request #349 from andre-motta/claude/v103\n\nPage the desktop inbox and fix crashes from damaged drafts, long discussions and bracketed titles",
+        "timestamp": "2026-09-27T17:17:41Z",
+        "author": {
+          "name": "André Lustosa",
+          "email": "30708955+andre-motta@users.noreply.github.com"
+        },
+        "committer": {
+          "name": "GitHub",
+          "email": "noreply@github.com"
+        }
+      },
+      "repository": {
+        "id": 1305350434,
+        "node_id": "R_kgDOTc4RIg",
+        "name": "tongs",
+        "full_name": "andre-motta/tongs",
+        "private": false,
+        "owner": {
+          "login": "andre-motta",
+          "id": 30708955,
+          "node_id": "MDQ6VXNlcjMwNzA4OTU1",
+          "type": "User",
+          "user_view_type": "public",
+          "site_admin": false
+        },
+        "html_url": "https://github.com/andre-motta/tongs",
+        "description": "Unified code review for the terminal.",
+        "fork": false,
+        "url": "https://api.github.com/repos/andre-motta/tongs"
+      },
+      "head_repository": {
+        "id": 1305350434,
+        "node_id": "R_kgDOTc4RIg",
+        "name": "tongs",
+        "full_name": "andre-motta/tongs",
+        "private": false,
+        "owner": {
+          "login": "andre-motta",
+          "id": 30708955,
+          "node_id": "MDQ6VXNlcjMwNzA4OTU1",
+          "type": "User",
+          "user_view_type": "public",
+          "site_admin": false
+        },
+        "html_url": "https://github.com/andre-motta/tongs",
+        "description": "Unified code review for the terminal.",
+        "fork": false,
+        "url": "https://api.github.com/repos/andre-motta/tongs"
+      }
+    },
+    {
+      "id": 36336399567,
+      "name": "CI",
+      "node_id": "WFR_kwLOTc4RIs8AAAAIddF0zw",
+      "head_branch": "main",
+      "head_sha": "790f75838b9e60a00412d2c5e06ab4531c19b537",
+      "path": ".github/workflows/ci.yml",
+      "display_title": "Merge pull request #349 from andre-motta/claude/v103",
+      "run_number": 549,
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "workflow_id": 315977117,
+      "check_suite_id": 98389746238,
+      "check_suite_node_id": "CS_kwDOTc4RIs8AAAAW6HxiPg",
+      "url": "https://api.github.com/repos/andre-motta/tongs/actions/runs/36336399567",
+      "html_url": "https://github.com/andre-motta/tongs/actions/runs/36336399567",
+      "pull_requests": [],
+      "created_at": "2026-09-27T17:17:44Z",
+      "updated_at": "2026-09-27T17:38:15Z",
+      "actor": {
+        "login": "andre-motta",
+        "id": 30708955,
+        "node_id": "MDQ6VXNlcjMwNzA4OTU1",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "run_attempt": 2,
+      "referenced_workflows": [
+        {
+          "path": "andre-motta/tongs/.github/workflows/desktop-podman-probe.yml@790f75838b9e60a00412d2c5e06ab4531c19b537",
+          "sha": "790f75838b9e60a00412d2c5e06ab4531c19b537",
+          "ref": "refs/heads/main"
+        },
+        {
+          "path": "andre-motta/tongs/.github/workflows/desktop-production.yml@790f75838b9e60a00412d2c5e06ab4531c19b537",
+          "sha": "790f75838b9e60a00412d2c5e06ab4531c19b537",
+          "ref": "refs/heads/main"
+        }
+      ],
+      "run_started_at": "2026-09-27T17:36:33Z",
+      "triggering_actor": {
+        "login": "andre-motta",
+        "id": 30708955,
+        "node_id": "MDQ6VXNlcjMwNzA4OTU1",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "jobs_url": "https://api.github.com/repos/andre-motta/tongs/actions/runs/36336399567/jobs",
+      "logs_url": "https://api.github.com/repos/andre-motta/tongs/actions/runs/36336399567/logs",
+      "check_suite_url": "https://api.github.com/repos/andre-motta/tongs/check-suites/98389746238",
+      "artifacts_url": "https://api.github.com/repos/andre-motta/tongs/actions/runs/36336399567/artifacts",
+      "cancel_url": "https://api.github.com/repos/andre-motta/tongs/actions/runs/36336399567/cancel",
+      "rerun_url": "https://api.github.com/repos/andre-motta/tongs/actions/runs/36336399567/rerun",
+      "previous_attempt_url": "https://api.github.com/repos/andre-motta/tongs/actions/runs/36336399567/attempts/1",
+      "workflow_url": "https://api.github.com/repos/andre-motta/tongs/actions/workflows/315977117",
+      "head_commit": {
+        "id": "790f75838b9e60a00412d2c5e06ab4531c19b537",
+        "tree_id": "f870c9d9f8419cc066eb9aa56afd30620d1e7e12",
+        "message": "Merge pull request #349 from andre-motta/claude/v103\n\nPage the desktop inbox and fix crashes from damaged drafts, long discussions and bracketed titles",
+        "timestamp": "2026-09-27T17:17:41Z",
+        "author": {
+          "name": "André Lustosa",
+          "email": "30708955+andre-motta@users.noreply.github.com"
+        },
+        "committer": {
+          "name": "GitHub",
+          "email": "noreply@github.com"
+        }
+      },
+      "repository": {
+        "id": 1305350434,
+        "node_id": "R_kgDOTc4RIg",
+        "name": "tongs",
+        "full_name": "andre-motta/tongs",
+        "private": false,
+        "owner": {
+          "login": "andre-motta",
+          "id": 30708955,
+          "node_id": "MDQ6VXNlcjMwNzA4OTU1",
+          "type": "User",
+          "user_view_type": "public",
+          "site_admin": false
+        },
+        "html_url": "https://github.com/andre-motta/tongs",
+        "description": "Unified code review for the terminal.",
+        "fork": false,
+        "url": "https://api.github.com/repos/andre-motta/tongs"
+      },
+      "head_repository": {
+        "id": 1305350434,
+        "node_id": "R_kgDOTc4RIg",
+        "name": "tongs",
+        "full_name": "andre-motta/tongs",
+        "private": false,
+        "owner": {
+          "login": "andre-motta",
+          "id": 30708955,
+          "node_id": "MDQ6VXNlcjMwNzA4OTU1",
+          "type": "User",
+          "user_view_type": "public",
+          "site_admin": false
+        },
+        "html_url": "https://github.com/andre-motta/tongs",
+        "description": "Unified code review for the terminal.",
+        "fork": false,
+        "url": "https://api.github.com/repos/andre-motta/tongs"
+      }
+    }
+  ]
+}

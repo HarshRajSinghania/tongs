@@ -163,6 +163,11 @@ def _merge_readiness(mr: MRDetail) -> Content:
 _SUBMIT_WORKER_GROUP = "review-draft-submit"
 
 
+def _reload_note(reloaded: bool) -> str:
+    """The sentence a failure notice adds when its state reload also failed."""
+    return "" if reloaded else " The draft state could not be reloaded."
+
+
 class MROverview(Static):
     """MR overview panel showing metadata and description."""
 
@@ -803,12 +808,14 @@ class MRDetailScreen(Screen):
                 severity="warning",
             )
         except asyncio.CancelledError:
-            await self._recover_submission_state(target, draft_id)
+            await self._try_recover_submission_state(target, draft_id)
             raise
         except Exception as exc:  # noqa: BLE001 - Service errors are safe for the terminal surface.
-            await self._recover_submission_state(target, draft_id)
+            reloaded = await self._try_recover_submission_state(target, draft_id)
             self.notify(
-                f"Review submission stopped. ({exc})", severity="error", markup=False
+                f"Review submission stopped. ({exc}){_reload_note(reloaded)}",
+                severity="error",
+                markup=False,
             )
         finally:
             self._draft_busy = False
@@ -851,16 +858,18 @@ class MRDetailScreen(Screen):
             self._review_progress_by_draft[progress.draft_id] = progress
             await self._refresh_after_submission(target, progress.draft_id, progress)
         except asyncio.CancelledError:
-            await self._recover_submission_state(
+            await self._try_recover_submission_state(
                 target, self._review_draft.id if self._review_draft else None
             )
             raise
         except Exception as exc:  # noqa: BLE001 - Service errors are safe for the terminal surface.
-            await self._recover_submission_state(
+            reloaded = await self._try_recover_submission_state(
                 target, self._review_draft.id if self._review_draft else None
             )
             self.notify(
-                f"Review recovery stopped. ({exc})", severity="error", markup=False
+                f"Review recovery stopped. ({exc}){_reload_note(reloaded)}",
+                severity="error",
+                markup=False,
             )
         finally:
             self._draft_busy = False
@@ -893,6 +902,20 @@ class MRDetailScreen(Screen):
             self._review_progress = None
             self._review_progress_by_draft.pop(draft_id, None)
         await self._recover_submission_state(target, draft_id)
+
+    async def _try_recover_submission_state(
+        self, target: TUIDraftTarget, draft_id: UUID | None
+    ) -> bool:
+        """Reload the submission state after a failure, without raising.
+
+        A failed reload must not hide the failure notice or escape the worker,
+        which would exit the terminal application.
+        """
+        try:
+            await self._recover_submission_state(target, draft_id)
+        except Exception:  # noqa: BLE001 - The caller reports the original failure.
+            return False
+        return True
 
     async def _recover_submission_state(
         self, target: TUIDraftTarget, draft_id: UUID | None
@@ -950,21 +973,6 @@ class MRDetailScreen(Screen):
         )
 
     def action_go_back(self) -> None:
-        # Leaving cancels this screen's workers, and a cancelled submission
-        # records an unknown outcome for a write the forge may still finish.
-        if self._submission_in_flight():
-            self.notify(
-                "Submission in progress. Wait for it to finish before leaving.",
-                severity="warning",
-            )
-            return
-        if self._draft_busy:
-            self.notify(
-                "A review draft change is in progress. Wait for it to finish "
-                "before leaving.",
-                severity="warning",
-            )
-            return
         editor = self.query_one("#comment-editor", CommentEditor)
         if editor.display and editor._defer_close:
             text = editor.query_one("#comment-input", TextArea).text.strip()
@@ -981,6 +989,23 @@ class MRDetailScreen(Screen):
                 return
         except NoMatches:
             pass
+        # Leaving cancels this screen's workers, and a cancelled submission
+        # records an unknown outcome for a write the forge may still finish.
+        # Drilling out of a pipeline stays on this screen, so only leaving is
+        # refused.
+        if self._submission_in_flight():
+            self.notify(
+                "Submission in progress. Wait for it to finish before leaving.",
+                severity="warning",
+            )
+            return
+        if self._draft_busy:
+            self.notify(
+                "A review draft change is in progress. Wait for it to finish "
+                "before leaving.",
+                severity="warning",
+            )
+            return
         screen_stack = self.app.screen_stack
         if len(screen_stack) >= 2:
             parent = screen_stack[-2]
