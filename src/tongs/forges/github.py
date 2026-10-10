@@ -50,6 +50,32 @@ _SEARCH_RESULT_CAP = 1000
 _CHECK_RUNS_PAGE_SIZE = 100
 _CHECK_RUNS_MAX_PAGES = 10
 
+# Review threads are read in GraphQL pages of 100, up to this many pages.
+_REVIEW_THREADS_MAX_PAGES = 50
+
+# One page of a pull request's review threads, with each thread's resolution
+# and the database ids of its first comments.  Resolving a thread and reading
+# the resolution of every thread share this shape.
+_REVIEW_THREADS_QUERY = """
+query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+    repository(owner: $owner, name: $repo) {
+        pullRequest(number: $number) {
+            reviewThreads(first: 100, after: $cursor) {
+                nodes {
+                    id
+                    isResolved
+                    comments(first: 100) {
+                        nodes { databaseId }
+                        pageInfo { hasNextPage endCursor }
+                    }
+                }
+                pageInfo { hasNextPage endCursor }
+            }
+        }
+    }
+}
+"""
+
 
 def _files_overflowed(changed_files: object) -> bool:
     """Return whether a pull request has more files than the files API lists."""
@@ -143,6 +169,19 @@ def _parse_mr_state(value: str) -> MRState:
         "closed": MRState.CLOSED,
         "merged": MRState.MERGED,
     }.get(value.lower(), MRState.OPEN)
+
+
+def _parse_pr_state(data: dict) -> MRState:
+    """Read a pull request's state, reporting a merged one as merged.
+
+    GitHub reports a merged pull request with state ``closed``.  The single
+    pull request response also carries ``merged``, but list and search items
+    do not, so ``merged_at`` is the signal every response shares.
+    """
+    if data.get("merged") is True or data.get("merged_at"):
+        return MRState.MERGED
+    state = data.get("state")
+    return _parse_mr_state(state if isinstance(state, str) else "open")
 
 
 def _parse_review_decision(value: str | None) -> ReviewDecision:
@@ -539,9 +578,16 @@ class GitHubClient(ForgeClient):
             root_id = comment.get("in_reply_to_id")
             if root_id in replies:
                 replies[root_id].append(comment)
+        resolution = (
+            await self._review_thread_resolution(owner, repo, number)
+            if any(comment.get("path") for comment in roots.values())
+            else {}
+        )
         discussions = []
         for root_id, comment in roots.items():
             parsed = self._parse_review_comment(comment)
+            is_inline = bool(comment.get("path"))
+            is_resolved = is_inline and resolution.get(root_id, False)
             root = InlineComment(
                 id=parsed.id,
                 author=parsed.author,
@@ -550,22 +596,54 @@ class GitHubClient(ForgeClient):
                 file_path=parsed.file_path,
                 old_line=parsed.old_line,
                 new_line=parsed.new_line,
-                is_resolved=parsed.is_resolved,
+                is_resolved=is_resolved,
                 replies=tuple(
                     self._parse_review_comment(reply) for reply in replies[root_id]
                 ),
             )
-            is_inline = bool(comment.get("path"))
             discussions.append(
                 Discussion(
                     id=str(root_id),
                     is_inline=is_inline,
                     root_comment=root,
-                    is_resolved=False,
+                    is_resolved=is_resolved,
                     resolvable=is_inline,
                 )
             )
         return discussions
+
+    async def _review_thread_resolution(
+        self, owner: str, repo: str, number: int
+    ) -> dict[int, bool]:
+        """Map the REST ids of review thread comments to their thread's resolution.
+
+        Only the first page of each thread's comments is read, which always
+        holds the thread's root comment.  Any GraphQL failure, including an
+        unexpected response shape, degrades every thread to unresolved instead
+        of failing the discussions read.
+        """
+        resolution: dict[int, bool] = {}
+        cursor: str | None = None
+        try:
+            for _ in range(_REVIEW_THREADS_MAX_PAGES):
+                data = await self._graphql(
+                    _REVIEW_THREADS_QUERY,
+                    {"owner": owner, "repo": repo, "number": number, "cursor": cursor},
+                )
+                connection = data["repository"]["pullRequest"]["reviewThreads"]
+                for thread in connection["nodes"]:
+                    is_resolved = thread["isResolved"] is True
+                    for comment in thread["comments"]["nodes"]:
+                        comment_id = comment.get("databaseId")
+                        if type(comment_id) is int:
+                            resolution[comment_id] = is_resolved
+                page = connection["pageInfo"]
+                cursor = page.get("endCursor")
+                if page.get("hasNextPage") is not True or not cursor:
+                    break
+        except (ForgeError, ValueError, KeyError, TypeError, AttributeError):
+            return {}
+        return resolution
 
     async def create_inline_comment(
         self,
@@ -666,28 +744,10 @@ class GitHubClient(ForgeClient):
         self, owner: str, repo: str, number: int, comment_id: int
     ) -> str | None:
         """Find the GraphQL node ID of the review thread containing a comment."""
-        query = """
-        query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
-            repository(owner: $owner, name: $repo) {
-                pullRequest(number: $number) {
-                    reviewThreads(first: 100, after: $cursor) {
-                        nodes {
-                            id
-                            comments(first: 100) {
-                                nodes { databaseId }
-                                pageInfo { hasNextPage endCursor }
-                            }
-                        }
-                        pageInfo { hasNextPage endCursor }
-                    }
-                }
-            }
-        }
-        """
         cursor = None
         while True:
             data = await self._graphql(
-                query,
+                _REVIEW_THREADS_QUERY,
                 {"owner": owner, "repo": repo, "number": number, "cursor": cursor},
             )
             connection = (
@@ -983,16 +1043,25 @@ class GitHubClient(ForgeClient):
         pr_data = await request(
             self._http, "GET", f"/repos/{owner}/{repo}/pulls/{number}"
         )
-        branch = pr_data.get("head", {}).get("ref", "")
-        if not branch:
+        head = pr_data.get("head", {})
+        branch = head.get("ref", "")
+        head_sha = head.get("sha", "")
+        if not branch or not head_sha:
             return []
         data = await request(
             self._http,
             "GET",
             f"/repos/{owner}/{repo}/actions/runs",
-            params={"branch": branch, "per_page": per_page},
+            params={"branch": branch, "head_sha": head_sha, "per_page": per_page},
         )
-        return [self._parse_workflow_run(r) for r in data.get("workflow_runs", [])]
+        # Some GitHub Enterprise Server versions ignore head_sha, so runs for
+        # older commits on the branch, and base-SHA pull_request_target runs,
+        # are dropped here as well.
+        return [
+            self._parse_workflow_run(r)
+            for r in data.get("workflow_runs", [])
+            if r.get("head_sha") == head_sha
+        ]
 
     async def retry_pipeline(self, repo_path: str, pipeline_id: int) -> None:
         owner, repo = _split_repo_path(repo_path)
@@ -1024,7 +1093,7 @@ class GitHubClient(ForgeClient):
             number=data.get("number", 0),
             title=data.get("title", ""),
             author=_parse_user(user),
-            state=_parse_mr_state(data.get("state", "open")),
+            state=_parse_pr_state(data),
             is_draft=data.get("draft", False),
             source_branch=head.get("ref", ""),
             target_branch=base.get("ref", ""),
@@ -1117,14 +1186,27 @@ class GitHubClient(ForgeClient):
         )
 
     def _parse_review_comment(self, data: dict) -> InlineComment:
+        """Parse a review comment, anchoring it to the side it was left on.
+
+        A LEFT comment anchors to the old file only, and a RIGHT one to the new
+        file only.  ``line`` is null on an outdated comment, which then falls
+        back to ``original_line``.
+        """
+        line = data.get("line")
+        original_line = data.get("original_line")
+        is_left = data.get("side") == "LEFT"
+        if is_left:
+            anchor = original_line if original_line is not None else line
+        else:
+            anchor = line if line is not None else original_line
         return InlineComment(
             id=str(data.get("id", "")),
             author=_parse_user(data.get("user")),
             body=data.get("body", ""),
             created_at=_parse_datetime(data.get("created_at")) or datetime.now(UTC),
             file_path=data.get("path", ""),
-            old_line=data.get("original_line") if data.get("side") == "LEFT" else None,
-            new_line=data.get("line"),
+            old_line=anchor if is_left else None,
+            new_line=None if is_left else anchor,
         )
 
     def _parse_workflow_run(self, data: dict) -> Pipeline:

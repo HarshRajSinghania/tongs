@@ -837,3 +837,79 @@ def test_parse_note_on_renamed_file_uses_new_path() -> None:
         }
     )
     assert comment.file_path == "src/new.py"
+
+
+def _gitlab_note(note_id: int, **fields: object) -> dict:
+    return {
+        "id": note_id,
+        "body": f"note {note_id}",
+        "author": {"username": "bob", "name": "Bob"},
+        "created_at": "2026-06-02T10:00:00Z",
+        "system": False,
+        **fields,
+    }
+
+
+class TestDiscussionResolution:
+    @pytest.mark.asyncio
+    async def test_resolution_is_read_per_note(self) -> None:
+        position = {"new_path": "src/a.py", "old_path": "src/a.py", "new_line": 3}
+        discussions = [
+            {
+                "id": "individual",
+                "individual_note": True,
+                "notes": [_gitlab_note(1, resolvable=False, resolved=False)],
+            },
+            {
+                "id": "resolved",
+                "individual_note": False,
+                "notes": [
+                    _gitlab_note(2, resolvable=True, resolved=True, position=position),
+                    _gitlab_note(3, resolvable=True, resolved=True),
+                ],
+            },
+            {
+                "id": "open",
+                "individual_note": False,
+                "notes": [
+                    _gitlab_note(4, resolvable=True, resolved=True, position=position),
+                    _gitlab_note(5, resolvable=True, resolved=False),
+                ],
+            },
+            {
+                "id": "not-resolvable-thread",
+                "individual_note": False,
+                "notes": [_gitlab_note(6, resolvable=False)],
+            },
+        ]
+        client, http = _make_gitlab_client(
+            lambda _: httpx.Response(200, json=discussions)
+        )
+        async with http:
+            parsed = await client.get_mr_discussions("acme/widgets", 42)
+
+        by_id = {d.id: (d.resolvable, d.is_resolved) for d in parsed}
+        assert by_id == {
+            "individual": (False, False),
+            "resolved": (True, True),
+            "open": (True, False),
+            "not-resolvable-thread": (False, False),
+        }
+
+    @pytest.mark.asyncio
+    async def test_individual_note_is_never_resolvable(self) -> None:
+        """Even a note flagged resolvable is a standalone comment, not a thread."""
+        discussions = [
+            {
+                "id": "individual",
+                "individual_note": True,
+                "notes": [_gitlab_note(1, resolvable=True, resolved=False)],
+            }
+        ]
+        client, http = _make_gitlab_client(
+            lambda _: httpx.Response(200, json=discussions)
+        )
+        async with http:
+            (parsed,) = await client.get_mr_discussions("acme/widgets", 42)
+
+        assert (parsed.resolvable, parsed.is_resolved) == (False, False)

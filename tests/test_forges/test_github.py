@@ -25,6 +25,7 @@ from tongs.forges.github import (
 from tongs.forges.models import (
     CIStatus,
     ForgeHost,
+    MRState,
     ReviewDecision,
     SourceCleanupStatus,
 )
@@ -903,3 +904,258 @@ class TestSearchPaging:
 
         assert not isinstance(caught.value, PartialResultsError)
         assert search_pages == ["1"]
+
+
+class TestMergedState:
+    @pytest.mark.asyncio
+    async def test_listed_pull_with_merged_at_reads_as_merged(self) -> None:
+        """List items carry merged_at but no merged key."""
+        pulls = [
+            _pr_api_json(
+                {"number": 1, "state": "closed", "merged_at": "2026-07-03T00:00:00Z"}
+            ),
+            _pr_api_json({"number": 2, "state": "closed", "merged_at": None}),
+            _pr_api_json({"number": 3}),
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/repos/acme/repo/pulls":
+                return httpx.Response(200, json=pulls)
+            return httpx.Response(200, json={"check_runs": [], "total_count": 0})
+
+        client, http = _make_github_client(handler)
+        async with http:
+            mrs = await client.list_mrs("acme/repo", state="closed")
+
+        assert [mr.state for mr in mrs] == [
+            MRState.MERGED,
+            MRState.CLOSED,
+            MRState.OPEN,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_merged_detail_is_not_closed(self) -> None:
+        """Reopen is offered only for CLOSED, so a merged PR must not read as it."""
+        pull = _pr_api_json(
+            {
+                "state": "closed",
+                "merged": True,
+                "merged_at": "2026-07-03T00:00:00Z",
+            }
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/repos/acme/repo/pulls/10":
+                return httpx.Response(200, json=pull)
+            if request.url.path.endswith("/reviews"):
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json={"check_runs": [], "total_count": 0})
+
+        client, http = _make_github_client(handler)
+        async with http:
+            detail = await client.get_mr("acme/repo", 10)
+
+        assert detail.state is MRState.MERGED
+
+
+class TestReviewCommentSides:
+    def _client(self) -> GitHubClient:
+        client, _ = _make_github_client(lambda _: httpx.Response(200))
+        return client
+
+    def test_left_comment_anchors_to_old_line_only(self) -> None:
+        comment = self._client()._parse_review_comment(
+            _review_comment_json({"side": "LEFT", "line": 12, "original_line": 10})
+        )
+        assert (comment.old_line, comment.new_line) == (10, None)
+
+    def test_left_comment_falls_back_to_line(self) -> None:
+        comment = self._client()._parse_review_comment(
+            _review_comment_json({"side": "LEFT", "line": 12, "original_line": None})
+        )
+        assert (comment.old_line, comment.new_line) == (12, None)
+
+    def test_right_comment_keeps_new_line(self) -> None:
+        comment = self._client()._parse_review_comment(
+            _review_comment_json({"side": "RIGHT", "line": 42, "original_line": 40})
+        )
+        assert (comment.old_line, comment.new_line) == (None, 42)
+
+    def test_outdated_right_comment_maps_from_original_line(self) -> None:
+        comment = self._client()._parse_review_comment(
+            _review_comment_json({"side": "RIGHT", "line": None, "original_line": 40})
+        )
+        assert (comment.old_line, comment.new_line) == (None, 40)
+
+    def test_outdated_left_comment_maps_from_original_line(self) -> None:
+        comment = self._client()._parse_review_comment(
+            _review_comment_json({"side": "LEFT", "line": None, "original_line": 7})
+        )
+        assert (comment.old_line, comment.new_line) == (7, None)
+
+
+def _review_threads_page(
+    threads: list[tuple[bool, list[int]]],
+    *,
+    has_next: bool = False,
+    cursor: str | None = None,
+) -> dict:
+    return {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "reviewThreads": {
+                        "nodes": [
+                            {
+                                "id": f"thread-{index}",
+                                "isResolved": resolved,
+                                "comments": {
+                                    "nodes": [{"databaseId": i} for i in ids],
+                                    "pageInfo": {
+                                        "hasNextPage": False,
+                                        "endCursor": None,
+                                    },
+                                },
+                            }
+                            for index, (resolved, ids) in enumerate(threads)
+                        ],
+                        "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                    }
+                }
+            }
+        }
+    }
+
+
+_THREAD_COMMENTS = (
+    _review_comment_json({"id": 1}),
+    _review_comment_json({"id": 2, "in_reply_to_id": 1}),
+    _review_comment_json({"id": 3}),
+    _review_comment_json({"id": 4}),
+)
+
+
+class TestThreadResolution:
+    @pytest.mark.asyncio
+    async def test_threads_reflect_review_threads_across_pages(self) -> None:
+        graphql_bodies: list[dict] = []
+        pages = [
+            _review_threads_page([(True, [1, 2])], has_next=True, cursor="next"),
+            _review_threads_page([(False, [3]), (True, [4])]),
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/graphql":
+                graphql_bodies.append(json.loads(request.content))
+                return httpx.Response(200, json=pages[len(graphql_bodies) - 1])
+            return httpx.Response(200, json=list(_THREAD_COMMENTS))
+
+        client, http = _make_github_client(handler)
+        async with http:
+            discussions = await client.get_mr_discussions("acme/repo", 10)
+
+        assert [d.id for d in discussions] == ["1", "3", "4"]
+        assert [d.is_resolved for d in discussions] == [True, False, True]
+        assert [d.root_comment.is_resolved for d in discussions] == [
+            True,
+            False,
+            True,
+        ]
+        assert [d.resolvable for d in discussions] == [True, True, True]
+        assert [body["variables"]["cursor"] for body in graphql_bodies] == [
+            None,
+            "next",
+        ]
+        assert "isResolved" in graphql_bodies[0]["query"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "graphql_response",
+        [
+            httpx.Response(200, json={"errors": [{"message": "boom"}]}),
+            httpx.Response(401, json={"message": "Bad credentials"}),
+            httpx.Response(502, text="bad gateway"),
+            httpx.Response(200, json={"data": {"repository": None}}),
+            httpx.Response(200, json=[]),
+        ],
+    )
+    async def test_graphql_failure_degrades_to_unresolved(
+        self, graphql_response: httpx.Response
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/graphql":
+                return graphql_response
+            return httpx.Response(200, json=list(_THREAD_COMMENTS))
+
+        client, http = _make_github_client(handler)
+        async with http:
+            discussions = await client.get_mr_discussions("acme/repo", 10)
+
+        assert [d.id for d in discussions] == ["1", "3", "4"]
+        assert [d.is_resolved for d in discussions] == [False, False, False]
+        assert [d.resolvable for d in discussions] == [True, True, True]
+
+    @pytest.mark.asyncio
+    async def test_no_review_comments_skips_graphql(self) -> None:
+        paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            return httpx.Response(200, json=[])
+
+        client, http = _make_github_client(handler)
+        async with http:
+            assert await client.get_mr_discussions("acme/repo", 10) == []
+
+        assert paths == ["/repos/acme/repo/pulls/10/comments"]
+
+
+class TestMRPipelines:
+    @pytest.mark.asyncio
+    async def test_only_head_sha_runs_are_listed_when_param_is_ignored(self) -> None:
+        run_params: list[dict[str, str]] = []
+        runs = [
+            {"id": 1, "head_sha": "abc123def456", "event": "pull_request"},
+            {"id": 2, "head_sha": "older-sha", "event": "pull_request"},
+            {"id": 3, "head_sha": "base123def456", "event": "pull_request_target"},
+            {"id": 4, "head_sha": "abc123def456", "event": "push"},
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/repos/acme/repo/pulls/10":
+                return httpx.Response(200, json=_pr_api_json())
+            if request.url.path == "/repos/acme/repo/actions/runs":
+                run_params.append(dict(request.url.params))
+                # Ignore head_sha, as some GHES versions do.
+                return httpx.Response(200, json={"workflow_runs": runs})
+            return httpx.Response(404)
+
+        client, http = _make_github_client(handler)
+        async with http:
+            pipelines = await client.list_mr_pipelines("acme/repo", 10)
+
+        assert [p.id for p in pipelines] == [1, 4]
+        assert {p.sha for p in pipelines} == {"abc123def456"}
+        assert run_params == [
+            {
+                "branch": "feature-branch",
+                "head_sha": "abc123def456",
+                "per_page": "20",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_pull_without_head_sha_lists_no_runs(self) -> None:
+        paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            return httpx.Response(
+                200, json=_pr_api_json({"head": {"ref": "feature-branch"}})
+            )
+
+        client, http = _make_github_client(handler)
+        async with http:
+            assert await client.list_mr_pipelines("acme/repo", 10) == []
+
+        assert paths == ["/repos/acme/repo/pulls/10"]
