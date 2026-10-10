@@ -1,13 +1,13 @@
 ---
 title: Known issues
-description: "Defects known in tongs 1.0.4, what you will see, and the release each fix is planned for."
+description: "Defects known in tongs 1.0.5, what you will see, and the release each fix is planned for."
 ---
 
-These defects are known in tongs 1.0.4.
+These defects are known in tongs 1.0.5.
 Each entry links to the issue that tracks the fix and names the milestone it is
 planned for. Milestones can move; the issue always has the current plan.
-Defects fixed in 1.0.4 are listed in the
-[1.0.4 release notes](/releases/v1.0.4/).
+Defects fixed in 1.0.5 are listed in the
+[1.0.5 release notes](/releases/v1.0.5/).
 
 [Troubleshooting](/desktop/troubleshooting/) covers desktop recovery states and
 launch problems that have a workaround today.
