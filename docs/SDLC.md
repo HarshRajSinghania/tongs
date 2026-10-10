@@ -25,7 +25,7 @@ PR. The lifecycle is for multi-item, architectural, or risky initiatives.
 | Platforms | Python 3.12 and 3.13 required; desktop app on Fedora 44 KDE x86_64 required; other platforms best effort |
 | Evidence level | `automated` by default; the CTO chooses `manual` for release acceptance sessions |
 | Commit rules | [AGENTS.md](https://github.com/andre-motta/tongs/blob/main/AGENTS.md#git-commits): title, blank line, one-line body, `git commit -s`, co-author trailer naming the actual model |
-| Upstream path | PR into `main`; the CTO merges. Tags, releases, and deployments need separate authorization |
+| Upstream path | PR into `main`. The CTO merges, except agent PRs inside the [merge delegation](#merge-delegation). Tags, releases, and deployments need separate authorization |
 
 ## Agent rules
 
@@ -42,6 +42,18 @@ Pass these to workflows as the `rules` argument:
 > from a checkout and from an installed wheel (the probe runs Python 3.14).
 > Forge writes during testing go only to the `tongs-test-sandbox` repositories
 > on GitHub and GitLab; never delete anything on a forge.
+
+## Merge delegation
+
+An agent may merge a PR into `main` only when all of these hold:
+
+1. The `CI aggregate` check is green on the PR head. Merge with a merge commit and never with `gh pr merge --admin`.
+2. The item is `low` or `standard` risk in the approved design, its independent review is done, and no blocker is open.
+3. The PR touches none of `.github/workflows/`, `.github/scripts/`, `packaging/`, `scripts/release-evidence/`, dependency or lock files, credential and authentication code (`src/tongs/forges/auth*`, netrc and token handling), `desktop/src/main/security.ts` or `desktop/src/preload/`.
+4. The PR author is the CTO's own account (`andre-motta`), which agents use. A PR from any other author, including outside contributors, waits for the CTO's go-ahead.
+5. The agent reports the merge to the CTO right after it lands, with the PR, the commit and what changed.
+
+Every other PR, every `high` risk item and every tag stay with the CTO, who can withdraw this delegation at any time.
 
 ## Hardware GPU check
 
