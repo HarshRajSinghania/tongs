@@ -28,7 +28,7 @@ You need Python 3.12 or newer:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e ".[dev,mcp]" ruff
+python -m pip install -e ".[dev,lint,mcp]"
 pytest
 ruff check src/ tests/
 ruff format --check src/ tests/
