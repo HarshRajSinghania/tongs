@@ -1280,16 +1280,20 @@ def _highlight_stream(
 ) -> None:
     """Lex consecutive lines of one side as one stream, keyed by ``id(line)``.
 
-    If the lexer changes the line count (a carriage return inside a line
-    reads as a line break), each line is lexed on its own instead, so no
-    line takes another line's colours.
+    Pygments reads a lone carriage return as a line break. A line with one
+    before its last character is therefore lexed on its own from the start,
+    because a stream ending in an empty line would hide the extra break and
+    shift every later line's colours by one. A line count that still does
+    not match also falls back to lexing each line on its own.
     """
     if not lines:
         return
-    highlighted = syntax.highlight("\n".join(dl.content for dl in lines))
-    parts = list(highlighted.split("\n", allow_blank=True))
-    if len(parts) == len(lines) + 1 and not parts[-1].plain:
-        parts.pop()
+    parts: list[Text] = []
+    if not any("\r" in dl.content[:-1] for dl in lines):
+        highlighted = syntax.highlight("\n".join(dl.content for dl in lines))
+        parts = list(highlighted.split("\n", allow_blank=True))
+        if len(parts) == len(lines) + 1 and not parts[-1].plain:
+            parts.pop()
     if len(parts) != len(lines):
         parts = []
         for dl in lines:

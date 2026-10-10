@@ -319,10 +319,22 @@ def test_a_string_opened_in_one_hunk_does_not_colour_the_next() -> None:
     assert string_colour not in {span.style.color for span in later.spans}
 
 
-def test_a_carriage_return_does_not_shift_colours_onto_other_lines() -> None:
-    lines = (
-        _line(None, 1, "first = 1\r", LineType.ADDITION),
-        _line(None, 2, "second = 2", LineType.ADDITION),
+@pytest.mark.parametrize(
+    ("contents", "expected"),
+    [
+        (("first = 1\r", "second = 2"), ["first = 1", "second = 2"]),
+        # The lone carriage return becomes a break, and the stream's last
+        # empty line would hide the extra part and shift the colours by one.
+        (("first = 1\rsecond = 2", ""), ["first = 1\nsecond = 2", ""]),
+    ],
+    ids=["trailing-cr", "cr-then-empty-line"],
+)
+def test_a_carriage_return_does_not_shift_colours_onto_other_lines(
+    contents: tuple[str, ...], expected: list[str]
+) -> None:
+    lines = tuple(
+        _line(None, number, content, LineType.ADDITION)
+        for number, content in enumerate(contents, start=1)
     )
     file = DiffFile(
         "m.py",
@@ -334,10 +346,7 @@ def test_a_carriage_return_does_not_shift_colours_onto_other_lines() -> None:
 
     highlight_map = _build_highlight_map(file)
 
-    assert [highlight_map.get(line).plain.strip() for line in lines] == [
-        "first = 1",
-        "second = 2",
-    ]
+    assert [highlight_map.get(line).plain.strip() for line in lines] == expected
 
 
 # -- highlight caching -------------------------------------------------------
