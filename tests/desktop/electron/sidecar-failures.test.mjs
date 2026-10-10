@@ -167,6 +167,41 @@ test("handshake accepts server capability supersets", async () => {
   await transport.stop();
 });
 
+test("a handshake timeout says the service did not start, not that a CI action is unknown", async () => {
+  const fake = harness({ autoHandshake: false });
+  // The request timeout is long, so only the startup deadline can expire.
+  const transport = new SidecarTransport(launch, 60_000, 20, 1_000, fake.spawn);
+  const states = [];
+  transport.on("status", (state) => states.push(state));
+  let failure = null;
+  try {
+    await transport.start();
+  } catch (error) {
+    failure = {
+      code: error.code,
+      message: error.message,
+      retryable: error.retryable,
+    };
+  }
+  assert.deepEqual(failure, {
+    code: "startup_timeout",
+    message: "The desktop service did not start in time.",
+    retryable: true,
+  });
+  assert.equal(/\bCI\b/.test(failure.message), false);
+  assert.equal(failure.message.includes("outcome"), false);
+  assert.equal(transport.serviceState, "stopped");
+  assert.deepEqual(states, []);
+  assert.equal(
+    fake.children[0].frames.filter((frame) => frame.method === "handshake").length,
+    1,
+  );
+  assert.equal(
+    fake.children[0].frames.filter((frame) => frame.type === "cancel").length,
+    0,
+  );
+});
+
 test("mutation timeout is uncertain and never sends cancel or replays a late result", async () => {
   const fake = harness();
   const transport = new SidecarTransport(launch, 20, 1_000, 1_000, fake.spawn);
@@ -176,7 +211,11 @@ test("mutation timeout is uncertain and never sends cancel or replays a late res
     pipeline: "pipeline-handle",
   });
 
-  await assert.rejects(request.result, { code: "mutation_timeout" });
+  await assert.rejects(request.result, {
+    code: "mutation_timeout",
+    message: "The CI mutation response timed out. Its outcome is unknown.",
+    retryable: true,
+  });
   assert.equal(
     fake.children[0].frames.filter((frame) => frame.type === "cancel").length,
     0,

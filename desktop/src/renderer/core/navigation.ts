@@ -28,6 +28,13 @@ export interface FeatureContext {
   readonly queries: QueryCoordinator;
   readonly repositories: readonly RepositoryDto[];
   readonly repositoriesReady: boolean;
+  /**
+   * Why the first repository discovery failed, as text safe to show, or null
+   * while it has not failed. It stays null once any discovery succeeded.
+   */
+  readonly repositoriesError?: string | null;
+  /** Runs repository discovery again, as the sidebar's Retry does. */
+  readonly retryDiscovery?: () => void;
   readonly repositoryGeneration: number;
   readonly reviewPanels: readonly ReviewPanelContribution[];
   readonly inlineAnchor: InlineAnchorSelection | null;
