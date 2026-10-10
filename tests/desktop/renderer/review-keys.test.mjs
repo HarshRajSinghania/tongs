@@ -11,6 +11,13 @@ import {
   reviewKeyMatches,
   reviewKeyParityTable,
 } from "../../../desktop/dist/src/renderer/features/review/keys.js";
+import {
+  CAPABILITY_LOADING,
+  capabilitiesReady,
+  enabledButton,
+  waitForCount,
+  waitForText,
+} from "./wait.mjs";
 
 const desktopRequire = createRequire(
   new URL("../../../desktop/package.json", import.meta.url),
@@ -25,7 +32,7 @@ Object.assign(globalThis, {
   HTMLElement: dom.window.HTMLElement,
   Node: dom.window.Node,
 });
-const { cleanup, fireEvent, render, waitFor } = desktopRequire(
+const { cleanup, fireEvent, render } = desktopRequire(
   "@testing-library/react",
 );
 const React = desktopRequire("react");
@@ -58,33 +65,12 @@ function focusedRow() {
 }
 
 /**
- * Waits until the button a key presses through is enabled. The composer's
- * primary write and a thread's Reply button stay disabled until
- * `getReviewMutationCapabilities` answers, and a key dispatched into that
- * window finds a disabled control and does nothing, with nothing later to
- * retry it: that is the shape of the hosted-runner flake in #235.
+ * The drawer's verdict tiles. `v` cycles `allowedVerdicts(capabilities)`
+ * (drawer.tsx), which stays empty for as long as `capabilities` is null, so a
+ * `v` dispatched before the shared `capabilitiesReady` wait on these tiles
+ * finds no verdict to move to and nothing later retries it.
  */
-async function buttonEnabled(view, name) {
-  await waitFor(() =>
-    assert.equal(view.getByRole("button", { name }).disabled, false),
-  );
-}
-
-/**
- * Waits until the drawer's verdict tiles have rendered from an answered
- * capability read. `v` cycles `allowedVerdicts(capabilities)` (drawer.tsx),
- * which stays empty for as long as `capabilities` is null, so a `v`
- * dispatched before this settles finds no verdict to move to and nothing
- * later retries it.
- */
-async function verdictTilesReady(view) {
-  await waitFor(() => {
-    const tiles = view.container.querySelectorAll(
-      ".review-drawer-verdict-tiles input",
-    ).length;
-    assert.notEqual(tiles, 0);
-  });
-}
+const VERDICT_TILES = ".review-drawer-verdict-tiles input";
 
 test("c opens the composer on the current selection from the document body", async () => {
   const review = "keys-comment";
@@ -149,9 +135,9 @@ test("c composes on the whole range and leaves the selection as the reader built
   fireEvent.change(view.getByLabelText("Inline review comment"), {
     target: { value: "Cover both lines" },
   });
-  await buttonEnabled(view, "Start a review");
+  await enabledButton(view, "Start a review");
   fireEvent.click(view.getByRole("button", { name: "Start a review" }));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   const { anchor } = saves[0].content.comments[0];
   assert.deepEqual([anchor.start_line, anchor.new_line], [10, 11]);
 });
@@ -164,8 +150,9 @@ test("Shift+C opens the review drawer from the document body", async () => {
 
   // A lower case c with no Shift is the comment key, not this one.
   fireEvent.keyDown(document.body, { key: "C", shiftKey: true });
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".review-drawer").length, 1),
+  await waitForCount(
+    () => view.container.querySelectorAll(".review-drawer").length,
+    1,
   );
   assert.equal(
     view.getByRole("dialog", { name: "Your review" }).getAttribute("tabindex"),
@@ -176,17 +163,17 @@ test("Shift+C opens the review drawer from the document body", async () => {
 test("] and [ step the changed files from the document body and wrap", async () => {
   const review = "keys-files";
   const view = renderDiff(diffBridge(review), review);
-  await waitFor(() => assert.equal(shownFile(view), "src/calc.py"));
+  await waitForText(() => shownFile(view), "src/calc.py");
 
   fireEvent.keyDown(document.body, { key: "]" });
-  await waitFor(() => assert.equal(shownFile(view), "docs/guide.md"));
+  await waitForText(() => shownFile(view), "docs/guide.md");
   // Wrapping is stated in the documentation, so it is asserted here.
   fireEvent.keyDown(document.body, { key: "]" });
-  await waitFor(() => assert.equal(shownFile(view), "src/calc.py"));
+  await waitForText(() => shownFile(view), "src/calc.py");
   fireEvent.keyDown(document.body, { key: "[" });
-  await waitFor(() => assert.equal(shownFile(view), "docs/guide.md"));
+  await waitForText(() => shownFile(view), "docs/guide.md");
   fireEvent.keyDown(document.body, { key: "[" });
-  await waitFor(() => assert.equal(shownFile(view), "src/calc.py"));
+  await waitForText(() => shownFile(view), "src/calc.py");
 });
 
 test("n and p step the threads and pending cards in document order and wrap", async () => {
@@ -204,11 +191,9 @@ test("n and p step the threads and pending cards in document order and wrap", as
     }),
     review,
   );
-  await waitFor(() =>
-    assert.equal(
-      view.container.querySelectorAll("[data-review-row]").length,
-      3,
-    ),
+  await waitForCount(
+    () => view.container.querySelectorAll("[data-review-row]").length,
+    3,
   );
   assert.deepEqual(
     [...view.container.querySelectorAll("[data-review-row]")].map((row) =>
@@ -240,11 +225,9 @@ test("r replies to the thread the row cursor is on", async () => {
     }),
     review,
   );
-  await waitFor(() =>
-    assert.equal(
-      view.container.querySelectorAll("[data-review-row]").length,
-      2,
-    ),
+  await waitForCount(
+    () => view.container.querySelectorAll("[data-review-row]").length,
+    2,
   );
   fireEvent.keyDown(document.body, { key: "n" });
   fireEvent.keyDown(document.body, { key: "n" });
@@ -255,14 +238,12 @@ test("r replies to the thread the row cursor is on", async () => {
   // is in flight, and `r` reads that same refusal (thread.tsx's
   // replyReason), so a press before it settles finds the thread but has
   // nothing to do; there is no second `r` to retry it (#235).
-  await buttonEnabled(view, "Reply to the discussion on new line 11");
+  await enabledButton(view, "Reply to the discussion on new line 11");
 
   fireEvent.keyDown(document.body, { key: "r" });
-  await waitFor(() =>
-    assert.equal(
-      view.container.querySelectorAll(".diff-thread-composer").length,
-      1,
-    ),
+  await waitForCount(
+    () => view.container.querySelectorAll(".diff-thread-composer").length,
+    1,
   );
   assert.equal(
     view.container.querySelectorAll(
@@ -285,11 +266,9 @@ test("r does nothing when the cursor is on a pending card rather than a thread",
     }),
     review,
   );
-  await waitFor(() =>
-    assert.equal(
-      view.container.querySelectorAll("[data-review-row]").length,
-      1,
-    ),
+  await waitForCount(
+    () => view.container.querySelectorAll("[data-review-row]").length,
+    1,
   );
   fireEvent.keyDown(document.body, { key: "n" });
   assert.equal(focusedRow(), "pending:entry-a");
@@ -330,9 +309,9 @@ test("Ctrl+Enter and Cmd+Enter run the composer's primary action from outside it
   // read answers, and Ctrl+Enter presses that button rather than reaching
   // into the composer (keys.ts's pressComposerPrimary), so it needs the
   // same settle as `r` above.
-  await buttonEnabled(view, "Start a review");
+  await enabledButton(view, "Start a review");
   fireEvent.keyDown(document.body, { key: "Enter", ctrlKey: true });
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   assert.equal(saves[0].content.comments[0].body, "Guard the zero divisor");
   assert.equal(saves[0].content.comments[0].anchor.new_line, 11);
 
@@ -343,8 +322,58 @@ test("Ctrl+Enter and Cmd+Enter run the composer's primary action from outside it
   });
   lineAnchor(view, "Select new line 11").focus();
   fireEvent.keyDown(document.body, { key: "Enter", metaKey: true });
-  await waitFor(() => assert.equal(saves.length, 2));
+  await waitForCount(() => saves.length, 2);
   assert.equal(saves[1].content.comments[1].body, "Name the context line");
+});
+
+test("the controls r and Ctrl+Enter press say their support is loading until the capability read answers", async () => {
+  // The sentences are written out: the shared `capabilitiesReady` wait knows
+  // only the ones in `CAPABILITY_LOADING`, so a reword in the source has to
+  // fail this pin rather than let the keyboard tests above settle too early.
+  const inline = "Inline comment support for this review is still loading.";
+  const reply = "Reply support for this review is still loading.";
+  assert.equal(CAPABILITY_LOADING.includes(inline), true);
+  assert.equal(CAPABILITY_LOADING.includes(reply), true);
+
+  const review = "keys-loading";
+  let release = () => {};
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const view = renderDiff(
+    diffBridge(review, {
+      getReviewMutationCapabilities: () => ({
+        requestToken: crypto.randomUUID(),
+        result: gate.then(() => ({ review, capabilities: capabilities() })),
+      }),
+      listDiscussions: () =>
+        read(discussionsPage([thread("d-1", { line: 10 })])),
+    }),
+    review,
+  );
+  const replyName = "Reply to the discussion on new line 10";
+  await view.findByRole("button", { name: replyName });
+  fireEvent.click(view.getByRole("button", { name: "Comment on new line 11" }));
+  await view.findByLabelText("Inline review comment");
+  const titles = () => [
+    view.getByRole("button", { name: replyName }).title,
+    view.getByRole("button", { name: "Add comment now" }).title,
+    view.getByRole("button", { name: "Start a review" }).title,
+  ];
+  assert.deepEqual(titles(), [reply, inline, inline]);
+
+  release();
+  await capabilitiesReady(
+    view.container,
+    ".diff-thread button, .inline-composer button",
+  );
+  assert.deepEqual(titles(), ["", "", ""]);
+
+  // The reply composer's resolve toggle is an input, which the same wait
+  // covers, and it is answered by the same read.
+  fireEvent.click(view.getByRole("button", { name: replyName }));
+  await capabilitiesReady(view.container, ".diff-thread-resolve input");
+  assert.equal(view.getByLabelText("Resolve thread").title, "");
 });
 
 test("Ctrl+Enter reaches the composer from a focused diff row, which does not activate", async () => {
@@ -374,15 +403,15 @@ test("Ctrl+Enter reaches the composer from a focused diff row, which does not ac
   // Same capability race as the two tests above: the primary write is
   // pressed rather than reached into, and it refuses while the read is
   // still in flight.
-  await buttonEnabled(view, "Start a review");
+  await enabledButton(view, "Start a review");
   fireEvent.keyDown(row, { key: "Enter", ctrlKey: true });
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   assert.equal(saves[0].content.comments[0].anchor.new_line, 11);
   assert.equal(row.getAttribute("aria-pressed"), "false");
 
   // A plain Enter on the same row still selects it.
   fireEvent.keyDown(row, { key: "Enter" });
-  await waitFor(() => assert.equal(row.getAttribute("aria-pressed"), "true"));
+  await waitForText(() => row.getAttribute("aria-pressed"), "true");
 });
 
 test("Escape closes the composer from outside the diff rows and keeps the text", async () => {
@@ -400,8 +429,9 @@ test("Escape closes the composer from outside the diff rows and keeps the text",
   // The changed-file navigation is one of the places it did nothing.
   view.container.querySelector(".file-list .file-item").focus();
   fireEvent.keyDown(document.body, { key: "Escape" });
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".inline-composer").length, 0),
+  await waitForCount(
+    () => view.container.querySelectorAll(".inline-composer").length,
+    0,
   );
 
   // The text belongs to the anchor, not to the composer, so it comes back.
@@ -414,8 +444,9 @@ test("Escape closes the composer from outside the diff rows and keeps the text",
   // And from the layout toggle, the other place named in the carry-over.
   view.getByRole("button", { name: "Split" }).focus();
   fireEvent.keyDown(document.body, { key: "Escape" });
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".inline-composer").length, 0),
+  await waitForCount(
+    () => view.container.querySelectorAll(".inline-composer").length,
+    0,
   );
 });
 
@@ -436,12 +467,11 @@ test("v cycles the verdict in the drawer, among the verdicts this review allows"
   );
   await view.findByRole("button", { name: /Your review/ });
   fireEvent.keyDown(document.body, { key: "C", shiftKey: true });
-  await waitFor(() =>
-    assert.equal(
+  await waitForCount(
+    () =>
       view.container.querySelectorAll(".review-drawer-verdict-tiles input")
         .length,
-      2,
-    ),
+    2,
   );
   assert.equal(
     view.container.querySelectorAll(
@@ -451,12 +481,12 @@ test("v cycles the verdict in the drawer, among the verdicts this review allows"
   );
 
   fireEvent.keyDown(document.body, { key: "v" });
-  await waitFor(() => assert.equal(checkedVerdict(view), "comment"));
+  await waitForText(() => checkedVerdict(view), "comment");
   fireEvent.keyDown(document.body, { key: "v" });
-  await waitFor(() => assert.equal(checkedVerdict(view), "approve"));
+  await waitForText(() => checkedVerdict(view), "approve");
   // Request changes is not offered on this review, so the cycle wraps over it.
   fireEvent.keyDown(document.body, { key: "v" });
-  await waitFor(() => assert.equal(checkedVerdict(view), "comment"));
+  await waitForText(() => checkedVerdict(view), "comment");
 });
 
 /** A review with a draft and one pending entry, so the drawer has content. */
@@ -475,8 +505,9 @@ function drawerBridge(review, changes = {}) {
 async function openDrawer(view) {
   await view.findByRole("button", { name: /Your review/ });
   fireEvent.keyDown(document.body, { key: "C", shiftKey: true });
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".review-drawer").length, 1),
+  await waitForCount(
+    () => view.container.querySelectorAll(".review-drawer").length,
+    1,
   );
 }
 
@@ -496,10 +527,10 @@ test("the open drawer owns the keyboard from the diff behind it", async () => {
   // The tiles `v` cycles through are empty until getReviewMutationCapabilities
   // answers (drawer.tsx's allowedVerdicts), so a press before that leaves
   // the verdict unset with no later press to retry it.
-  await verdictTilesReady(view);
+  await capabilitiesReady(view.container, VERDICT_TILES);
   // Every key is typed where the focus is, on the diff line behind the drawer.
   fireEvent.keyDown(line, { key: "v" });
-  await waitFor(() => assert.equal(checkedVerdict(view), "comment"));
+  await waitForText(() => checkedVerdict(view), "comment");
 
   // The diff's own keys stand down for as long as the drawer is open.
   assert.equal(shownFile(view), "src/calc.py");
@@ -507,8 +538,9 @@ test("the open drawer owns the keyboard from the diff behind it", async () => {
   assert.equal(shownFile(view), "src/calc.py");
 
   fireEvent.keyDown(line, { key: "Escape" });
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".review-drawer").length, 0),
+  await waitForCount(
+    () => view.container.querySelectorAll(".review-drawer").length,
+    0,
   );
   assert.equal(
     document.activeElement.className,
@@ -516,7 +548,7 @@ test("the open drawer owns the keyboard from the diff behind it", async () => {
   );
   // And the diff has its keys back.
   fireEvent.keyDown(document.body, { key: "]" });
-  await waitFor(() => assert.equal(shownFile(view), "docs/guide.md"));
+  await waitForText(() => shownFile(view), "docs/guide.md");
 });
 
 test("the open drawer answers v and Escape from the document body", async () => {
@@ -526,12 +558,13 @@ test("the open drawer answers v and Escape from the document body", async () => 
   document.body.focus();
 
   // Same capability race as the sibling test above.
-  await verdictTilesReady(view);
+  await capabilitiesReady(view.container, VERDICT_TILES);
   fireEvent.keyDown(document.body, { key: "v" });
-  await waitFor(() => assert.equal(checkedVerdict(view), "comment"));
+  await waitForText(() => checkedVerdict(view), "comment");
   fireEvent.keyDown(document.body, { key: "Escape" });
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".review-drawer").length, 0),
+  await waitForCount(
+    () => view.container.querySelectorAll(".review-drawer").length,
+    0,
   );
   assert.equal(
     document.activeElement.className,
@@ -568,9 +601,9 @@ test("the drawer keys keep their guards while the drawer owns the keyboard", asy
   }
   // This press is the one expected to land, so it needs the same capability
   // settle as the two sibling tests above.
-  await verdictTilesReady(view);
+  await capabilitiesReady(view.container, VERDICT_TILES);
   fireEvent.keyDown(document.body, { key: "v" });
-  await waitFor(() => assert.equal(checkedVerdict(view), "comment"));
+  await waitForText(() => checkedVerdict(view), "comment");
 });
 
 test("] and [ stay unclaimed on a review with one changed file", async () => {
@@ -579,7 +612,7 @@ test("] and [ stay unclaimed on a review with one changed file", async () => {
     diffBridge(review, { openDiff: () => read(onePageDiff(review)) }),
     review,
   );
-  await waitFor(() => assert.equal(shownFile(view), "src/calc.py"));
+  await waitForText(() => shownFile(view), "src/calc.py");
   assert.equal(view.container.querySelectorAll(".file-list .file-item").length, 2);
   for (const key of ["]", "["]) {
     const event = new window.KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
@@ -604,8 +637,9 @@ test("n and p walk the split panes in the order the documentation states", async
     review,
   );
   fireEvent.click(await view.findByRole("button", { name: "Split" }));
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll("[data-review-row]").length, 2),
+  await waitForCount(
+    () => view.container.querySelectorAll("[data-review-row]").length,
+    2,
   );
   // The panes are independent columns, so the old pane's rows come first. The
   // documentation states exactly this rather than claiming screen order.
@@ -663,7 +697,7 @@ test("the review keys stand down while a text field holds the keyboard", async (
 test("the review keys stand down while an aria-modal dialog is on screen", async () => {
   const review = "keys-modal";
   const view = renderDiff(diffBridge(review), review);
-  await waitFor(() => assert.equal(shownFile(view), "src/calc.py"));
+  await waitForText(() => shownFile(view), "src/calc.py");
   const modal = document.createElement("div");
   modal.setAttribute("aria-modal", "true");
   modal.setAttribute("role", "alertdialog");
@@ -682,7 +716,7 @@ test("the review keys stand down while an aria-modal dialog is on screen", async
   }
   // The same key acts once the dialog is gone.
   fireEvent.keyDown(document.body, { key: "]" });
-  await waitFor(() => assert.equal(shownFile(view), "docs/guide.md"));
+  await waitForText(() => shownFile(view), "docs/guide.md");
 });
 
 test("the review keys stand down when a modifier they do not name is held", async () => {
