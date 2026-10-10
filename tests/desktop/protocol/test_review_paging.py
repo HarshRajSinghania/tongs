@@ -25,6 +25,7 @@ from tongs.desktop.protocol.messages import (
     ProtocolErrorCode,
 )
 from tongs.desktop.protocol.server import DesktopSidecarServer
+from tongs.forges import http as forge_http
 from tongs.forges.base import ForgeClient
 from tongs.forges.github import GitHubClient
 from tongs.forges.models import ForgeHost
@@ -88,9 +89,19 @@ class _Forge:
         self.list_requests: list[tuple[str, dict[str, str]]] = []
         self.allow_unsorted = False
         self.ci_requests: list[str] = []
+        self.rate_limited: dict[str, dict[str, str]] = {}
+        self.rate_limited_requests: list[str] = []
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        headers = self.rate_limited.get(path)
+        if headers is not None:
+            self.rate_limited_requests.append(path)
+            return httpx.Response(
+                403,
+                json={"message": "API rate limit exceeded for user ID 1."},
+                headers=headers,
+            )
         for project, pulls in self.pulls.items():
             if path == f"/repos/{project}/pulls":
                 params = dict(request.url.params)
@@ -482,3 +493,67 @@ async def test_plugin_reads_of_reviews_take_no_cursor(
             DesktopCancellation(),
         )
     assert raised.value.code is ProtocolErrorCode.INVALID_PARAMS
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_403_reaches_the_wire_with_its_wait(
+    wired: tuple[_Wire, _Forge, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GitHub rate-limit 403 is rate_limited, not a permission failure."""
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(forge_http, "_sleep", fake_sleep)
+    wire, forge, handles = wired
+    listed = _result(
+        await wire.call(
+            "reviews.list", {"scope": "all_open", "repository": handles["acme/small"]}
+        )
+    )
+    review = cast(list[dict[str, object]], listed["items"])[0]
+    number = cast(dict[str, object], review["summary"])["number"]
+    path = f"/repos/acme/small/pulls/{number}"
+    forge.rate_limited[path] = {"x-ratelimit-remaining": "0", "Retry-After": "120"}
+
+    frame = await wire.call("reviews.get", {"review": review["handle"]})
+
+    error = cast(dict[str, object], frame["error"])
+    details = cast(dict[str, object], error["details"])
+    assert error["code"] == "service_error"
+    assert error["retryable"] is True
+    assert details["service_code"] == "rate_limited"
+    assert details["retry_after_seconds"] == "120"
+    assert "API rate limit exceeded" not in json.dumps(frame)
+    # A wait above the cap fails at once instead of sleeping and retrying.
+    assert forge.rate_limited_requests == [path]
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_page_is_a_rate_limited_failure(
+    wired: tuple[_Wire, _Forge, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(forge_http, "_sleep", fake_sleep)
+    wire, forge, handles = wired
+    forge.rate_limited["/repos/acme/small/pulls"] = {"x-ratelimit-remaining": "0"}
+
+    result = _result(
+        await wire.call(
+            "reviews.list", {"scope": "all_open", "repository": handles["acme/small"]}
+        )
+    )
+
+    assert result["items"] == []
+    failures = cast(list[dict[str, object]], result["failures"])
+    assert [(item["code"], item["retryable"]) for item in failures] == [
+        ("rate_limited", True)
+    ]
+    # Without a reset time the read waits the default delay and retries once.
+    assert forge.rate_limited_requests == ["/repos/acme/small/pulls"] * 2

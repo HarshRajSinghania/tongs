@@ -32,6 +32,7 @@ from tongs.forges.models import (
     PipelineJob,
     User,
 )
+from tongs.forges.registry import ForgeRegistry
 from tongs.scanner.repo import ForgeType, Remote, Repo
 from tongs.services import (
     ApplicationSession,
@@ -468,6 +469,23 @@ class BlockingGetClientRegistry(ClosingAwareRegistry):
         if self.block_get_client:
             self.get_client_started.set()
             await self.get_client_release.wait()
+        return await super().get_client(hostname)
+
+
+class HostBlockingRegistry(FakeRegistry):
+    """Hold one host's client acquisition, as a hung token lookup would."""
+
+    def __init__(self, clients: dict[str, object], *, blocked: str) -> None:
+        super().__init__(clients)
+        self.blocked = blocked
+        self.armed = False
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def get_client(self, hostname: str) -> ForgeClient:
+        if self.armed and hostname == self.blocked:
+            self.started.set()
+            await self.release.wait()
         return await super().get_client(hostname)
 
 
@@ -1193,6 +1211,66 @@ class TestResourceIssuance:
             assert caught.value.code is ServiceErrorCode.CLOSED
 
     @pytest.mark.asyncio
+    async def test_owned_registry_bounds_each_host_by_max_parallel(self) -> None:
+        session = await ApplicationSession(
+            config=Config(max_parallel=3),
+            cache=FakeCache(),
+            draft_store=FakeDraftStore(),  # type: ignore[arg-type]
+        ).start()
+        registry = session.forge_registry
+        assert isinstance(registry, ForgeRegistry)
+        assert registry.max_parallel == 3
+        await session.close()
+
+    @pytest.mark.asyncio
+    async def test_invalid_max_parallel_fails_before_building_a_registry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        built: list[object] = []
+        monkeypatch.setattr(
+            "tongs.services.session.ForgeRegistry",
+            lambda *args, **kwargs: built.append(kwargs),
+        )
+        cache = FakeCache()
+        session = ApplicationSession(
+            config=Config(max_parallel=0),
+            cache=cache,
+            draft_store=FakeDraftStore(),  # type: ignore[arg-type]
+        )
+        with pytest.raises(ServiceError) as caught:
+            await session.start()
+        assert caught.value.code == ServiceErrorCode.INVALID_RESPONSE
+        assert built == []
+        assert cache.close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_pending_client_for_one_host_does_not_block_another(self) -> None:
+        github = FakeClient()
+        gitlab = FakeClient(make_detail(GITLAB_HOST))
+        gitlab.repository_reviews = [make_summary(GITLAB_HOST)]
+        registry = HostBlockingRegistry(
+            {"github.com": github, "gitlab.com": gitlab}, blocked="gitlab.com"
+        )
+        session = await start_session(registry)
+        github_repo = await session.open_repository("github.com", "acme/widgets")
+        registry.armed = True
+        pending = asyncio.create_task(
+            session.open_repository("gitlab.com", "acme/widgets")
+        )
+        await registry.started.wait()
+
+        snapshot = await asyncio.wait_for(
+            session.get_review(ReviewRef(github_repo.ref, 7)), 2
+        )
+        assert snapshot.ref.number == 7
+        assert not pending.done()
+
+        registry.release.set()
+        opened = await asyncio.wait_for(pending, 2)
+        assert opened.ref.hostname == "gitlab.com"
+        await session.close()
+
+    @pytest.mark.asyncio
     async def test_well_formed_unissued_same_host_fails_before_forge_call(self) -> None:
         registry = FakeRegistry()
         session = await start_session(registry)
@@ -1587,7 +1665,7 @@ class TestReviewReads:
         assert session._issued_repositories == set()
 
     @pytest.mark.asyncio
-    async def test_client_created_during_close_is_closed_once_and_not_returned(
+    async def test_client_created_during_close_is_closed_and_not_returned(
         self,
     ) -> None:
         client = FakeClient()
@@ -1605,11 +1683,47 @@ class TestReviewReads:
             session.get_review(ReviewRef(repository.ref, 7))
         )
         await registry.get_client_started.wait()
-        # The acquisition outlives the close bound, so only the read path can
-        # close the late client.
+        # A pending client acquisition (such as a slow token lookup) does not
+        # hold the client lock, so close finishes without waiting for it.
+        await session.close()
+        assert registry.close_calls == 1
+
+        # The acquisition then finishes after the registry was closed, so the
+        # read path closes the late client again before refusing.
+        registry.get_client_release.set()
+
+        with pytest.raises(ServiceError) as caught:
+            await read_task
+        assert caught.value.code == ServiceErrorCode.CLOSED
+        assert client.get_mr_fresh_calls == 0
+        assert registry.close_calls == 2
+
+    @pytest.mark.asyncio
+    async def test_late_client_closes_registry_when_coordinator_timed_out(
+        self,
+    ) -> None:
+        client = FakeClient()
+        registry = BlockingGetClientRegistry({"github.com": client})
+        session = await ApplicationSession(
+            config=Config(max_parallel=2),
+            cache=FakeCache(),
+            draft_store=cast(DraftStore, FakeDraftStore()),
+            forge_registry=registry,
+            shutdown_timeout=0.05,
+        ).start()
+        repository = await session.open_repository("github.com", "acme/widgets")
+        registry.block_get_client = True
+        read_task = asyncio.create_task(
+            session.get_review(ReviewRef(repository.ref, 7))
+        )
+        await registry.get_client_started.wait()
+        # Another client acquisition holds the lock past the close bound, so
+        # the coordinator never reaches the registry.
+        await session._client_lock.acquire()
         with pytest.raises(ServiceError):
             await session.close()
         assert registry.close_calls == 0
+        session._client_lock.release()
 
         registry.get_client_release.set()
 

@@ -311,6 +311,8 @@ class ApplicationSession:
                     await self._draft_store.recover_incomplete_attempts()
                     self._recovery_warnings = self._draft_store.recovery_warnings
                     self._require_start_open()
+                    if self._config.max_parallel <= 0:
+                        raise ValueError("max_parallel must be positive")
                     self._registry = self._provided_registry or ForgeRegistry(
                         extra_gitlab_hosts=self._config.extra_gitlab_hosts,
                         extra_github_hosts=self._config.extra_github_hosts,
@@ -318,11 +320,10 @@ class ApplicationSession:
                         cache=self._cache,
                         mr_list_ttl=self._config.mr_list_ttl,
                         diff_ttl=self._config.diff_ttl,
+                        max_parallel=self._config.max_parallel,
                     )
                     self._registry_owned = True
                     hosts = self._registry.active_hostnames()
-                    if self._config.max_parallel <= 0:
-                        raise ValueError("max_parallel must be positive")
                     for hostname in hosts:
                         validate_hostname(hostname)
                     self._configured_hosts = frozenset(hosts)
@@ -949,30 +950,40 @@ class ApplicationSession:
 
     async def _get_client(self, hostname: str, operation: str) -> ForgeClient:
         registry = cast(ForgeRegistryResource, self._registry)
-        async with self._client_lock:
-            self._require_started()
-            try:
-                client = await registry.get_client(hostname)
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # noqa: BLE001 - Sanitize registry boundary.
-                if self._close_requested:
-                    self._require_started()
-                raise translate_error(
-                    error, operation=operation, hostname=hostname
-                ) from None
+        self._require_started()
+        # The registry looks tokens up in a worker thread, so the lookup runs
+        # outside the client lock: a slow or hung lookup for one host must not
+        # hold up other hosts or the close coordinator.
+        try:
+            client = await registry.get_client(hostname)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - Sanitize registry boundary.
             if self._close_requested:
-                # The close coordinator normally waits for this lock and closes the
-                # newly created client. Close it here as well so a client acquisition
-                # that outlives the coordinator's bound cannot leak a late client.
+                self._require_started()
+            raise translate_error(
+                error, operation=operation, hostname=hostname
+            ) from None
+        async with self._client_lock:
+            if self._close_requested:
+                # The client may have been created after the close coordinator
+                # closed the registry, or the coordinator may not have closed it
+                # yet within its bound. Close the registry here as well so a late
+                # client cannot leak.
                 try:
                     await asyncio.wait_for(
-                        self._close_registry_once(), timeout=self._shutdown_timeout
+                        self._close_late_clients(), timeout=self._shutdown_timeout
                     )
                 except Exception as error:  # noqa: BLE001 - Coordinator reports safely.
                     self._registry_close_failure = error
-                self._require_started()
+            self._require_started()
             return client
+
+    async def _close_late_clients(self) -> None:
+        if not self._registry_close_attempted:
+            await self._close_registry_once()
+            return
+        await cast(ForgeRegistryResource, self._registry).close_all()
 
     async def _call(
         self,

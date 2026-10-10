@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections.abc import Callable
 from functools import partial
 
+from tongs.errors import AuthError
 from tongs.forges.auth import refresh_token, resolve_token
 from tongs.forges.base import ForgeClient
-from tongs.forges.http import create_client
+from tongs.forges.http import HostRequestLimiter, create_client
 from tongs.forges.models import ForgeHost
 from tongs.scanner.repo import ForgeType
 
@@ -22,10 +25,20 @@ def _gitlab_api_base(hostname: str) -> str:
     return f"https://{hostname}/api/v4"
 
 
+#: How long a failed token lookup for a host is reused before it is retried.
+AUTH_FAILURE_TTL_SECONDS = 60.0
+
+
 class ForgeRegistry:
     """Maps hostnames to authenticated ForgeClient instances.
 
     Clients are created lazily on first access and cached for reuse.
+
+    ``max_parallel`` bounds the requests in flight to each forge host across
+    every client, call path and caller of this registry; ``None`` leaves them
+    unbounded. Token lookups run in a worker thread, one at a time per host,
+    and a failed lookup is reused for ``auth_failure_ttl`` seconds of
+    ``clock`` time before the host is looked up again.
     """
 
     def __init__(
@@ -36,15 +49,32 @@ class ForgeRegistry:
         cache: object | None = None,
         mr_list_ttl: int = 60,
         diff_ttl: int = 300,
+        *,
+        max_parallel: int | None = None,
+        auth_failure_ttl: float = AUTH_FAILURE_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
     ):
+        if max_parallel is not None and max_parallel < 1:
+            raise ValueError("max_parallel must be positive")
         self._extra_gitlab_hosts = extra_gitlab_hosts
         self._extra_github_hosts = extra_github_hosts
         self._timeout = request_timeout
         self._cache = cache
         self._mr_list_ttl = mr_list_ttl
         self._diff_ttl = diff_ttl
+        self._max_parallel = max_parallel
+        self._auth_failure_ttl = auth_failure_ttl
+        self._clock = clock
         self._clients: dict[str, ForgeClient] = {}
         self._hosts: dict[str, ForgeHost] = {}
+        self._limiters: dict[str, HostRequestLimiter] = {}
+        self._token_lookups: dict[str, asyncio.Task[str]] = {}
+        self._auth_failures: dict[str, tuple[float, str]] = {}
+
+    @property
+    def max_parallel(self) -> int | None:
+        """The per-host request bound, or ``None`` when requests are unbounded."""
+        return self._max_parallel
 
     def get_host(self, hostname: str) -> ForgeHost | None:
         """Get or create a ForgeHost for the given hostname."""
@@ -75,16 +105,20 @@ class ForgeRegistry:
 
         host = self.get_host(hostname)
         if host is None:
-            from tongs.errors import AuthError
-
             raise AuthError(f"Unknown forge host: {hostname}")
 
-        token = resolve_token(hostname, host.forge_type)
+        token = await self._lookup_token(host)
+        # Another caller may have created the client while this one waited.
+        existing = self._clients.get(hostname)
+        if existing is not None:
+            return existing
+
         http_client = create_client(
             host.api_base,
             token,
             self._timeout,
             refresh=partial(refresh_token, hostname, host.forge_type),
+            limiter=self._limiter_for(hostname),
         )
 
         if host.forge_type == ForgeType.GITLAB:
@@ -109,6 +143,68 @@ class ForgeRegistry:
 
         self._clients[hostname] = client
         return client
+
+    def forget_auth_failures(self, hostname: str | None = None) -> None:
+        """Drop remembered token lookup failures so the next access looks again.
+
+        With ``hostname`` only that host is forgotten; otherwise every host is.
+        A lookup still running for a forgotten host no longer records its
+        result, and the next access starts a new one.
+        """
+        if hostname is None:
+            self._auth_failures.clear()
+            self._token_lookups.clear()
+            return
+        self._auth_failures.pop(hostname, None)
+        self._token_lookups.pop(hostname, None)
+
+    async def _lookup_token(self, host: ForgeHost) -> str:
+        """Resolve the host's token off the event loop, sharing in-flight lookups.
+
+        The lookup can run CLI tools or wait on a keyring, so it runs in a
+        worker thread and never blocks lookups or requests for other hosts.
+        Callers for the same host share one lookup. A cancelled caller leaves
+        the lookup running for the others.
+        """
+        hostname = host.hostname
+        failure = self._auth_failures.get(hostname)
+        if failure is not None:
+            failed_at, message = failure
+            if self._clock() - failed_at < self._auth_failure_ttl:
+                raise AuthError(message)
+            del self._auth_failures[hostname]
+
+        loop = asyncio.get_running_loop()
+        lookup = self._token_lookups.get(hostname)
+        if lookup is None or lookup.get_loop() is not loop:
+            lookup = loop.create_task(
+                asyncio.to_thread(resolve_token, hostname, host.forge_type)
+            )
+            self._token_lookups[hostname] = lookup
+            lookup.add_done_callback(partial(self._finish_lookup, hostname))
+        return await asyncio.shield(lookup)
+
+    def _finish_lookup(self, hostname: str, lookup: asyncio.Task[str]) -> None:
+        if self._token_lookups.get(hostname) is not lookup:
+            # Forgotten while running: the result no longer counts.
+            if not lookup.cancelled():
+                lookup.exception()
+            return
+        del self._token_lookups[hostname]
+        if lookup.cancelled():
+            return
+        error = lookup.exception()
+        if isinstance(error, AuthError):
+            self._auth_failures[hostname] = (self._clock(), str(error))
+
+    def _limiter_for(self, hostname: str) -> HostRequestLimiter | None:
+        if self._max_parallel is None:
+            return None
+        limiter = self._limiters.get(hostname)
+        if limiter is None:
+            limiter = HostRequestLimiter(self._max_parallel)
+            self._limiters[hostname] = limiter
+        return limiter
 
     def active_hostnames(self) -> list[str]:
         """Return the configured hostnames.

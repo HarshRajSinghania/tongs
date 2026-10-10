@@ -282,3 +282,78 @@ class TestFallbackPage:
     async def test_invalid_page_is_rejected(self) -> None:
         with pytest.raises(ValueError):
             await ForgeClient.list_mrs_page(_ListOnlyClient(), "acme/repo", page=0)  # type: ignore[arg-type]
+
+
+class TestDefaultPageSize:
+    """Whole-list reads that use paginate's default ask for 100 items a page."""
+
+    @pytest.mark.asyncio
+    async def test_github_detail_lists_ask_for_one_hundred_per_page(self) -> None:
+        requests: list[tuple[str, dict[str, str]]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.url.path, dict(request.url.params)))
+            return httpx.Response(200, json=[])
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url=_GITHUB.api_base
+        ) as http:
+            client = GitHubClient(_GITHUB, http)
+            await client.get_mr_diff("acme/repo", 5)
+            await client.list_mr_commits("acme/repo", 5)
+            await client.get_mr_discussions("acme/repo", 5)
+
+        page_one = {"per_page": "100", "page": "1"}
+        assert requests == [
+            ("/repos/acme/repo/pulls/5/files", page_one),
+            ("/repos/acme/repo/pulls/5/commits", page_one),
+            ("/repos/acme/repo/pulls/5/comments", page_one),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_gitlab_detail_lists_ask_for_one_hundred_per_page(self) -> None:
+        requests: list[tuple[str, dict[str, str]]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.url.raw_path.decode(), dict(request.url.params)))
+            return httpx.Response(200, json=[])
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url=_GITLAB.api_base
+        ) as http:
+            client = GitLabClient(_GITLAB, http)
+            await client.list_mr_commits("acme/repo", 5)
+            await client.get_mr_discussions("acme/repo", 5)
+            await client.get_pipeline_jobs("acme/repo", 9)
+
+        page_one = {"per_page": "100", "page": "1"}
+        prefix = "/api/v4/projects/acme%2Frepo"
+        assert [(path.split("?", 1)[0], params) for path, params in requests] == [
+            (f"{prefix}/merge_requests/5/commits", page_one),
+            (f"{prefix}/merge_requests/5/discussions", page_one),
+            (f"{prefix}/pipelines/9/jobs", page_one),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_full_default_page_reads_the_next_one(self) -> None:
+        pages: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            page = request.url.params["page"]
+            pages.append(page)
+            assert request.url.params["per_page"] == "100"
+            count = 100 if page == "1" else 1
+            return httpx.Response(
+                200,
+                json=[
+                    {"sha": f"sha-{page}-{index}", "commit": {"message": "m"}}
+                    for index in range(count)
+                ],
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url=_GITHUB.api_base
+        ) as http:
+            commits = await GitHubClient(_GITHUB, http).list_mr_commits("acme/repo", 5)
+        assert len(commits) == 101
+        assert pages == ["1", "2"]
