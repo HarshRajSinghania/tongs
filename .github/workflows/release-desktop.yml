@@ -70,7 +70,7 @@ jobs:
             exit 1
           fi
       - name: Check out exact validation source without persisted credentials
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.TONGS_SOURCE_SHA }}
           fetch-depth: 1
@@ -146,7 +146,7 @@ jobs:
       archive-name: ${{ steps.release.outputs.archive_name }}
     steps:
       - name: Check out the exact candidate without persisted credentials
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 1
@@ -335,7 +335,7 @@ jobs:
       artifact-name: ${{ steps.names.outputs.artifact_name }}
     steps:
       - name: Check out the exact verifier without persisted credentials
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 1
@@ -569,7 +569,7 @@ jobs:
       - name: Check out the exact source with its tags and without persisted credentials
         # The RPM identity derives the core version from git describe, which
         # needs the release tag reachable from this checkout.
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -691,7 +691,7 @@ jobs:
       RELEASE_TAG: ${{ needs.candidate-archive.outputs.release-tag }}
     steps:
       - name: Check out the exact tagged source without persisted credentials
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 1

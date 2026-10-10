@@ -88,7 +88,7 @@ jobs:
       pull-request-base: ${{ steps.identity.outputs.pull_request_base }}
     steps:
       - name: Check out the exact revision without persisted credentials
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.checked_out_sha }}
           fetch-depth: 1
@@ -143,7 +143,7 @@ jobs:
       EVIDENCE_DIRECTORY: desktop-production-tap
     steps:
       - name: Check out the exact head without persisted credentials
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.source-identity.outputs.checked-out-commit }}
           fetch-depth: 1
@@ -327,7 +327,7 @@ jobs:
       license-inventory-sha256: ${{ steps.observe.outputs.license_inventory_sha256 }}
     steps:
       - name: Check out the exact head without persisted credentials
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.source-identity.outputs.checked-out-commit }}
           fetch-depth: 1
@@ -437,7 +437,7 @@ jobs:
       - name: Require the producer job to have succeeded
         run: test "${{ needs.archive.result }}" = "success"
       - name: Check out the exact head without persisted credentials
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.source-identity.outputs.checked-out-commit }}
           fetch-depth: 1
@@ -499,7 +499,7 @@ jobs:
       CHECK_ID: desktop-installed-core
     steps:
       - name: Check out the exact head without persisted credentials
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.source-identity.outputs.checked-out-commit }}
           fetch-depth: 0
@@ -664,7 +664,7 @@ jobs:
           test "${{ needs.archive.result }}" = "success"
           test "${{ needs.archive-evidence.result }}" = "success"
       - name: Check out the exact head without persisted credentials
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.source-identity.outputs.checked-out-commit }}
           fetch-depth: 1
@@ -737,7 +737,7 @@ jobs:
           test "${{ needs.archive.result }}" = "success"
           test "${{ needs.archive-evidence.result }}" = "success"
       - name: Check out the exact head without persisted credentials
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.source-identity.outputs.checked-out-commit }}
           fetch-depth: 0
@@ -1030,7 +1030,7 @@ jobs:
       CHECK_ID: desktop-native-payload-fixture
     steps:
       - name: Check out the exact head without persisted credentials
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.source-identity.outputs.checked-out-commit }}
           fetch-depth: 1
