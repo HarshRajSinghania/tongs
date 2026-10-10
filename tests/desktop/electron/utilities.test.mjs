@@ -370,6 +370,9 @@ test("a rename-over save is removed and releases its slot", async (t) => {
   clock.passHold();
   children[0].emit("exit", 0);
   await waitForEmptyDirectory(root);
+  // The release is requested after the file is removed.
+  while (transport.mutations.length === 0)
+    await new Promise((resolve) => setImmediate(resolve));
 
   assert.deepEqual(await readdir(root), []);
   assert.deepEqual(transport.mutations, [[
