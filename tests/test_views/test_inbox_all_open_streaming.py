@@ -31,6 +31,9 @@ from tongs.app import TongsApp
 from tongs.errors import NotFoundError
 from tongs.forges.models import ForgeHost, MRSummary
 from tongs.scanner.repo import ForgeType
+from tongs.services.errors import ServiceError, ServiceErrorCode
+from tongs.services.models import ReviewPage, ReviewScope
+from tongs.tui_services import TUIRepositoryProgress
 from tongs.widgets.mr_table import MRTable
 
 HOST = ForgeHost("github.com", ForgeType.GITHUB, "https://api.github.com")
@@ -435,3 +438,59 @@ async def test_a_repeated_merge_request_replaces_its_row(tmp_path: Path) -> None
         assert selected is not None
         assert selected.number == 1
         assert selected.title == "Edited"
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_where_every_repository_fails_says_the_rows_are_old(
+    tmp_path: Path,
+) -> None:
+    client = GatedForgeClient([summary("acme/a", 1, 2), summary("acme/b", 2, 1)])
+    app = build(tmp_path, client, ["acme/a", "acme/b"])
+
+    async with app.run_test(notifications=True) as pilot:
+        await settle(app)
+        await pilot.press("3")
+        await settle(app)
+        table = app.screen.query_one("#all-open-table", MRTable)
+        assert numbers(table) == [2, 1]
+
+        client.repo_errors["acme/a"] = NotFoundError("gone")
+        client.repo_errors["acme/b"] = NotFoundError("gone")
+        app.screen.load_all_open(fresh=True)
+        await settle(app)
+
+        assert numbers(table) == [2, 1]
+        assert status_text(app) == (
+            "Showing earlier results: 2 of 2 repositories could not be loaded"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_stream_error_after_some_rows_keeps_the_warnings_and_says_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = GatedForgeClient([summary("acme/a", 1, 2)])
+    client.repo_errors["acme/b"] = NotFoundError("gone")
+    app = build(tmp_path, client, ["acme/a", "acme/b"])
+
+    async with app.run_test(notifications=True) as pilot:
+        await settle(app)
+        page = await app.services.list_reviews(ReviewScope.ALL_OPEN)
+        assert len(page.items) == 1
+        assert len(page.failures) == 1
+
+        async def broken_stream(*, fresh: bool = False):
+            yield TUIRepositoryProgress(None, ReviewPage((), ()), 0, 3)
+            yield TUIRepositoryProgress(None, page, 2, 3)
+            raise ServiceError(ServiceErrorCode.CONFLICT, "The read stopped.")
+
+        monkeypatch.setattr(app.services, "stream_all_open", broken_stream)
+        await pilot.press("3")
+        await settle(app)
+
+        table = app.screen.query_one("#all-open-table", MRTable)
+        assert numbers(table) == [1]
+        assert status_text(app) == "List incomplete: 1 open MR loaded"
+        notices = all_open_notices(app)
+        assert "All Open: The read stopped." in notices
+        assert any("acme/b" in notice for notice in notices)
