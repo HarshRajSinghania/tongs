@@ -50,6 +50,28 @@ test("reviews.list accepts only a boolean fresh flag for an explicit refresh", (
   assert.throws(() => assertParams("pipelines.list", { repository: "r", fresh: true }), /Invalid desktop parameter fields/);
 });
 
+test("reviews.ci_status takes one review handle and an optional fresh flag", () => {
+  assertParams("reviews.ci_status", { review: "r" });
+  assertParams("reviews.ci_status", { review: "r", fresh: true });
+  assertParams("reviews.ci_status", { review: "r", fresh: false });
+  assert.throws(() => assertParams("reviews.ci_status", {}), /Invalid desktop parameter fields/);
+  for (const extra of [{ head_sha: "abc" }, { repository: "r" }, { scope: "all_open" }]) {
+    assert.throws(() => assertParams("reviews.ci_status", { review: "r", ...extra }), /Invalid desktop parameter fields/, JSON.stringify(extra));
+  }
+  for (const fresh of ["true", "", 1, 0, null, [], {}]) {
+    assert.throws(() => assertParams("reviews.ci_status", { review: "r", fresh }), /Invalid desktop boolean parameter/, String(fresh));
+  }
+  for (const review of ["", 7, true, [], {}, "x".repeat(2049)]) {
+    assert.throws(() => assertParams("reviews.ci_status", { review }), /Invalid desktop/, JSON.stringify(review));
+  }
+  for (const status of ["pending", "running", "success", "failed", "canceled", "skipped", "unknown"]) {
+    assertResult("reviews.ci_status", { ci_status: status });
+  }
+  for (const value of [{}, { ci_status: "" }, { ci_status: "green" }, { ci_status: null }, { ci_status: 1 }, { ci_status: "success", head_sha: "abc" }]) {
+    assert.throws(() => assertResult("reviews.ci_status", value), /Invalid reviews.ci_status result/, JSON.stringify(value));
+  }
+});
+
 test("runtime result boundary validates operation-specific DTOs", () => {
   assertResult("reviews.list", { next_cursor: null, items: [], failures: [] });
   assertResult("reviews.list", { next_cursor: "rc1.2.0123456789abcdef0123456789abcdef", items: [], failures: [] });

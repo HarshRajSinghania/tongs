@@ -156,11 +156,15 @@ SUPPORTED_METHODS = (
     "review_pipelines.list",
     *UTILITY_METHODS,
     *REVIEW_METHODS,
+    "reviews.ci_status",
     "reviews.get",
     "reviews.list",
 )
 
 _MAX_PROTOCOL_ERRORS = 8
+# Head commits remembered for ``reviews.ci_status``, one per listed review. No
+# more reviews than review handles can be listed, so this only bounds the map.
+_MAX_REVIEW_HEADS = 8192
 _DEFAULT_SHUTDOWN_TIMEOUT = 5.0
 
 
@@ -358,6 +362,9 @@ class DesktopSidecarServer:
         )
         self._handles = HandleRegistry()
         self._review_cursors = _ReviewCursors()
+        # The head commit each listed review had when its list was last read,
+        # so a CI lookup never takes a commit from the renderer.
+        self._review_heads: dict[ReviewRef, str] = {}
         self._snapshots = SnapshotStore()
         self._assets = AssetCatalog()
         self._operations: dict[str, _Operation] = {}
@@ -470,6 +477,7 @@ class DesktopSidecarServer:
             "repositories.discover": self._repositories_discover,
             "repositories.open": self._repositories_open,
             "review_pipelines.list": self._review_pipelines_list,
+            "reviews.ci_status": self._reviews_ci_status,
             "reviews.get": self._reviews_get,
             "reviews.list": self._reviews_list,
         }
@@ -706,6 +714,10 @@ class DesktopSidecarServer:
         rejected: it could neither be paged nor stay inside the frame budget.
         An optional boolean ``fresh`` marks an explicit refresh, which reads
         past the service's list cache.
+
+        Rows come without per-review CI requests where the forge allows it:
+        their CI status is then ``unknown`` and ``reviews.ci_status`` fills it
+        in for the rows the renderer shows.
         """
         _require_params(
             params,
@@ -742,6 +754,7 @@ class DesktopSidecarServer:
                 paged=True,
                 cursor=cursor,
                 fresh=fresh,
+                with_ci=False,
             )
         )
         return {
@@ -807,6 +820,27 @@ class DesktopSidecarServer:
                 for failure in page.failures
             ],
         }
+
+    async def _reviews_ci_status(
+        self, params: JsonObject, _context: RequestContext
+    ) -> object:
+        """Read the CI status of one listed review.
+
+        The lookup uses the head commit the review's last list read named, so
+        it costs the forge's CI requests only. An optional boolean ``fresh``
+        reads past the service's CI cache, as after an explicit refresh.
+        """
+        _require_params(
+            params,
+            allowed=frozenset({"review", "fresh"}),
+            required=frozenset({"review"}),
+        )
+        review = self._handles.resolve(params["review"], HandleKind.REVIEW, ReviewRef)
+        fresh = _optional_bool(params, "fresh", False)
+        status = await self._session.get_review_ci_status(
+            review, head_sha=self._review_heads.get(review, ""), fresh=fresh
+        )
+        return {"ci_status": status.value}
 
     async def _reviews_get(
         self, params: JsonObject, _context: RequestContext
@@ -1166,11 +1200,21 @@ class DesktopSidecarServer:
             HandleKind.REPOSITORY, item.ref.repository
         )
         review_handle = self._handles.issue(HandleKind.REVIEW, item.ref)
+        self._remember_head(item.ref, item.summary.head_commit_sha)
         return {
             "handle": review_handle,
             "repository": repository_handle,
             "summary": cast(JsonValue, _summary_wire(item.summary)),
         }
+
+    def _remember_head(self, review: ReviewRef, head_sha: str) -> None:
+        """Keep the head commit a list read named, replacing an older one."""
+        self._review_heads.pop(review, None)
+        if not head_sha:
+            return
+        if len(self._review_heads) >= _MAX_REVIEW_HEADS:
+            self._review_heads.pop(next(iter(self._review_heads)))
+        self._review_heads[review] = head_sha
 
     def _review_snapshot_wire(self, snapshot: ReviewSnapshot) -> JsonObject:
         repository_handle = self._handles.issue(

@@ -1,5 +1,5 @@
 import type { IpcMainInvokeEvent, WebContents } from "electron";
-import type { JsonObject, JsonValue } from "../shared/bridge.js";
+import { CI_STATUS_VALUES, type JsonObject, type JsonValue } from "../shared/bridge.js";
 
 export const APP_ORIGIN = "tongs://app";
 export const APP_DOCUMENT = `${APP_ORIGIN}/index.html`;
@@ -39,6 +39,7 @@ export function assertParams(method: string, value: unknown): asserts value is J
     "repositories.open": { required: ["hostname", "project_path"] },
     "reviews.list": { required: ["scope"], optional: ["repository", "state", "per_page", "cursor", "fresh"] },
     "reviews.get": { required: ["review"] }, "discussions.list": { required: ["review"] },
+    "reviews.ci_status": { required: ["review"], optional: ["fresh"] },
     "commits.list": { required: ["review"] }, "jobs.list": { required: ["pipeline"] },
     "diff.open": { required: ["review"], optional: ["layout", "max_items"] },
     "logs.open": { required: ["job"], optional: ["max_items"] },
@@ -59,7 +60,7 @@ export function assertParams(method: string, value: unknown): asserts value is J
     if (method === "reviews.list" && key === "cursor") {
       // An opaque cursor the service sealed; the service rejects forged ones.
       if (item !== null && (typeof item !== "string" || !/^[A-Za-z0-9._-]{1,64}$/.test(item))) throw new Error("Invalid desktop cursor parameter");
-    } else if (method === "reviews.list" && key === "fresh") {
+    } else if ((method === "reviews.list" || method === "reviews.ci_status") && key === "fresh") {
       // An explicit refresh that reads past the service's list cache.
       if (typeof item !== "boolean") throw new Error("Invalid desktop boolean parameter");
     } else if (["per_page", "max_items", "cursor"].includes(key)) {
@@ -104,6 +105,11 @@ function assertResultValue(method: string, value: unknown): asserts value is Jso
     if (value.next_cursor !== null && (typeof value.next_cursor !== "string" || !/^[A-Za-z0-9._-]{1,64}$/.test(value.next_cursor))) fail("next_cursor", "must be null or an opaque cursor of at most 64 characters");
     assertArray(value.items, (item) => { assertKeys(item, ["handle", "repository", "summary"]); text(item.handle); text(item.repository); assertReviewSummary(item.summary); });
     return assertArray(value.failures, (failure) => { assertKeys(failure, ["code", "message", "retryable", "repository"]); text(failure.code); text(failure.message); bool(failure.retryable); nullableText(failure.repository); });
+  }
+  if (method === "reviews.ci_status") {
+    assertKeys(value, ["ci_status"]);
+    if (!(CI_STATUS_VALUES as readonly unknown[]).includes(value.ci_status)) fail("ci_status", "must be a known CI status");
+    return;
   }
   if (method === "reviews.get") {
     assertKeys(value, ["handle", "repository", "detail", "capabilities", "revision", "revision_error"]);

@@ -22,6 +22,7 @@ import {
 } from "../../core/presentation.js";
 import { StaleQueryError, type CoordinatedRead } from "../../core/query.js";
 import { useRetainedRead } from "../../core/use-read.js";
+import { CILookups } from "./ci.js";
 import {
   appendPage,
   feedFailures,
@@ -35,6 +36,7 @@ import {
   type RepositoryFeed,
 } from "./paging.js";
 
+export { CI_LOOKUP_CONCURRENCY, CILookups } from "./ci.js";
 export {
   mergedReviewItems,
   nextRepositoryToLoad,
@@ -157,6 +159,9 @@ const CI_PRIORITY: Readonly<Record<string, number>> = Object.freeze({
   skipped: 5,
   unknown: 6,
 });
+
+/** The CI cell of a row whose lookup has not finished yet. */
+export const CI_LOADING_TEXT = "…";
 
 export function createInboxFeature(): FeatureContribution {
   return {
@@ -385,6 +390,19 @@ function InboxResults({
   // Set by the Refresh button and consumed by the read it starts, so only an
   // explicit refresh reads past the service's list cache.
   const freshRead = useRef(false);
+  // Whether the read whose pages are swapped in when it completes was an
+  // explicit refresh, so its CI lookups read past the CI cache too.
+  const swapFresh = useRef(false);
+  // Rows arrive without CI where the forge would need a request per row, and
+  // each shown row's status is filled in here. Every new list starts a new
+  // generation, so a late lookup never lands on a newer list.
+  const [, setCIVersion] = useState(0);
+  const ciLookups = useRef<CILookups | null>(null);
+  if (ciLookups.current === null)
+    ciLookups.current = new CILookups(bridge, () =>
+      setCIVersion((current) => current + 1),
+    );
+  const ci = ciLookups.current;
   const cancelMoreReads = useCallback(() => {
     const cancelled = new Set(moreReads.current.values());
     for (const key of moreReads.current.keys()) void queries.cancel(key);
@@ -417,10 +435,13 @@ function InboxResults({
     freshRead.current = false;
     const live = !hasValue.current;
     liveRead.current = live;
-    if (live)
+    swapFresh.current = fresh;
+    if (live) {
+      ci.reset(fresh);
       setFeeds(
         Object.freeze(sources.map((source) => pendingFeed(source.handle))),
       );
+    }
     const depths = new Map(loadedDepths.get(readKey) ?? []);
     return listDiscoveredReviews(
       bridge,
@@ -446,6 +467,7 @@ function InboxResults({
   }, [
     bridge,
     cancelMoreReads,
+    ci,
     readKey,
     repositories,
     repository,
@@ -477,9 +499,16 @@ function InboxResults({
     if (!state.value) return;
     hasValue.current = true;
     // A live read already holds these pages and any loaded after them.
-    if (!liveRead.current) setFeeds(state.value.feeds);
+    if (!liveRead.current) {
+      // The refreshed rows replace the shown ones, so their CI is looked up
+      // again and lookups still running for the old rows land nowhere.
+      ci.reset(swapFresh.current);
+      setFeeds(state.value.feeds);
+    }
     liveRead.current = false;
   }, [state.value]);
+  // Leaving the list (a tab or state change remounts it) cancels its lookups.
+  useEffect(() => () => ci.stop(), [ci]);
   useEffect(
     () => () => {
       discoveredRead.current?.abort();
@@ -613,6 +642,7 @@ function InboxResults({
           releaseFocusTarget={releaseFocusTarget}
           emptyLabel={emptyReviewLabel(reviewScope, reviewState)}
           loadMore={loadMore}
+          ci={ci}
         />
       )}
     </>
@@ -832,6 +862,7 @@ function ReviewList({
   releaseFocusTarget,
   emptyLabel,
   loadMore,
+  ci,
 }: {
   readonly feeds: readonly RepositoryFeed[];
   readonly navigate: (route: AppRoute) => void;
@@ -842,9 +873,15 @@ function ReviewList({
   readonly releaseFocusTarget: () => void;
   readonly emptyLabel: string;
   readonly loadMore: (repository: string) => void;
+  readonly ci: CILookups;
 }): ReactNode {
-  const presentation = inboxFeedPresentation(feeds, sort);
+  const presentation = inboxFeedPresentation(feeds, sort, ci);
   const items = presentation.items;
+  // Only the rows the list shows are looked up, in the order shown. Rows that
+  // update-time order still holds back are looked up once they are shown.
+  useEffect(() => {
+    ci.request(items);
+  });
   const listRef = useRef<HTMLDivElement | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const [nearEnd, setNearEnd] = useState(false);
@@ -953,6 +990,7 @@ function ReviewList({
             <ReviewCard
               key={item.handle}
               item={item}
+              ci={ci.shown(item)}
               selected={item.handle === selected}
               open={open}
             />
@@ -995,6 +1033,7 @@ function ReviewList({
 export function inboxFeedPresentation(
   feeds: readonly RepositoryFeed[],
   sort: ReviewSort,
+  ci?: Pick<CILookups, "shown">,
 ): {
   readonly items: readonly ReviewListItemDto[];
   readonly empty: boolean;
@@ -1005,7 +1044,7 @@ export function inboxFeedPresentation(
   const items =
     sort === "updated"
       ? orderedReviewItems(feeds)
-      : sortReviewItems(mergedReviewItems(feeds), sort);
+      : sortReviewItems(mergedReviewItems(feeds), sort, ci);
   const loading = loadingFeedCount(feeds);
   return Object.freeze({
     items,
@@ -1016,10 +1055,18 @@ export function inboxFeedPresentation(
   });
 }
 
+/**
+ * Sort loaded rows. CI order uses the status a lookup found when the list
+ * left it unknown; a row still waiting sorts with the unknown ones, so a row
+ * moves at most once, when its status arrives.
+ */
 export function sortReviewItems(
   items: readonly ReviewListItemDto[],
   sort: ReviewSort,
+  ci?: Pick<CILookups, "shown">,
 ): readonly ReviewListItemDto[] {
+  const ciOf = (item: ReviewListItemDto): string =>
+    (ci ? ci.shown(item) : item.summary.ci_status) ?? "unknown";
   const sorted = [...items];
   sorted.sort((left, right) => {
     const leftSummary = left.summary;
@@ -1031,8 +1078,7 @@ export function sortReviewItems(
       });
     else if (sort === "ci")
       order =
-        (CI_PRIORITY[leftSummary.ci_status] ?? 9) -
-          (CI_PRIORITY[rightSummary.ci_status] ?? 9) ||
+        (CI_PRIORITY[ciOf(left)] ?? 9) - (CI_PRIORITY[ciOf(right)] ?? 9) ||
         leftSummary.title.localeCompare(rightSummary.title, undefined, {
           sensitivity: "base",
         });
@@ -1068,10 +1114,13 @@ function emptyReviewLabel(
 
 const ReviewCard = memo(function ReviewCard({
   item,
+  ci,
   selected,
   open,
 }: {
   readonly item: ReviewListItemDto;
+  /** The CI status to show, or null while its lookup runs. */
+  readonly ci: string | null;
   readonly selected: boolean;
   readonly open: (item: ReviewListItemDto) => void;
 }): ReactNode {
@@ -1084,9 +1133,19 @@ const ReviewCard = memo(function ReviewCard({
       aria-current={selected ? "true" : undefined}
       onClick={() => open(item)}
     >
-      <span className={`state state-${item.summary.ci_status}`}>
-        {item.summary.ci_status}
-      </span>
+      {ci === null ? (
+        <span
+          className="state state-loading"
+          data-ci-loading="true"
+          title="Loading CI status"
+        >
+          {CI_LOADING_TEXT}
+        </span>
+      ) : (
+        <span className={`state state-${ci}`} data-ci-status={ci}>
+          {ci}
+        </span>
+      )}
       <span className="review-number">#{item.summary.number}</span>
       <strong className="review-title">{item.summary.title}</strong>
       <span className="review-meta">

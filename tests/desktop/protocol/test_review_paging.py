@@ -18,6 +18,7 @@ import pytest_asyncio
 from tongs.cache.cached_client import CachedForgeClient
 from tongs.cache.store import CacheStore
 from tongs.config import Config
+from tongs.desktop.protocol import server as server_module
 from tongs.desktop.protocol.messages import (
     MAX_JSON_ITEMS,
     JsonObject,
@@ -61,7 +62,10 @@ def _pull(project: str, number: int, updated: datetime) -> dict[str, object]:
         "state": "open",
         "draft": False,
         "user": {"login": f"author-{number % 17}"},
-        "head": {"ref": f"feature/{number}", "sha": f"sha-{project}-{number}"},
+        "head": {
+            "ref": f"feature/{number}",
+            "sha": f"head-{project.split('/')[1]}-{number}",
+        },
         "base": {"ref": "main", "sha": "base"},
         "created_at": stamp,
         "updated_at": stamp,
@@ -90,6 +94,9 @@ class _Forge:
         self.list_requests: list[tuple[str, dict[str, str]]] = []
         self.allow_unsorted = False
         self.ci_requests: list[str] = []
+        self.status_requests: list[str] = []
+        self.detail_requests: list[str] = []
+        self.conclusion = "success"
         self.rate_limited: dict[str, dict[str, str]] = {}
         self.rate_limited_requests: list[str] = []
 
@@ -108,6 +115,10 @@ class _Forge:
                 headers=headers,
             )
         for project, pulls in self.pulls.items():
+            for pull in pulls:
+                if path == f"/repos/{project}/pulls/{pull['number']}":
+                    self.detail_requests.append(path)
+                    return httpx.Response(200, json=pull)
             if path == f"/repos/{project}/pulls":
                 params = dict(request.url.params)
                 self.list_requests.append((project, params))
@@ -140,13 +151,16 @@ class _Forge:
                 return httpx.Response(
                     200,
                     json={
-                        "check_runs": [{"status": "completed", "conclusion": "success"}]
+                        "check_runs": [
+                            {"status": "completed", "conclusion": self.conclusion}
+                        ]
                     },
                 )
             if path.startswith(f"/repos/{project}/commits/") and path.endswith(
                 "/status"
             ):
                 # The commit's legacy statuses, read beside its check runs.
+                self.status_requests.append(path)
                 return httpx.Response(200, json={"total_count": 0, "statuses": []})
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
@@ -289,6 +303,7 @@ async def _serve(
         assert all(params["per_page"] == "1" for _, params in forge.list_requests)
         forge.list_requests.clear()
         forge.ci_requests.clear()
+        forge.status_requests.clear()
         yield wire, forge, handles
         await wire.call("shutdown", {})
         await asyncio.wait_for(running, 5)
@@ -300,7 +315,7 @@ async def _serve(
 
 
 @pytest.mark.asyncio
-async def test_huge_repository_first_read_is_one_page_with_page_ci_only(
+async def test_huge_repository_first_read_is_one_page_without_ci_requests(
     wired: tuple[_Wire, _Forge, dict[str, str]],
 ) -> None:
     wire, forge, handles = wired
@@ -319,8 +334,10 @@ async def test_huge_repository_first_read_is_one_page_with_page_ci_only(
     assert isinstance(first["next_cursor"], str)
     assert len(forge.list_requests) == 1
     assert forge.list_requests[0][1]["page"] == "1"
-    assert len(forge.ci_requests) == 100
-    assert all(cast(dict, item["summary"])["ci_status"] == "success" for item in items)
+    # CI is filled in per shown row through reviews.ci_status instead.
+    assert forge.ci_requests == []
+    assert forge.status_requests == []
+    assert all(cast(dict, item["summary"])["ci_status"] == "unknown" for item in items)
 
 
 @pytest.mark.asyncio
@@ -338,9 +355,9 @@ async def test_every_page_of_a_huge_repository_stays_under_the_value_budget(
             cast(dict, item["summary"])["number"]
             for item in cast(list[dict[str, object]], result["items"])
         )
-        # Each read makes one list request and CI lookups for its own page.
+        # Each read makes one list request and no CI lookups.
         assert len(forge.list_requests) == pages
-        assert len(forge.ci_requests) == len(seen)
+        assert forge.ci_requests == []
         if result["next_cursor"] is None:
             break
         params = {**params, "cursor": result["next_cursor"]}
@@ -362,7 +379,7 @@ async def test_small_repository_has_no_next_cursor(
     )
     assert len(cast(list[object], result["items"])) == 3
     assert result["next_cursor"] is None
-    assert len(forge.ci_requests) == 3
+    assert forge.ci_requests == []
 
 
 @pytest.mark.asyncio
@@ -535,6 +552,7 @@ async def test_plugin_reads_of_reviews_keep_the_whole_list(
         )
     )
     forge.list_requests.clear()
+    forge.ci_requests.clear()
     context = _plugin_context(wire.server)
 
     result = await context.read(
@@ -547,6 +565,9 @@ async def test_plugin_reads_of_reviews_keep_the_whole_list(
     assert result["failures"] == ()
     numbers = sorted(item["summary"]["number"] for item in result["items"])
     assert numbers == list(range(1, 106))
+    # Providers were written against rows that carry CI, so they still do.
+    assert {item["summary"]["ci_status"] for item in result["items"]} == {"success"}
+    assert len(forge.ci_requests) == 105
     assert [params["page"] for _, params in forge.list_requests] == ["1", "2"]
 
     # The wire read of the same repository still stops at one page.
@@ -636,3 +657,140 @@ async def test_rate_limited_page_is_a_rate_limited_failure(
     ]
     # Without a reset time the read waits the default delay and retries once.
     assert forge.rate_limited_requests == ["/repos/acme/small/pulls"] * 2
+
+
+async def _listed(wire: _Wire, repository: str) -> list[dict[str, object]]:
+    result = _result(
+        await wire.call("reviews.list", {"scope": "all_open", "repository": repository})
+    )
+    return cast(list[dict[str, object]], result["items"])
+
+
+@pytest.mark.asyncio
+async def test_ci_status_reads_one_review_at_its_listed_head(
+    wired: tuple[_Wire, _Forge, dict[str, str]],
+) -> None:
+    wire, forge, handles = wired
+    items = await _listed(wire, handles["acme/small"])
+    assert [cast(dict, item["summary"])["ci_status"] for item in items] == [
+        "unknown"
+    ] * 3
+
+    result = _result(
+        await wire.call("reviews.ci_status", {"review": items[1]["handle"]})
+    )
+
+    assert result == {"ci_status": "success"}
+    # The head commit comes from the list read: no pull request read, and
+    # one check-run and one commit-status request for that commit only.
+    assert forge.detail_requests == []
+    assert forge.ci_requests == ["/repos/acme/small/commits/head-small-9001/check-runs"]
+    assert forge.status_requests == ["/repos/acme/small/commits/head-small-9001/status"]
+
+
+@pytest.mark.asyncio
+async def test_ci_status_is_cached_until_a_fresh_lookup(tmp_path: Path) -> None:
+    async with _serve(tmp_path, cached=True) as (wire, forge, handles):
+        items = await _listed(wire, handles["acme/small"])
+        review = items[0]["handle"]
+        first = _result(await wire.call("reviews.ci_status", {"review": review}))
+        assert first == {"ci_status": "success"}
+        assert len(forge.ci_requests) == 1
+
+        # The run fails meanwhile; a plain lookup still serves the cached one.
+        forge.conclusion = "failure"
+        cached = _result(await wire.call("reviews.ci_status", {"review": review}))
+        assert cached == {"ci_status": "success"}
+        assert len(forge.ci_requests) == 1
+
+        fresh = _result(
+            await wire.call("reviews.ci_status", {"review": review, "fresh": True})
+        )
+        assert fresh == {"ci_status": "failed"}
+        assert len(forge.ci_requests) == 2
+        after = _result(
+            await wire.call("reviews.ci_status", {"review": review, "fresh": False})
+        )
+        assert after == {"ci_status": "failed"}
+        assert len(forge.ci_requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_ci_status_follows_the_head_of_the_latest_list_read(
+    tmp_path: Path,
+) -> None:
+    async with _serve(tmp_path, cached=True) as (wire, forge, handles):
+        params: JsonObject = {"scope": "all_open", "repository": handles["acme/small"]}
+        items = await _listed(wire, handles["acme/small"])
+        review = items[0]["handle"]
+        forge.pulls["acme/small"][0]["head"] = {"ref": "feature/9000", "sha": "pushed"}
+        _result(await wire.call("reviews.list", {**params, "fresh": True}))
+
+        result = _result(await wire.call("reviews.ci_status", {"review": review}))
+
+        assert result == {"ci_status": "success"}
+        assert forge.ci_requests == ["/repos/acme/small/commits/pushed/check-runs"]
+
+
+@pytest.mark.asyncio
+async def test_ci_status_without_a_remembered_head_reads_the_review_first(
+    wired: tuple[_Wire, _Forge, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The remembered heads are bounded; the oldest one goes first."""
+    monkeypatch.setattr(server_module, "_MAX_REVIEW_HEADS", 2)
+    wire, forge, handles = wired
+    items = await _listed(wire, handles["acme/small"])
+
+    oldest = _result(
+        await wire.call("reviews.ci_status", {"review": items[0]["handle"]})
+    )
+    newest = _result(
+        await wire.call("reviews.ci_status", {"review": items[2]["handle"]})
+    )
+
+    assert oldest == newest == {"ci_status": "success"}
+    assert forge.detail_requests == ["/repos/acme/small/pulls/9000"]
+    assert forge.ci_requests == [
+        "/repos/acme/small/commits/head-small-9000/check-runs",
+        "/repos/acme/small/commits/head-small-9002/check-runs",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ci_status_rejects_malformed_requests_before_the_forge(
+    wired: tuple[_Wire, _Forge, dict[str, str]],
+) -> None:
+    wire, forge, handles = wired
+    items = await _listed(wire, handles["acme/small"])
+    review = items[0]["handle"]
+    cases: list[tuple[JsonObject, str]] = [
+        ({}, "invalid_params"),
+        ({"review": review, "head_sha": "abc"}, "invalid_params"),
+        ({"review": review, "repository": handles["acme/small"]}, "invalid_params"),
+        ({"review": review, "fresh": "true"}, "invalid_params"),
+        ({"review": review, "fresh": 1}, "invalid_params"),
+        ({"review": review, "fresh": None}, "invalid_params"),
+        ({"review": "forged-handle"}, "invalid_handle"),
+        ({"review": 7}, "invalid_handle"),
+        ({"review": None}, "invalid_handle"),
+        ({"review": handles["acme/small"]}, "wrong_handle_kind"),
+    ]
+    for params, code in cases:
+        frame = await wire.call("reviews.ci_status", params)
+        error = cast(dict[str, object], frame["error"])
+        assert error["code"] == code, params
+    assert forge.ci_requests == []
+    assert forge.status_requests == []
+    assert forge.detail_requests == []
+
+
+@pytest.mark.asyncio
+async def test_ci_status_is_an_advertised_read(
+    wired: tuple[_Wire, _Forge, dict[str, str]],
+) -> None:
+    wire, _forge, _handles = wired
+    # The handshake advertises every registered operation.
+    assert "reviews.ci_status" in server_module.SUPPORTED_METHODS
+    operation = wire.server._operations["reviews.ci_status"]
+    assert operation.mutation is False

@@ -58,6 +58,7 @@ export const methods = [
   "review_submissions.resume",
   "review_submissions.start",
   "review_submissions.status",
+  "reviews.ci_status",
   "reviews.get",
   "reviews.list",
   "utilities.cache_clear",
