@@ -403,6 +403,63 @@ test("a paused submission returns to editing beside Resume without sending more"
   );
 });
 
+test("a refused start adopts the stored draft version before the next save", async () => {
+  const review = "review-drawer-start-refused";
+  const kept = content({ body: "Kept summary", verdict: "approve" });
+  const reads = [];
+  const saves = [];
+  let starts = 0;
+  const view = renderDiff(
+    diffBridge(review, {
+      listReviewDrafts: () =>
+        read({ cursor: 0, next_cursor: null, drafts: [draft(review, 2, kept)] }),
+      startReviewSubmission: async () => {
+        starts += 1;
+        throw {
+          code: "revision_changed",
+          message: "The draft revision changed. Refresh its anchors before submitting.",
+          retryable: true,
+        };
+      },
+      // The refused start locked version 2 and released it, so the store now
+      // holds version 4 of the same draft.
+      getReviewDraft: (params) => {
+        reads.push(params.draft_id);
+        return read(draft(review, 4, kept));
+      },
+      saveReviewDraft: async (params) => {
+        saves.push(params);
+        return draft(review, params.expected_version + 1, params.content);
+      },
+    }),
+    review,
+  );
+  fireEvent.click(await view.findByRole("button", { name: /Your review/ }));
+  await view.findByText("Version 2");
+  fireEvent.click(await view.findByRole("button", { name: "Submit review" }));
+  fireEvent.click(
+    await view.findByRole("button", { name: "Confirm submit review" }),
+  );
+  await view.findByText("Version 4");
+  await view.findByText(/The review revision changed/);
+
+  assert.equal(starts, 1);
+  assert.equal(reads.at(-1), DRAFT_ID);
+  assert.equal(view.getByLabelText("Summary").value, "Kept summary");
+  assert.equal(view.queryAllByText("Version 2").length, 0);
+
+  fireEvent.change(view.getByLabelText("Summary"), {
+    target: { value: "Kept summary, revised" },
+  });
+  fireEvent.click(
+    view.getByRole("button", { name: "Save summary and verdict" }),
+  );
+  await waitFor(() => assert.equal(saves.length, 1));
+  assert.equal(saves[0].expected_version, 4);
+  assert.equal(saves[0].content.body, "Kept summary, revised");
+  await view.findByText("Version 5");
+});
+
 test("a zero-step interrupted attempt only offers returning to editing", async () => {
   const review = "review-drawer-zero-step-recovery";
   const attempt = {

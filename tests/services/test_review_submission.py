@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1302,4 +1304,241 @@ async def test_paused_attempt_owned_by_another_process_is_not_returned(
     assert store.holds_attempt(paused.attempt_id)
     assert (await store.get_draft(draft.id)).state is DraftState.SUBMITTING
     await other_store.close()
+    await store.close()
+
+
+async def _cancel_while_gated(
+    store: DraftStore,
+    method: str,
+    call: Callable[[], object],
+) -> asyncio.Task[object]:
+    """Cancel a service call while one store transition is in flight.
+
+    The real transition commits, then its return is held at a gate until the
+    caller's cancellation is delivered, so the test observes what the service
+    does with a transition that committed after its caller went away.
+    """
+    real = getattr(store, method)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated(*args: object, **kwargs: object) -> object:
+        result = await real(*args, **kwargs)
+        entered.set()
+        await release.wait()
+        return result
+
+    setattr(store, method, gated)
+    task = asyncio.ensure_future(call())  # type: ignore[arg-type]
+    await entered.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    delattr(store, method)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_cancel_inside_lock_returns_draft_to_editing_and_propagates(
+    tmp_path: Path,
+) -> None:
+    content = _content(GeneralDraftComment(uuid4(), "comment"), body="summary")
+    store, service, client, _, draft = await _services(tmp_path / "drafts.db", content)
+
+    task = await _cancel_while_gated(
+        store,
+        "lock_submission",
+        lambda: service.start(draft.id, draft.version),
+    )
+
+    assert task.cancelled()
+    saved = await store.get_draft(draft.id)
+    assert saved.state is DraftState.EDITABLE
+    _assert_draft_content(saved, content)
+    assert await store.list_recovery_attempts(include_owned=True) == ()
+    client.add_comment.assert_not_awaited()
+    client.submit_review.assert_not_awaited()
+    progress = await service.start(saved.id, saved.version)
+    assert progress.outcome is SubmissionOutcome.SUBMITTED
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_inside_lock_with_failed_cancel_parks_attempt_unknown(
+    tmp_path: Path,
+) -> None:
+    content = _content(GeneralDraftComment(uuid4(), "comment"))
+    store, service, client, _, draft = await _services(tmp_path / "drafts.db", content)
+    store.cancel_submission = AsyncMock(  # type: ignore[method-assign]
+        side_effect=DraftStoreError("disk full")
+    )
+
+    await _cancel_while_gated(
+        store,
+        "lock_submission",
+        lambda: service.start(draft.id, draft.version),
+    )
+    del store.cancel_submission
+
+    (attempt,) = await store.list_recovery_attempts(include_owned=True)
+    assert attempt.state is DraftState.UNKNOWN
+    assert not store.holds_attempt(attempt.id)
+    assert (await store.get_draft(draft.id)).state is DraftState.UNKNOWN
+    client.add_comment.assert_not_awaited()
+    editable = await service.reconcile(
+        attempt.id, ReconciliationResolution.RETURN_EDITABLE
+    )
+    assert editable.outcome is SubmissionOutcome.EDITABLE
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resolution", "draft_state"),
+    [
+        (ReconciliationResolution.RETRY_REMAINING, DraftState.UNKNOWN),
+        (ReconciliationResolution.RETURN_EDITABLE, DraftState.EDITABLE),
+        (ReconciliationResolution.MARK_SUBMITTED, DraftState.SUBMITTED),
+    ],
+)
+async def test_cancel_inside_reconcile_never_leaves_an_owned_submitting_attempt(
+    tmp_path: Path,
+    resolution: ReconciliationResolution,
+    draft_state: DraftState,
+) -> None:
+    add = AsyncMock(side_effect=NetworkError("timeout"))
+    store, service, _, _, draft = await _services(
+        tmp_path / "drafts.db",
+        _content(GeneralDraftComment(uuid4(), "comment")),
+        client=_client(add_comment=add),
+    )
+    unknown = await service.start(draft.id, draft.version)
+    assert unknown.outcome is SubmissionOutcome.UNKNOWN
+
+    task = await _cancel_while_gated(
+        store,
+        "reconcile_attempt",
+        lambda: service.reconcile(unknown.attempt_id, resolution),
+    )
+
+    assert task.cancelled()
+    assert not store.holds_attempt(unknown.attempt_id)
+    assert (await store.get_draft(draft.id)).state is draft_state
+    historical = await store.get_attempt(unknown.attempt_id)
+    assert [item.resolution for item in historical.reconciliations] == [resolution]
+    assert add.await_count == 1
+    if draft_state is DraftState.UNKNOWN:
+        assert historical.state is DraftState.UNKNOWN
+        assert [item.id for item in await store.list_recovery_attempts()] == [
+            unknown.attempt_id
+        ]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_retry_remaining_whose_preflight_fails_returns_to_unknown(
+    tmp_path: Path,
+) -> None:
+    add = AsyncMock(
+        side_effect=[NetworkError("timeout"), ForgeMutationResult("done", "done")]
+    )
+    client = _client(add_comment=add)
+    current = _snapshot()
+    store = DraftStore(tmp_path / "drafts.db")
+    await store.open()
+    draft = await store.create_draft(
+        current.ref, REVISION, _content(GeneralDraftComment(uuid4(), "comment"))
+    )
+    get_review = AsyncMock(return_value=current)
+    service = ReviewSubmissionService(
+        store=store,
+        mutations=_mutation_service(client, current),
+        get_review=get_review,
+    )
+    unknown = await service.start(draft.id, draft.version)
+    get_review.return_value = _snapshot(
+        revision=ReviewRevision("head-2", "base-1", "start-1")
+    )
+
+    with pytest.raises(ServiceError) as raised:
+        await service.reconcile(
+            unknown.attempt_id, ReconciliationResolution.RETRY_REMAINING
+        )
+
+    assert raised.value.code is ServiceErrorCode.REVISION_CHANGED
+    assert not store.holds_attempt(unknown.attempt_id)
+    assert (await store.get_attempt(unknown.attempt_id)).state is DraftState.UNKNOWN
+    assert (await store.get_draft(draft.id)).state is DraftState.UNKNOWN
+    assert [item.id for item in await store.list_recovery_attempts()] == [
+        unknown.attempt_id
+    ]
+    assert add.await_count == 1
+
+    get_review.return_value = current
+    submitted = await service.reconcile(
+        unknown.attempt_id, ReconciliationResolution.RETRY_REMAINING
+    )
+    assert submitted.outcome is SubmissionOutcome.SUBMITTED
+    assert add.await_count == 2
+    await store.close()
+
+
+def _persist_anchor(db_path: Path, draft_id: object, **changes: object) -> None:
+    """Rewrite the stored inline anchors of one draft row in place."""
+    with sqlite3.connect(db_path) as db:
+        (raw,) = db.execute(
+            "SELECT comments_json FROM drafts WHERE id = ?", (str(draft_id),)
+        ).fetchone()
+        comments = json.loads(raw)
+        for comment in comments:
+            if comment["kind"] == "inline":
+                comment["anchor"].update(changes)
+        db.execute(
+            "UPDATE drafts SET comments_json = ? WHERE id = ?",
+            (json.dumps(comments), str(draft_id)),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("matching", [True, False], ids=["matching", "mismatched"])
+async def test_persisted_stale_anchor_is_judged_by_its_revision_alone(
+    tmp_path: Path, matching: bool
+) -> None:
+    db_path = tmp_path / "drafts.db"
+    current = _snapshot()
+    store = DraftStore(db_path)
+    await store.open()
+    draft = await store.create_draft(
+        current.ref, REVISION, _content(InlineDraftComment(uuid4(), "note", _anchor()))
+    )
+    await store.close()
+    changes: dict[str, object] = {"stale": True}
+    if not matching:
+        changes["revision"] = {
+            "head_sha": "head-0",
+            "base_sha": REVISION.base_sha,
+            "start_sha": REVISION.start_sha,
+        }
+    _persist_anchor(db_path, draft.id, **changes)
+    store = DraftStore(db_path)
+    await store.open()
+    client = _client()
+    service = ReviewSubmissionService(
+        store=store,
+        mutations=_mutation_service(client, current),
+        get_review=AsyncMock(return_value=current),
+    )
+
+    if matching:
+        progress = await service.start(draft.id, draft.version)
+        assert progress.outcome is SubmissionOutcome.SUBMITTED
+        client.submit_review.assert_awaited_once()
+    else:
+        with pytest.raises(ServiceError) as raised:
+            await service.start(draft.id, draft.version)
+        assert raised.value.code is ServiceErrorCode.REVISION_CHANGED
+        assert (await store.get_draft(draft.id)).state is DraftState.EDITABLE
+        client.submit_review.assert_not_awaited()
     await store.close()

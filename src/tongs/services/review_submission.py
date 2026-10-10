@@ -145,7 +145,12 @@ class ReviewSubmissionService:
         """Freeze an exact draft version, preflight it, then submit its plan."""
         operation = await self._enter_operation()
         try:
-            attempt = await self._store.lock_submission(draft_id, expected_version)
+            attempt, cancelled = await _finish_critical_state(
+                self._store.lock_submission(draft_id, expected_version)
+            )
+            if cancelled:
+                await self._release_cancelled_lock(attempt.id)
+                raise asyncio.CancelledError
             lock = self._attempt_lock(attempt.id)
             async with lock:
                 try:
@@ -217,18 +222,33 @@ class ReviewSubmissionService:
                     plan = self._stored_plan(attempt)
                     confirmed = self._confirmed_content(attempt)
                     content = editable_remainder(attempt, confirmed)
-                    reconciled = await self._store.reconcile_attempt(
-                        attempt_id, resolution, editable_content=content
+                    reconciled, cancelled = await _finish_critical_state(
+                        self._store.reconcile_attempt(
+                            attempt_id, resolution, editable_content=content
+                        )
                     )
+                    if cancelled:
+                        raise asyncio.CancelledError
                     return self._progress(reconciled, plan, SubmissionOutcome.EDITABLE)
-                reconciled = await self._store.reconcile_attempt(attempt_id, resolution)
+                reconciled, cancelled = await _finish_critical_state(
+                    self._store.reconcile_attempt(attempt_id, resolution)
+                )
                 if resolution == ReconciliationResolution.MARK_SUBMITTED:
+                    if cancelled:
+                        raise asyncio.CancelledError
                     return self._progress(
                         reconciled,
                         self._stored_plan(reconciled),
                         SubmissionOutcome.SUBMITTED,
                     )
-                reconciled, plan = await self._preflight(reconciled)
+                if cancelled:
+                    await self._park_unknown(attempt_id, "retry_cancelled")
+                    raise asyncio.CancelledError
+                try:
+                    reconciled, plan = await self._preflight(reconciled)
+                except BaseException as error:
+                    await self._unknown_before_reraise(attempt_id, error)
+                    raise
                 return await self._advance(reconciled, plan)
         finally:
             self._active_tasks.discard(operation)
@@ -349,9 +369,9 @@ class ReviewSubmissionService:
                 "GitLab did not provide a complete review revision.",
             )
         for comment in attempt.snapshot.comments:
-            if isinstance(comment, InlineDraftComment) and (
-                comment.anchor.stale
-                or comment.anchor.revision != attempt.snapshot.revision
+            if (
+                isinstance(comment, InlineDraftComment)
+                and comment.anchor.revision != attempt.snapshot.revision
             ):
                 raise ServiceError(
                     ServiceErrorCode.REVISION_CHANGED,
@@ -612,6 +632,46 @@ class ReviewSubmissionService:
     ) -> None:
         try:
             await self._cancel_predispatch(attempt_id)
+        except BaseException:
+            if not isinstance(original, Exception):
+                raise original
+            raise
+
+    async def _release_cancelled_lock(self, attempt_id: UUID) -> None:
+        """Undo a submission lock whose caller was cancelled while it landed.
+
+        Nothing was dispatched, so the attempt is cancelled and its draft is
+        editable again. If that write fails, the attempt is recorded as
+        outcome-unknown instead, which also releases this process's
+        ownership, so it is never left owned and submitting with no caller.
+        If both writes fail, ownership is still released and startup recovery
+        finds the attempt; the caller's cancellation is what propagates.
+        """
+        try:
+            await self._cancel_predispatch(attempt_id)
+        except DraftStoreError:
+            try:
+                await self._park_unknown(attempt_id, "lock_cancelled")
+            except DraftStoreError:
+                pass
+
+    async def _park_unknown(self, attempt_id: UUID, reason: str) -> None:
+        """Record an owned attempt that will not advance as outcome-unknown.
+
+        A retry decision makes this process own the attempt again; when the
+        retry stops before any dispatch, the attempt returns to the same
+        outcome-unknown state the user decided from. Ownership is released
+        even when the write fails.
+        """
+        await _finish_critical(
+            self._store.mark_attempt_unknown(attempt_id, reason=reason)
+        )
+
+    async def _unknown_before_reraise(
+        self, attempt_id: UUID, original: BaseException
+    ) -> None:
+        try:
+            await self._park_unknown(attempt_id, "retry_preflight_failed")
         except BaseException:
             if not isinstance(original, Exception):
                 raise original

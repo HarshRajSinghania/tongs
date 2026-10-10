@@ -95,9 +95,13 @@ class InlineAnchor:
             raise ValueError("context_fingerprint is required")
 
     def assessed_against(self, current_revision: ReviewRevision) -> InlineAnchor:
-        """Mark the anchor stale when any captured revision identity differs."""
-        stale = self.stale or current_revision != self.revision
-        return replace(self, stale=stale)
+        """Return the anchor marked stale exactly when its revision differs.
+
+        Staleness is derived from the revisions alone, so an earlier
+        assessment never sticks: an anchor whose captured revision matches the
+        current one is fresh again.
+        """
+        return replace(self, stale=current_revision != self.revision)
 
 
 @dataclass(frozen=True, slots=True)
