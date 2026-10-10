@@ -342,3 +342,96 @@ async def test_failures_still_warn_once_every_repository_is_done(
             "The requested forge resource was not found."
         )
         assert all_open_notices(app) == [expected]
+
+
+@pytest.mark.asyncio
+async def test_each_repository_builds_only_its_own_rows(tmp_path: Path) -> None:
+    # Every repository's merge requests fall in among the rows already shown,
+    # so a table that rebuilt every row per repository would build about
+    # repositories * rows / 2 rows here instead of one per merge request.
+    repositories = 40
+    per_repository = 5
+    projects = [f"acme/repo{index}" for index in range(repositories)]
+    client = GatedForgeClient(
+        [
+            summary(project, offset * 100 + index + 1, offset * repositories + index)
+            for index, project in enumerate(projects)
+            for offset in range(per_repository)
+        ]
+    )
+    app = build(tmp_path, client, projects)
+    built: list[str] = []
+    clears: list[bool] = []
+    merges: list[int] = []
+
+    async with app.run_test(notifications=True) as pilot:
+        await settle(app)
+        table = app.screen.query_one("#all-open-table", MRTable)
+        add_row = table.add_row
+        clear = table.clear
+        merge_mrs = table.merge_mrs
+
+        def counting_add_row(*cells: object, **kwargs: object) -> object:
+            built.append(str(kwargs["key"]))
+            return add_row(*cells, **kwargs)
+
+        def counting_clear(*args: object, **kwargs: object) -> MRTable:
+            clears.append(True)
+            return clear(*args, **kwargs)
+
+        def counting_merge(*args: object, **kwargs: object) -> None:
+            merges.append(table.row_count)
+            merge_mrs(*args, **kwargs)
+
+        table.add_row = counting_add_row
+        table.clear = counting_clear
+        table.merge_mrs = counting_merge
+        await pilot.press("3")
+        await settle(app)
+
+        total = repositories * per_repository
+        assert table.row_count == total
+        assert (
+            status_text(app) == f"{total} open MRs across {repositories} repositories"
+        )
+        assert len(built) == total
+        assert len(set(built)) == total
+        # One step per repository, each landing among the rows already shown.
+        assert len(merges) == repositories
+        assert len(clears) == 1
+        assert all_open_notices(app) == []
+        # The rows were moved, not rebuilt, and still read newest first.
+        ordered = [table._mr_data[row.key.value] for row in table.ordered_rows]
+        ages = [NOW - mr.updated_at for mr in ordered]
+        assert ages == sorted(ages)
+        for index, row in enumerate(table.ordered_rows):
+            assert table.get_row_index(row.key) == index
+            number = str(table.get_row_at(index)[2])
+            assert number == str(table._mr_data[row.key.value].number)
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_merge_request_replaces_its_row(tmp_path: Path) -> None:
+    client = GatedForgeClient([summary("acme/fast", 1, 5), summary("acme/slow", 2, 1)])
+    app = build(tmp_path, client, ["acme/fast", "acme/slow"])
+
+    async with app.run_test(notifications=True) as pilot:
+        await settle(app)
+        await pilot.press("3")
+        await settle(app)
+        table = app.screen.query_one("#all-open-table", MRTable)
+        assert numbers(table) == [2, 1]
+        table.focus()
+        await pilot.press("down")
+
+        table.merge_mrs(
+            [summary("acme/fast", 1, 0, "Edited"), summary("acme/fast", 3, 3)]
+        )
+
+        assert numbers(table) == [1, 2, 3]
+        assert table.row_count == 3
+        assert str(table.get_row_at(0)[3]).strip() == "Edited"
+        selected = table.get_selected_mr()
+        assert selected is not None
+        assert selected.number == 1
+        assert selected.title == "Edited"
