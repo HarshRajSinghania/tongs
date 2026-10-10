@@ -543,6 +543,40 @@ test("in CI order rows re-sort once the shown lookups settle and keep focus", as
   assert.deepEqual(cardCI(view), ["A11:failed", "A10:running", "A12:success"]);
 });
 
+test("in CI order a refresh that changes a known status re-sorts that row", async () => {
+  const bridge = ciBridge();
+  const view = render(
+    createInboxFeature().render(
+      featureContext(bridge.bridge, [repository("repo-a")]),
+      { kind: "inbox" },
+    ),
+  );
+  fireEvent.change(view.getByLabelText("Sort reviews"), {
+    target: { value: "ci" },
+  });
+  await waitFor(() => assert.equal(bridge.lists.size, 1));
+  bridge.respondList("all_open:repo-a", {
+    items: [reviewItem("A12", "failed"), reviewItem("A11", "success")],
+    failures: [],
+    next_cursor: null,
+  });
+  await waitFor(() => assert.deepEqual(cardTitles(view), ["A12", "A11"]));
+  await new Promise((resolve) => setTimeout(resolve, CI_SORT_SETTLE_MS * 3));
+
+  // Every status comes with the list, so no lookup runs to settle.
+  fireEvent.click(view.getByRole("button", { name: "Refresh reviews" }));
+  await waitFor(() => assert.equal(bridge.lists.size, 1));
+  bridge.respondList("all_open:repo-a", {
+    items: [reviewItem("A12", "success"), reviewItem("A11", "success")],
+    failures: [],
+    next_cursor: null,
+  });
+  await waitFor(() =>
+    assert.deepEqual(cardCI(view), ["A11:success", "A12:success"]),
+  );
+  assert.equal(bridge.calls.length, 0);
+});
+
 test("rows the list already knows the CI of are not looked up", async () => {
   const bridge = ciBridge();
   const view = render(

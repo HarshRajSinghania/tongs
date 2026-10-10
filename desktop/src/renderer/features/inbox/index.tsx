@@ -1198,13 +1198,18 @@ export function inboxFeedPresentation(
 /** The CI status a row sorts by, or null while it has none. */
 export type CIOrder = { readonly shown: (item: ReviewListItemDto) => string | null };
 
-/** The CI statuses the list sorts by, as known now. */
+/**
+ * The CI statuses lookups have found so far, which the list sorts by until
+ * they settle again. Rows whose status came with the list are left out: they
+ * always sort by their live status, so a refresh that changes one re-sorts it.
+ */
 function settledCIOrder(
   items: readonly ReviewListItemDto[],
   ci: CILookups,
 ): ReadonlyMap<string, string> {
   const order = new Map<string, string>();
   for (const item of items) {
+    if (item.summary.ci_status !== "unknown") continue;
     const shown = ci.shown(item);
     if (shown !== null && shown !== CI_UNAVAILABLE) order.set(item.handle, shown);
   }
@@ -1221,12 +1226,16 @@ function sameOrder(
   return true;
 }
 
-/** Sort by settled statuses; a row found since sorts as its list said. */
+/**
+ * Sort a row the list knows by its live status, and a row it left unknown by
+ * the status lookups had found when they last settled.
+ */
 function orderedCI(order: ReadonlyMap<string, string>): CIOrder {
   return {
     shown: (item) =>
-      order.get(item.handle) ??
-      (item.summary.ci_status === "unknown" ? null : item.summary.ci_status),
+      item.summary.ci_status !== "unknown"
+        ? item.summary.ci_status
+        : (order.get(item.handle) ?? null),
   };
 }
 
