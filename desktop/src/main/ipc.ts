@@ -418,6 +418,7 @@ function safeMutationError(error: unknown): {
 
 const SAFE_REVIEW_ERROR_CODES = new Set([
   "authentication_failed",
+  "capacity_exhausted",
   "closed",
   "configuration_invalid",
   "conflict",

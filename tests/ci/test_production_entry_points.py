@@ -87,7 +87,7 @@ INSTALL_PROVIDES: dict[str, frozenset[str]] = {
     | frozenset({"jsonschema"}),
     "python -I -m pip install --isolated --disable-pip-version-check "
     "--no-deps --no-build-isolation -e .": frozenset({"tongs"}),
-    "python -m pip install ruff": frozenset(),
+    'python -m pip install -e ".[dev,lint]"': CORE_MODULES | DEV_MODULES,
     "python -m pip install ./examples/desktop-plugin": frozenset(),
 }
 

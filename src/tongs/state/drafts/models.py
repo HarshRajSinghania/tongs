@@ -12,6 +12,13 @@ from uuid import UUID, uuid4
 
 from tongs.scanner.repo import ForgeType
 from tongs.services.models import ReviewRef, ReviewRevision
+from tongs.state.drafts.errors import DraftStoreError
+
+#: The largest review summary or comment body a draft may hold, in UTF-8 bytes.
+MAX_DRAFT_BODY_BYTES = 65_536
+#: The most comments one draft may hold.
+MAX_DRAFT_COMMENTS = 200
+_ALLOWED_CONTROL_CHARACTERS = frozenset("\t\n")
 
 
 class DraftState(str, Enum):
@@ -180,6 +187,52 @@ class DraftContent:
                 )
             comments.append(comment)
         return replace(self, comments=tuple(comments))
+
+
+class DraftLimitError(DraftStoreError):
+    """Raised when draft content breaks a draft limit; the message is user-safe."""
+
+
+def draft_text_problem(text: object) -> str | None:
+    """Return why ``text`` breaks the draft body limits, or ``None`` if it fits.
+
+    A body is UTF-8 text of at most :data:`MAX_DRAFT_BODY_BYTES` bytes with no
+    control characters other than tab and newline. The returned phrase never
+    quotes the text.
+    """
+    if not isinstance(text, str):
+        return "is not text"
+    if any(
+        ord(character) < 32 and character not in _ALLOWED_CONTROL_CHARACTERS
+        for character in text
+    ):
+        return "contains a control character; only tab and newline are allowed"
+    try:
+        size = len(text.encode("utf-8"))
+    except UnicodeEncodeError:
+        return "contains text that cannot be stored"
+    if size > MAX_DRAFT_BODY_BYTES:
+        return f"is over the {MAX_DRAFT_BODY_BYTES:,}-byte limit"
+    return None
+
+
+def validate_draft_content(content: DraftContent) -> None:
+    """Raise :class:`DraftLimitError` when content breaks a draft limit.
+
+    The limits are checked when a draft is written, not when one is read, so a
+    draft stored before the limits existed still loads.
+    """
+    if len(content.comments) > MAX_DRAFT_COMMENTS:
+        raise DraftLimitError(
+            f"A draft can hold at most {MAX_DRAFT_COMMENTS:,} comments."
+        )
+    problem = draft_text_problem(content.body)
+    if problem is not None:
+        raise DraftLimitError(f"The review summary {problem}.")
+    for comment in content.comments:
+        problem = draft_text_problem(comment.body)
+        if problem is not None:
+            raise DraftLimitError(f"A comment {problem}.")
 
 
 @dataclass(frozen=True, slots=True)

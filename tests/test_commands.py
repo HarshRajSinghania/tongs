@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import inspect
+import logging
+from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+from textual.app import App
 
 from tongs.commands import TongsCommandProvider
+from tongs.plugins.base import TongsPlugin
+from tongs.plugins.registry import PluginRegistry
 from tongs.views.inbox import InboxScreen
 from tongs.views.mr_detail import MRDetailScreen
 from tongs.views.repo_list import RepoListScreen
@@ -109,3 +114,73 @@ async def test_palette_callback_triggers_its_action(
         assert triggered[0] == expected
     else:
         assert triggered == [expected]
+
+
+class _RaisingPlugin(TongsPlugin):
+    """A plugin whose palette callbacks fail, synchronously or when awaited."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    @property
+    def name(self) -> str:
+        return "raising"
+
+    def get_commands(self) -> list[tuple[str, str, object]]:
+        def explode() -> None:
+            self.calls.append("sync")
+            raise RuntimeError("plugin bug")
+
+        async def explode_later() -> None:
+            self.calls.append("async")
+            raise RuntimeError("plugin bug")
+
+        return [
+            ("Explode Now", "Raises synchronously", explode),
+            ("Explode Later", "Raises when awaited", explode_later),
+        ]
+
+
+class _PaletteApp(App[None]):
+    """The smallest app that runs the real tongs palette provider."""
+
+    COMMANDS: ClassVar[set] = {TongsCommandProvider}
+
+    def __init__(self, plugin_registry: PluginRegistry) -> None:
+        super().__init__()
+        self.plugin_registry = plugin_registry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("query", "kind"), [("Explode Now", "sync"), ("Explode Later", "async")]
+)
+async def test_raising_plugin_command_leaves_the_app_running(
+    query: str, kind: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A plugin callback that raises is logged and noticed, not fatal."""
+    plugin = _RaisingPlugin()
+    registry = PluginRegistry()
+    registry._plugins.append(plugin)
+    app = _PaletteApp(registry)
+
+    with caplog.at_level(logging.WARNING, logger="tongs.plugins.registry"):
+        async with app.run_test(notifications=True) as pilot:
+            app.action_command_palette()
+            await pilot.pause()
+            await pilot.press(*query)
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            assert plugin.calls == [kind]
+            assert app.is_running
+            assert app.return_code is None
+            assert [
+                (notice.message, notice.severity) for notice in app._notifications
+            ] == [("The raising plugin command failed. See the log.", "error")]
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == [f"Plugin raising command {query!r} failed"]

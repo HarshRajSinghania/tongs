@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import ClassVar
@@ -46,6 +47,7 @@ from tongs.state.drafts import (
     DraftComment,
     DraftConflictError,
     DraftContent,
+    DraftLimitError,
     DraftSnapshot,
     DraftState,
     GeneralDraftComment,
@@ -107,6 +109,8 @@ from tongs.widgets.review_draft import (
 from tongs.widgets.split_diff import DiffSelection
 from tongs.widgets.two_press import TwoPressConfirm
 
+log = logging.getLogger(__name__)
+
 
 def _ci_label(status: CIStatus) -> str:
     labels = {
@@ -161,6 +165,10 @@ def _merge_readiness(mr: MRDetail) -> Content:
 
 
 _SUBMIT_WORKER_GROUP = "review-draft-submit"
+
+_RELOAD_WARNING = (
+    "The review drafts could not be reloaded. Reopen the review to refresh them."
+)
 
 
 def _reload_note(reloaded: bool) -> str:
@@ -541,6 +549,10 @@ class MRDetailScreen(Screen):
             self._select_review_draft(draft)
             self.refresh_bindings()
             self.notify("Review mode started. Comments are now saved locally.")
+        except DraftLimitError as exc:
+            self.notify(
+                f"Could not start review mode. {exc}", severity="error", markup=False
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - Surface safe durable-store failures.
@@ -677,6 +689,19 @@ class MRDetailScreen(Screen):
                     severity="warning",
                 )
                 reopen_review = reopen_after_conflict
+        except DraftLimitError as exc:
+            if self._detached_from_app():
+                return
+            message = f"Draft was not saved. {exc}"
+            if acknowledge_editor:
+                # Keeps the text in the editor so it can be shortened.
+                editor.reject_submission(message)
+            else:
+                self.notify(message, severity="error", markup=False)
+                if reopen_after_conflict:
+                    # Reopens the dialog with the refused text so it can be shortened.
+                    self._draft_conflict = content
+                    reopen_review = True
         except asyncio.CancelledError:
             if acknowledge_editor and not self._detached_from_app():
                 editor.reject_submission(
@@ -807,6 +832,14 @@ class MRDetailScreen(Screen):
                 "Draft changed elsewhere before submission. Review the recovered summary and verdict.",
                 severity="warning",
             )
+        except DraftLimitError as exc:
+            # Refused before submission started, so nothing reached the forge.
+            # The dialog reopens with the refused text so it can be shortened.
+            self._draft_conflict = requested
+            reopen_after_conflict = True
+            self.notify(
+                f"Review was not submitted. {exc}", severity="error", markup=False
+            )
         except asyncio.CancelledError:
             await self._try_recover_submission_state(target, draft_id)
             raise
@@ -901,7 +934,10 @@ class MRDetailScreen(Screen):
         if progress.outcome is SubmissionOutcome.EDITABLE:
             self._review_progress = None
             self._review_progress_by_draft.pop(draft_id, None)
-        await self._recover_submission_state(target, draft_id)
+        # The service call already returned its result, so a failed reload is
+        # reported on its own instead of as a stopped submission.
+        if not await self._try_recover_submission_state(target, draft_id):
+            self.notify(_RELOAD_WARNING, severity="warning")
 
     async def _try_recover_submission_state(
         self, target: TUIDraftTarget, draft_id: UUID | None
@@ -913,7 +949,9 @@ class MRDetailScreen(Screen):
         """
         try:
             await self._recover_submission_state(target, draft_id)
-        except Exception:  # noqa: BLE001 - The caller reports the original failure.
+        except Exception as exc:  # noqa: BLE001 - The caller reports the failure.
+            # Only the type is logged: messages can carry forge or draft text.
+            log.debug("Review draft state reload failed: %s", type(exc).__name__)
             return False
         return True
 

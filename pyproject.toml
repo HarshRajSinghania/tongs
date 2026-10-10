@@ -50,6 +50,11 @@ dev = [
     # skipped test would itself fail the gate's no-skip rule.
     "pyyaml>=6.0",
 ]
+# The linter and formatter CI runs, pinned exactly so every contributor and the
+# lint job use one version and Dependabot can propose the bump.
+lint = [
+    "ruff==0.17.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/andre-motta/tongs"

@@ -30,6 +30,7 @@ from tongs.services.models import (
     ReviewSnapshot,
     ServiceEventKind,
 )
+from tongs.services.operation_ledger import OperationEntry, OperationLedger
 
 _OPERATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _KNOWN_DISPATCH_ERRORS = (
@@ -202,12 +203,7 @@ type GetReview = Callable[[ReviewRef], Awaitable[ReviewSnapshot]]
 type EmitChange = Callable[[ServiceEventKind, ReviewRef, ReviewRevision | None], None]
 
 
-@dataclass(slots=True)
-class _OperationRecord:
-    command: MRActionCommand
-    done: asyncio.Event
-    receipt: MRActionReceipt | None = None
-    error: ServiceError | None = None
+type _Entry = OperationEntry[MRActionCommand, MRActionReceipt]
 
 
 class MRActionService:
@@ -231,9 +227,10 @@ class MRActionService:
         self._get_client = get_client
         self._get_review = get_review
         self._emit_change = emit_change
-        self._max_operations = max_operations
         self._close_timeout = close_timeout
-        self._operations: dict[str, _OperationRecord] = {}
+        self._operations: OperationLedger[MRActionCommand, MRActionReceipt] = (
+            OperationLedger(max_operations)
+        )
         self._operation_lock = asyncio.Lock()
         self._owner_tasks: set[asyncio.Task[object]] = set()
         self._closed = False
@@ -259,13 +256,19 @@ class MRActionService:
             ) from None
 
     async def execute(self, command: MRActionCommand) -> MRActionReceipt:
-        """Execute once per operation ID and retain every terminal disposition."""
+        """Execute once per operation ID.
+
+        Every outcome once dispatch starts (a result, a known forge rejection
+        or an uncertain outcome) is retained under the operation ID, so a retry
+        returns it instead of running the action twice. A rejection or
+        cancellation before dispatch releases the ID, so the same operation can
+        be tried again.
+        """
         action, target = self._command_parts(command)
         self._validate_operation_id(command.operation_id)
         record, owner = await self._reserve(command)
         if not owner:
-            await record.done.wait()
-            return self._record_result(record)
+            return await self._operations.wait(record)
 
         owner_task = asyncio.current_task()
         if owner_task is None:
@@ -301,7 +304,7 @@ class MRActionService:
     async def _execute_owner(
         self,
         command: MRActionCommand,
-        record: _OperationRecord,
+        record: _Entry,
         action: MRAction,
         target: ReviewActionTarget,
     ) -> MRActionReceipt:
@@ -320,10 +323,10 @@ class MRActionService:
         except asyncio.CancelledError:
             if dispatch_started:
                 receipt = self._unknown_receipt(command.operation_id, action, target)
-                self._retain_receipt_now(record, receipt)
+                self._operations.retain(record, receipt)
                 self._finish_receipt(record, receipt, emit_resync=True)
             else:
-                self._complete_error_now(
+                self._operations.release(
                     record,
                     ServiceError(
                         ServiceErrorCode.INTERNAL,
@@ -338,10 +341,10 @@ class MRActionService:
                     receipt = self._unknown_receipt(
                         command.operation_id, action, target
                     )
-                    self._retain_receipt_now(record, receipt)
+                    self._operations.retain(record, receipt)
                     self._finish_receipt(record, receipt, emit_resync=True)
                 else:
-                    self._complete_error_now(
+                    self._operations.release(
                         record,
                         ServiceError(
                             ServiceErrorCode.INTERNAL,
@@ -349,9 +352,13 @@ class MRActionService:
                         ),
                     )
                 raise
-            if not dispatch_started or self._is_known_rejection(error):
+            if not dispatch_started:
                 safe = self._safe_error(error, action, target.review.repository)
-                self._complete_error_now(record, safe)
+                self._operations.release(record, safe)
+                raise safe from None
+            if self._is_known_rejection(error):
+                safe = self._safe_error(error, action, target.review.repository)
+                self._operations.fail(record, safe)
                 raise safe from None
             receipt = self._unknown_receipt(
                 command.operation_id,
@@ -359,10 +366,10 @@ class MRActionService:
                 target,
                 self._safe_error(error, action, target.review.repository),
             )
-            self._retain_receipt_now(record, receipt)
+            self._operations.retain(record, receipt)
             return self._finish_receipt(record, receipt, emit_resync=True)
 
-        self._retain_receipt_now(record, receipt)
+        self._operations.retain(record, receipt)
         emit_resync = not result.cache_invalidated or (
             isinstance(result, ForgeMergeResult)
             and result.source_cleanup is SourceCleanupStatus.UNKNOWN
@@ -373,34 +380,20 @@ class MRActionService:
             raise asyncio.CancelledError
         return finished
 
-    async def _reserve(self, command: MRActionCommand) -> tuple[_OperationRecord, bool]:
+    async def _reserve(self, command: MRActionCommand) -> tuple[_Entry, bool]:
+        owner_task = asyncio.current_task()
+        if owner_task is None:
+            raise RuntimeError("MR action execution requires an asyncio task")
         async with self._operation_lock:
             if self._closed:
                 raise ServiceError(
                     ServiceErrorCode.CLOSED,
                     "The MR action service is closed.",
                 )
-            existing = self._operations.get(command.operation_id)
-            if existing is not None:
-                if existing.command != command:
-                    raise ServiceError(
-                        ServiceErrorCode.CONFLICT,
-                        "The operation ID is already bound to another review action.",
-                    )
-                return existing, False
-            if len(self._operations) >= self._max_operations:
-                raise ServiceError(
-                    ServiceErrorCode.CONFLICT,
-                    "The MR action operation ledger is full.",
-                    retryable=True,
-                )
-            record = _OperationRecord(command, asyncio.Event())
-            self._operations[command.operation_id] = record
-            owner = asyncio.current_task()
-            if owner is None:
-                raise RuntimeError("MR action execution requires an asyncio task")
-            self._owner_tasks.add(owner)
-            return record, True
+            record, owner = self._operations.reserve(command.operation_id, command)
+            if owner:
+                self._owner_tasks.add(owner_task)
+            return record, owner
 
     async def _validate_fresh_target(
         self,
@@ -541,7 +534,7 @@ class MRActionService:
 
     def _finish_receipt(
         self,
-        record: _OperationRecord,
+        record: _Entry,
         receipt: MRActionReceipt,
         *,
         emit_resync: bool,
@@ -562,29 +555,9 @@ class MRActionService:
                 )
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             resync = True
-        finished = replace(receipt, resync_required=resync)
-        record.receipt = finished
-        record.done.set()
-        return finished
-
-    @staticmethod
-    def _retain_receipt_now(record: _OperationRecord, receipt: MRActionReceipt) -> None:
-        if not record.done.is_set():
-            record.receipt = receipt
-
-    @staticmethod
-    def _complete_error_now(record: _OperationRecord, error: ServiceError) -> None:
-        if not record.done.is_set():
-            record.error = error
-            record.done.set()
-
-    @staticmethod
-    def _record_result(record: _OperationRecord) -> MRActionReceipt:
-        if record.error is not None:
-            raise record.error
-        if record.receipt is None:
-            raise RuntimeError("completed operation has no result")
-        return record.receipt
+        return self._operations.complete(
+            record, replace(receipt, resync_required=resync)
+        )
 
     @staticmethod
     def _known_receipt(

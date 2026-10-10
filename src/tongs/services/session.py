@@ -59,7 +59,7 @@ from tongs.services.mr_actions import MRActionService
 from tongs.services.review_mutations import ReviewMutationService
 from tongs.services.review_submission import ReviewSubmissionService
 from tongs.state.drafts.models import RecoveryWarning
-from tongs.state.drafts.store import DraftStore
+from tongs.state.drafts.store import SUBMITTED_RETENTION, DraftStore
 
 log = logging.getLogger(__name__)
 
@@ -342,6 +342,16 @@ class ApplicationSession:
                     await self._prune_cache()
                     self._require_start_open()
                     self._draft_store_open_attempted = True
+                    try:
+                        self._draft_store.submitted_retention = (
+                            self._config.submitted_draft_retention
+                        )
+                    except ValueError:
+                        # Only a Config built in code can hold an invalid window.
+                        log.warning(
+                            "Ignoring an invalid submitted draft retention window"
+                        )
+                        self._draft_store.submitted_retention = SUBMITTED_RETENTION
                     await self._draft_store.open()
                     await self._draft_store.recover_incomplete_attempts()
                     self._recovery_warnings = self._draft_store.recovery_warnings

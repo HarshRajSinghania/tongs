@@ -11,6 +11,14 @@ import {
   ACTIONS_LOADING,
 } from "../../../desktop/dist/src/renderer/features/review/header.js";
 import { createReviewOverviewFeature } from "../../../desktop/dist/src/renderer/features/review-detail/index.js";
+import {
+  CAPABILITY_LOADING,
+  capabilitiesReady,
+  enabledButton,
+  settle,
+  waitForCount,
+  waitForList,
+} from "./wait.mjs";
 
 const desktopRequire = createRequire(
   new URL("../../../desktop/package.json", import.meta.url),
@@ -25,7 +33,7 @@ Object.assign(globalThis, {
   HTMLElement: dom.window.HTMLElement,
   Node: dom.window.Node,
 });
-const { cleanup, fireEvent, render, waitFor } = desktopRequire(
+const { cleanup, fireEvent, render } = desktopRequire(
   "@testing-library/react",
 );
 const React = desktopRequire("react");
@@ -45,6 +53,9 @@ const TABS = ["overview", "diff", "discussions"];
 
 const ACTION_LABELS = ["Merge", "Close", "Reopen", "Remove approval"];
 
+/** The header's capability-gated lifecycle action buttons. */
+const ACTION_SELECTOR = ".review-header [data-review-action]";
+
 const REJECTION =
   "The forge refused this action: the review changed remotely or its branch conflicts with the target. Refresh, and check for merge conflicts.";
 
@@ -52,8 +63,8 @@ for (const panel of TABS) {
   test(`the ${panel} tab header carries the lifecycle actions and Your review`, async () => {
     const review = `header-layout-${panel}`;
     const view = renderReview(reviewBridge(review), review, panel);
-    await waitFor(() => assert.equal(yourReviewButtons(view), 1));
-    await settledActions(view);
+    await waitForCount(() => yourReviewButtons(view), 1);
+    await capabilitiesReady(view.container, ACTION_SELECTOR);
     // The header's own buttons, in order, as the reader meets them.
     assert.deepEqual(headerButtonTexts(view), [
       "← Reviews",
@@ -92,14 +103,12 @@ for (const panel of TABS) {
       review,
       panel,
     );
-    await waitFor(() =>
-      assert.deepEqual(actionStates(view), [
-        ["Merge", false],
-        ["Close", true],
-        ["Reopen", true],
-        ["Remove approval", false],
-      ]),
-    );
+    await waitForList(() => actionStates(view), [
+      ["Merge", false],
+      ["Close", true],
+      ["Reopen", true],
+      ["Remove approval", false],
+    ]);
     assert.deepEqual(
       actionButtons(view).map((button) => button.title),
       [
@@ -142,15 +151,16 @@ for (const panel of TABS) {
       review,
       panel,
     );
-    fireEvent.click(await enabledAction(view, "Close"));
+    fireEvent.click(await enabledButton(view, "Close"));
     assert.equal(closes.length, 0);
     assert.equal(view.queryAllByRole("button", { name: "Close" }).length, 0);
     fireEvent.click(view.getByRole("button", { name: "Confirm Close" }));
-    await waitFor(() => assert.equal(closes.length, 1));
+    await waitForCount(() => closes.length, 1);
     assert.equal(closes[0].review, review);
     assert.deepEqual(closes[0].revision, REVISION);
-    await waitFor(() =>
-      assert.equal(view.queryAllByRole("button", { name: "Close" }).length, 1),
+    await waitForCount(
+      () => view.queryAllByRole("button", { name: "Close" }).length,
+      1,
     );
   });
 }
@@ -173,7 +183,7 @@ test("merge options travel with the confirmed merge from the Overview header", a
     review,
     "overview",
   );
-  fireEvent.click(await enabledAction(view, "Merge"));
+  fireEvent.click(await enabledButton(view, "Merge"));
   // Changing an option withdraws the armed confirmation, so what is
   // confirmed is always the command on screen.
   fireEvent.click(view.getByLabelText("Squash commits"));
@@ -182,7 +192,7 @@ test("merge options travel with the confirmed merge from the Overview header", a
   fireEvent.click(view.getByRole("button", { name: "Merge" }));
   assert.equal(merges.length, 0);
   fireEvent.click(view.getByRole("button", { name: "Confirm Merge" }));
-  await waitFor(() => assert.equal(merges.length, 1));
+  await waitForCount(() => merges.length, 1);
   assert.equal(merges[0].squash, true);
   assert.deepEqual(merges[0].source_cleanup, { branch: "feature" });
 });
@@ -213,9 +223,9 @@ for (const panel of TABS) {
       review,
       panel,
     );
-    fireEvent.click(await enabledAction(view, "Reopen"));
+    fireEvent.click(await enabledButton(view, "Reopen"));
     fireEvent.click(view.getByRole("button", { name: "Confirm Reopen" }));
-    await waitFor(() => assert.equal(view.queryAllByText(REJECTION).length, 1));
+    await waitForCount(() => view.queryAllByText(REJECTION).length, 1);
     assert.equal(view.getAllByRole("alert").length, 1);
     assert.equal(
       view.container.querySelectorAll('.review-header [role="alert"]').length,
@@ -234,12 +244,19 @@ test("the actions say they are loading until the capability read answers", async
     review,
     "discussions",
   );
-  await waitFor(() => assert.equal(yourReviewButtons(view), 1));
+  await waitForCount(() => yourReviewButtons(view), 1);
   await settle();
   assert.deepEqual(
     actionButtons(view).map((button) => [button.disabled, button.title]),
     ACTION_LABELS.map(() => [true, ACTIONS_LOADING]),
   );
+  // Written out, so a reword in the source fails here rather than leaving the
+  // shared `capabilitiesReady` wait blind to the new sentence.
+  assert.equal(
+    ACTIONS_LOADING,
+    "Review action support for this review is still loading.",
+  );
+  assert.equal(CAPABILITY_LOADING.includes(ACTIONS_LOADING), true);
 });
 
 test("a failed capability read disables the actions and says why", async () => {
@@ -252,13 +269,12 @@ test("a failed capability read disables the actions and says why", async () => {
     review,
     "overview",
   );
-  await waitFor(() =>
-    assert.equal(
+  await waitForCount(
+    () =>
       actionButtons(view).filter((button) =>
         button.title.startsWith("Review action support could not be read"),
       ).length,
-      4,
-    ),
+    4,
   );
   assert.equal(
     actionButtons(view).filter((button) => button.disabled).length,
@@ -286,44 +302,37 @@ test("an unknown action result blocks every action on every tab until it is sett
     review,
     "discussions",
   );
-  fireEvent.click(await enabledAction(view, "Close"));
+  fireEvent.click(await enabledButton(view, "Close"));
   fireEvent.click(view.getByRole("button", { name: "Confirm Close" }));
-  await waitFor(() =>
-    assert.equal(
-      view.queryAllByRole("button", { name: "Check retained receipt" }).length,
-      1,
-    ),
+  await waitForCount(
+    () => view.queryAllByRole("button", { name: "Check retained receipt" }).length,
+    1,
   );
   // The standing belongs to the review, not the tab: Changes shows the same
   // refusal and the same way out.
   fireEvent.click(view.getByRole("button", { name: "Files changed" }));
-  await waitFor(() =>
-    assert.equal(
-      view.queryAllByRole("button", { name: "Check retained receipt" }).length,
-      1,
-    ),
+  await waitForCount(
+    () => view.queryAllByRole("button", { name: "Check retained receipt" }).length,
+    1,
   );
-  await waitFor(() =>
-    assert.deepEqual(
+  await waitForList(
+    () =>
       actionButtons(view).map((button) => [button.disabled, button.title]),
-      [
-        [true, ACTIONS_BLOCKED],
-        [true, ACTIONS_BLOCKED],
-        [true, "Reopen is unsupported for this review."],
-        [true, "Remove approval is unsupported for this review."],
-      ],
-    ),
+    [
+      [true, ACTIONS_BLOCKED],
+      [true, ACTIONS_BLOCKED],
+      [true, "Reopen is unsupported for this review."],
+      [true, "Remove approval is unsupported for this review."],
+    ],
   );
   fireEvent.click(
     view.getByRole("button", {
       name: "I inspected the forge; acknowledge uncertainty",
     }),
   );
-  await waitFor(() =>
-    assert.deepEqual(
-      actionButtons(view).map((button) => button.disabled),
-      [false, false, true, true],
-    ),
+  await waitForList(
+    () => actionButtons(view).map((button) => button.disabled),
+    [false, false, true, true],
   );
 });
 
@@ -361,7 +370,7 @@ async function unknownInlineComment(review) {
     target: { value: "Possibly delivered" },
   });
   fireEvent.click(view.getByRole("button", { name: "Add comment now" }));
-  await waitFor(() => assert.equal(posts.length, 1));
+  await waitForCount(() => posts.length, 1);
   return view;
 }
 
@@ -387,7 +396,7 @@ for (const [label, panel] of [
       fireEvent.click(view.getByRole("button", { name: label }));
     // One way out on the page, in the header, and no receipt to check: only a
     // lifecycle action retains one.
-    await waitFor(() => assert.equal(acknowledgeButtons(view), 1));
+    await waitForCount(() => acknowledgeButtons(view), 1);
     assert.equal(
       [...view.container.querySelectorAll(".review-header button")].filter(
         (button) => button.textContent === ACKNOWLEDGE,
@@ -399,23 +408,20 @@ for (const [label, panel] of [
       0,
     );
     assert.equal(headerText(view).includes("may have completed remotely"), true);
-    await waitFor(() =>
-      assert.deepEqual(
-        actionButtons(view).map((button) => button.title),
-        ACTION_LABELS.map(() => ACTIONS_BLOCKED),
-      ),
+    await waitForList(
+      () => actionButtons(view).map((button) => button.title),
+      ACTION_LABELS.map(() => ACTIONS_BLOCKED),
     );
     fireEvent.click(view.getByRole("button", { name: ACKNOWLEDGE }));
-    await waitFor(() => assert.equal(acknowledgeButtons(view), 0));
+    await waitForCount(() => acknowledgeButtons(view), 0);
     assert.equal(headerText(view).includes("acknowledged without replay"), true);
     assert.equal(view.queryAllByText(/acknowledged without replay/).length, 1);
     assert.equal(headerText(view).includes("may have completed remotely"), false);
-    await waitFor(() =>
-      assert.equal(
+    await waitForCount(
+      () =>
         actionButtons(view).filter((button) => button.title === ACTIONS_BLOCKED)
           .length,
-        0,
-      ),
+      0,
     );
   });
 }
@@ -435,24 +441,22 @@ test("the header tabs switch panels and keep the same controls", async () => {
     ["Overview", "overview"],
   ]) {
     fireEvent.click(view.getByRole("button", { name: tab }));
-    await waitFor(() =>
-      assert.deepEqual(
+    await waitForList(
+      () =>
         [...view.container.querySelectorAll('[aria-current="page"]')].map(
           (button) => button.getAttribute("data-panel"),
         ),
-        [panel],
-      ),
+      [panel],
     );
-    await waitFor(() =>
-      assert.deepEqual(
+    await waitForList(
+      () =>
         Object.entries(markers)
           .filter(([, selector]) => view.container.querySelectorAll(selector).length > 0)
           .map(([id]) => id),
-        [panel],
-      ),
+      [panel],
     );
-    await waitFor(() => assert.equal(yourReviewButtons(view), 1));
-    await waitFor(() => assert.equal(actionButtons(view).length, 4));
+    await waitForCount(() => yourReviewButtons(view), 1);
+    await waitForCount(() => actionButtons(view).length, 4);
     assert.equal(
       view.container.querySelectorAll(".review-header").length,
       1,
@@ -467,9 +471,7 @@ function headerButtonTexts(view) {
 }
 
 function actionButtons(view) {
-  return [
-    ...view.container.querySelectorAll(".review-header [data-review-action]"),
-  ];
+  return [...view.container.querySelectorAll(ACTION_SELECTOR)];
 }
 
 function actionStates(view) {
@@ -481,29 +483,6 @@ function actionStates(view) {
 
 function yourReviewButtons(view) {
   return view.queryAllByRole("button", { name: /^Your review/ }).length;
-}
-
-async function settledActions(view) {
-  await waitFor(() =>
-    assert.equal(
-      actionButtons(view).filter((button) => button.title === ACTIONS_LOADING)
-        .length,
-      0,
-    ),
-  );
-}
-
-async function enabledAction(view, name) {
-  return waitFor(() => {
-    const found = view.getByRole("button", { name });
-    assert.equal(found.disabled, false);
-    return found;
-  });
-}
-
-async function settle(rounds = 10) {
-  for (let round = 0; round < rounds; round += 1)
-    await new Promise((resolve) => setTimeout(resolve, 5));
 }
 
 function renderReview(bridge, review, panel) {

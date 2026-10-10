@@ -13,6 +13,7 @@ import {
   type ServiceStatusDto,
 } from "../shared/bridge.js";
 import { REVIEW_OPERATIONS } from "./review.js";
+import type { ServiceRecoveryState } from "./renderer_lifecycle.js";
 import { UTILITY_PROTOCOL_METHODS } from "../shared/utilities.js";
 import {
   SIDECAR_ARGUMENTS,
@@ -31,6 +32,13 @@ export const MAX_JSON_ITEMS = 20_000;
 export const MIN_JSON_DEPTH = 8;
 export const MIN_JSON_ITEMS = 1_024;
 const MAX_CRASH_HISTORY = 16;
+/** The longest service diagnostic line kept; the rest of the line is cut. */
+export const MAX_STDERR_LINE_BYTES = 4 * 1024;
+/** The service diagnostics one service session may write to the main log. */
+export const MAX_STDERR_SESSION_BYTES = 1024 * 1024;
+export const STDERR_LOG_PREFIX = "[tongs service] ";
+export const STDERR_LINE_TRUNCATED = " [line truncated]";
+export const STDERR_OUTPUT_DROPPED = "further output dropped";
 const EDITOR_EXPORT_ROOT_ENV = "TONGS_DESKTOP_EDITOR_EXPORT_ROOT";
 
 export class SidecarError extends Error {
@@ -95,6 +103,96 @@ type SpawnChild = (
 const spawnSidecar: SpawnChild = (executable, args, options) =>
   spawn(executable, [...args], options) as ChildProcessWithoutNullStreams;
 
+/**
+ * Characters a diagnostic line must not carry into the log: C0 controls other
+ * than tab, DEL and the C1 controls (U+0080 to U+009F, which include the
+ * single-byte CSI), the line and paragraph separators, and the bidirectional
+ * embeddings, overrides and isolates.
+ */
+const UNSAFE_LOG_CHARACTERS =
+  /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
+
+/** Receives one line of the service's diagnostics, already bounded and prefixed. */
+export type DiagnosticSink = (line: string) => void;
+
+const consoleSink: DiagnosticSink = (line) => console.error(line);
+
+/**
+ * Forwards one service session's stderr to the main-process log, a line at a
+ * time. The service redacts what it writes, so the text is kept as written,
+ * apart from characters that could act on a terminal or reorder the line:
+ * C0 and C1 controls except tab, DEL, line and paragraph separators, and
+ * bidirectional overrides and isolates. A line over the line bound is cut with a
+ * marker, and once the session's total reaches its bound one last line says
+ * further output was dropped and the rest is ignored, so a chatty or stuck
+ * service cannot grow the log or this buffer without limit.
+ */
+class DiagnosticForwarder {
+  readonly #decoder = new TextDecoder("utf-8");
+  #line: Buffer[] = [];
+  #lineBytes = 0;
+  #lineCut = false;
+  #total = 0;
+  #dropped = false;
+
+  constructor(private readonly sink: DiagnosticSink) {}
+
+  write(chunk: Buffer): void {
+    let start = 0;
+    while (!this.#dropped && start < chunk.length) {
+      const newline = chunk.indexOf(0x0a, start);
+      const end = newline < 0 ? chunk.length : newline;
+      this.#append(chunk.subarray(start, end));
+      if (newline < 0) return;
+      this.#emitLine();
+      start = newline + 1;
+    }
+  }
+
+  /** Forwards a last line the service wrote without a newline. */
+  end(): void {
+    if (!this.#dropped && (this.#lineBytes > 0 || this.#lineCut)) this.#emitLine();
+  }
+
+  #append(part: Buffer): void {
+    const room = MAX_STDERR_LINE_BYTES - this.#lineBytes;
+    if (part.length > room) this.#lineCut = true;
+    const kept = part.subarray(0, Math.max(0, room));
+    if (kept.length === 0) return;
+    this.#line.push(Buffer.from(kept));
+    this.#lineBytes += kept.length;
+  }
+
+  #emitLine(): void {
+    const raw = Buffer.concat(this.#line, this.#lineBytes);
+    const cut = this.#lineCut;
+    this.#line = [];
+    this.#lineBytes = 0;
+    this.#lineCut = false;
+    const text = this.#decoder
+      .decode(raw)
+      .replace(/\r$/, "")
+      .replace(UNSAFE_LOG_CHARACTERS, "\ufffd");
+    if (text.trim().length === 0 && !cut) return;
+    this.#total += raw.length + 1;
+    if (this.#total > MAX_STDERR_SESSION_BYTES) {
+      this.#dropped = true;
+      this.#line = [];
+      this.#send(STDERR_OUTPUT_DROPPED);
+      return;
+    }
+    this.#send(`${text}${cut ? STDERR_LINE_TRUNCATED : ""}`);
+  }
+
+  #send(text: string): void {
+    try {
+      this.sink(`${STDERR_LOG_PREFIX}${text}`);
+    } catch {
+      // A failing log must not take the service connection down with it.
+    }
+  }
+}
+
 export class SidecarTransport extends EventEmitter {
   readonly launch: DesktopLaunchConfig;
   readonly crashHistory: SidecarCrash[] = [];
@@ -111,6 +209,8 @@ export class SidecarTransport extends EventEmitter {
   private failureReported = false;
   private closeRequested = false;
   private state: ServiceState = "stopped";
+  private recovery: ServiceRecoveryState = "idle";
+  private notRunningReported = false;
   private notices: readonly string[] = NO_NOTICES;
 
   constructor(
@@ -119,6 +219,7 @@ export class SidecarTransport extends EventEmitter {
     private readonly startupTimeoutMs = 10_000,
     private readonly shutdownTimeoutMs = 5_000,
     private readonly spawnChild: SpawnChild = spawnSidecar,
+    private readonly diagnostics: DiagnosticSink = consoleSink,
   ) {
     super();
     this.launch = validateLaunchConfig(launch);
@@ -150,6 +251,18 @@ export class SidecarTransport extends EventEmitter {
    */
   get serviceNotices(): readonly string[] {
     return this.notices;
+  }
+
+  /** Whether the app's crash recovery is restarting the service or gave up. */
+  get serviceRecovery(): ServiceRecoveryState {
+    return this.recovery;
+  }
+
+  /** Set by the app's crash recovery policy; emits `recovery` once per change. */
+  setRecovery(state: ServiceRecoveryState): void {
+    if (this.recovery === state) return;
+    this.recovery = state;
+    this.emit("recovery", state);
   }
 
   get processId(): number | undefined {
@@ -251,7 +364,9 @@ export class SidecarTransport extends EventEmitter {
     this.child = child;
     const generation = this.generation;
     child.stdout.on("data", (chunk: Buffer) => this.consume(child, generation, chunk));
-    child.stderr.on("data", () => undefined);
+    const diagnostics = new DiagnosticForwarder(this.diagnostics);
+    child.stderr.on("data", (chunk: Buffer) => diagnostics.write(chunk));
+    child.stderr.once("end", () => diagnostics.end());
     child.once("error", () => this.failConnection(child, generation, "start_failed"));
     child.once("exit", (code, signal) => this.onExit(child, generation, code, signal));
 
@@ -273,10 +388,13 @@ export class SidecarTransport extends EventEmitter {
       this.jsonLimits = validateHandshake(result, this.launch.coreVersion);
       this.notices = mergeNotices(this.notices, handshakeNotices(result));
     } catch (error) {
-      await this.stop();
+      // Only this session failed: a later start or restart may still succeed.
+      // `stop()` is for app shutdown and would refuse every later start.
+      await this.stopSession();
       throw error;
     }
     if (this.child === child && this.generation === generation && !this.failureReported) {
+      this.notRunningReported = false;
       this.setState("connected");
     }
   }
@@ -295,7 +413,13 @@ export class SidecarTransport extends EventEmitter {
     timeoutMs: number,
     timedOut: () => SidecarError = read ? readTimeout : mutationTimeout,
   ): SidecarRequest<T> {
-    if (!this.child?.stdin.writable) {
+    if (!this.child?.stdin.writable || this.failureReported) {
+      // A request that finds no service outside a shutdown or a deliberate
+      // stop tells the app once per lost session, so it can restart it.
+      if (!this.closeRequested && !this.expectedExit && !this.notRunningReported) {
+        this.notRunningReported = true;
+        queueMicrotask(() => this.emit("not_running"));
+      }
       throw new SidecarError("not_running", "The desktop service is not running.");
     }
     if (this.pending.size >= MAX_PENDING) {
@@ -486,7 +610,10 @@ export class SidecarTransport extends EventEmitter {
     this.pending.clear();
     if (!child.killed) child.kill("SIGTERM");
     this.setState("stopped");
-    this.emit("crash", error);
+    // A failure while a deliberate stop or restart runs is not a crash: the
+    // stop already ends this session, and reporting it would spend one of the
+    // recovery policy's automatic restarts.
+    if (!this.expectedExit) this.emit("crash", error);
   }
 
   private onExit(child: ChildProcessWithoutNullStreams, generation: number, code: number | null, signal: NodeJS.Signals | null): void {
@@ -543,22 +670,31 @@ export class SidecarTransport extends EventEmitter {
 export class ServiceStatusPublisher {
   #revision = 0;
   #state: ServiceState;
+  #recovery: ServiceRecoveryState;
   #listener: ((state: ServiceState) => void) | null = null;
+  #recoveryListener: ((state: ServiceRecoveryState) => void) | null = null;
 
   constructor(
     private readonly source: SidecarTransport,
     private readonly publish: (status: ServiceStatusDto) => void,
   ) {
     this.#state = source.serviceState;
+    this.#recovery = source.serviceRecovery;
   }
 
-  get current(): ServiceStatusDto {
+  /**
+   * `recovery` is present only while the app restarts a lost service or after
+   * it gave up, so the status line can say which; the renderer reads it as
+   * optional.
+   */
+  get current(): ServiceStatusDto & { readonly recovery?: ServiceRecoveryState } {
     // Notices outlive a stopped session: they are this app run's warnings.
-    return {
+    const status = {
       state: this.#state,
       revision: this.#revision,
       notices: [...this.source.serviceNotices],
     };
+    return this.#recovery === "idle" ? status : { ...status, recovery: this.#recovery };
   }
 
   start(): void {
@@ -569,19 +705,30 @@ export class ServiceStatusPublisher {
       this.#revision += 1;
       this.publish(this.current);
     };
+    this.#recoveryListener = (recovery) => {
+      if (recovery === this.#recovery) return;
+      this.#recovery = recovery;
+      this.#revision += 1;
+      this.publish(this.current);
+    };
     this.source.on("status", this.#listener);
+    this.source.on("recovery", this.#recoveryListener);
     // A change between construction and subscription still reaches the renderer.
     this.#listener(this.source.serviceState);
+    this.#recoveryListener(this.source.serviceRecovery);
   }
 
   dispose(): void {
     if (this.#listener) this.source.off("status", this.#listener);
+    if (this.#recoveryListener) this.source.off("recovery", this.#recoveryListener);
     this.#listener = null;
+    this.#recoveryListener = null;
   }
 }
 
 const SERVICE_ERROR_CODES = new Set([
   "authentication_failed",
+  "capacity_exhausted",
   "closed",
   "configuration_invalid",
   "conflict",

@@ -212,6 +212,20 @@ file, and closing tongs does not stop the editor. The
 [configuration reference](/reference/configuration/) lists the supported editor
 commands.
 
+The export is written to a folder only your account can open:
+`$XDG_RUNTIME_DIR/tongs/editor-exports` when that runtime folder is private,
+otherwise `tongs-editor-exports-<uid>` in the temp folder. If that folder
+belongs to another account or others can open it, the message names the folder
+so you can remove or fix it. For `code`, `code-insiders`, `codium`, `subl`,
+`gvim`, `kate` and `gedit`, tongs adds the flag that makes the command wait for
+the editor (`--wait`, `-f` or `--block`) when it is missing. It also drops `-n`
+and `--no-wait` from `emacsclient`, and turns the `--remote` flags of `vim` and
+`gvim` into their waiting forms, such as `--remote-wait-silent`. A command that
+still exits successfully within five seconds is treated as handing the file to
+an editor that is already running. The export then stays in place, and a later
+export removes it after 24 hours. Otherwise the export is removed when the
+editor exits, including when the editor saved it by replacing the file.
+
 Long logs load and display in bounded pages and windows. If a refresh, a page
 or a log revision check fails after output was loaded, the previous result stays
 visible with an explanation. A log beyond the renderer's safe limits is shown as

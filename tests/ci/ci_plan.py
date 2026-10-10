@@ -26,7 +26,9 @@ rewrite the gate regardless; rule edits live under ``tests/ci/**``, which always
 selects the full graph, and every push to ``main`` runs the full graph.
 
 The program is standard library only, because the ``changes`` job and the
-aggregate install nothing.  The verifiers load it by path.
+aggregate install nothing.  The verifiers load it by path, and both judge job
+results with :func:`check_job_results` and read the effective plan with
+:func:`read_plan_file`, so the job-result policy is defined once, here.
 """
 
 from __future__ import annotations
@@ -76,6 +78,9 @@ LANE_CI_JOBS: dict[str, str] = {
 }
 #: The planning job every lane job needs.
 CHANGES_JOB = "changes"
+#: Jobs of ``ci.yml`` the aggregate needs: every lane job plus ``changes``.
+#: Which of them must succeed is decided by the effective plan.
+AGGREGATE_JOBS: frozenset[str] = frozenset(LANE_CI_JOBS.values()) | {CHANGES_JOB}
 
 #: Jobs of the called ``desktop-production.yml`` that each lane owns.
 LANE_PRODUCTION_JOBS: dict[str, frozenset[str]] = {
@@ -437,11 +442,13 @@ RULES: tuple[Rule, ...] = (
         patterns=("scripts/release-evidence/**",),
         lanes=frozenset({"lint", "core"}),
     ),
+    # The Dependabot configuration is read by tests/ci/test_workflow_hygiene.py.
     Rule(
         name="ci-infrastructure",
         patterns=(
             ".github/workflows/**",
             ".github/scripts/**",
+            ".github/dependabot.yml",
             "tests/ci/**",
             "tests/containers/**",
         ),
@@ -531,6 +538,10 @@ def classify_paths(
 
 class PlanError(ValueError):
     """Raised when a plan document or plan value is malformed."""
+
+
+class JobResultError(ValueError):
+    """Raised when workflow job results do not match the expected job set."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -835,6 +846,66 @@ def selected_checks(plan: Plan) -> frozenset[str]:
     return frozenset(
         check for lane in plan.lanes for check in LANE_CHECKS.get(lane, frozenset())
     )
+
+
+def read_plan_file(path: Path) -> Plan:
+    """Read an effective plan file strictly, raising :class:`PlanError`."""
+
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise PlanError(f"effective plan is unreadable: {path}") from error
+    try:
+        return Plan.from_json(text)
+    except ValueError as error:
+        raise PlanError(f"effective plan is malformed: {error}") from error
+
+
+def check_job_results(
+    raw_results: str, expected: Mapping[str, frozenset[str]], label: str
+) -> dict[str, str]:
+    """Require the exact job set and an allowed result for each job.
+
+    ``raw_results`` is a workflow's ``toJSON(needs)`` text and ``expected``
+    maps each job to the results it may report.  Returns each job's observed
+    result, or raises :class:`JobResultError` naming every job that deviates.
+    """
+
+    if not isinstance(raw_results, str) or not raw_results.strip():
+        raise JobResultError(f"{label} results are absent")
+    try:
+        results: Any = json.loads(raw_results)
+    except json.JSONDecodeError as error:
+        raise JobResultError(f"{label} results are malformed JSON") from error
+    if not isinstance(results, dict):
+        raise JobResultError(f"{label} results must be a JSON object")
+
+    actual_jobs = set(results)
+    if actual_jobs != set(expected):
+        missing = sorted(set(expected) - actual_jobs)
+        unexpected = sorted(actual_jobs - set(expected))
+        raise JobResultError(
+            f"{label} job set mismatch: missing={missing}, unexpected={unexpected}"
+        )
+
+    observed: dict[str, str] = {}
+    rejected: list[str] = []
+    for name in sorted(expected):
+        job = results[name]
+        if not isinstance(job, dict):
+            rejected.append(f"{name}=malformed")
+            continue
+        result = job.get("result")
+        if result not in expected[name]:
+            allowed = "|".join(sorted(expected[name]))
+            rejected.append(f"{name}={result!r} (expected {allowed})")
+            continue
+        observed[name] = result
+    if rejected:
+        raise JobResultError(
+            f"{label} jobs did not match the effective plan: " + ", ".join(rejected)
+        )
+    return observed
 
 
 def _describe(error: BaseException) -> str:

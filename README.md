@@ -57,10 +57,10 @@ git clone https://github.com/andre-motta/tongs.git
 cd tongs
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e ".[dev]" ruff
+python -m pip install -e ".[dev,lint]"
 ```
 
-Use Python 3.12 or newer. If you prefer `uv`, use `uv venv --python 3.12` to create the environment and `uv pip install -e ".[dev]" ruff` after activation.
+Use Python 3.12 or newer. If you prefer `uv`, use `uv venv --python 3.12` to create the environment and `uv pip install -e ".[dev,lint]"` after activation.
 
 ## Quick start
 
@@ -500,7 +500,7 @@ tongs-mcp
 
 The server communicates over stdio, so you can wire it into any MCP-compatible client, including Codex, Claude Code, and Claude Desktop. It reuses the same forge configuration and auth tokens as the TUI.
 
-When the `mcp` extra is installed, the built-in plugin also adds a **Start MCP Server** command to the command palette, which launches the server as `python -m tongs.mcp.server`. On a default install without the extra, the plugin contributes no command.
+When the `mcp` extra is installed, the built-in plugin also adds an **MCP Server Setup** command to the command palette, which shows the command that registers `tongs-mcp` with your MCP client. It does not start a server. On a default install without the extra, the plugin contributes no command.
 
 ### Connect to Codex
 

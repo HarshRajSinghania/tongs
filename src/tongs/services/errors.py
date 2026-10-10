@@ -36,6 +36,7 @@ class ServiceErrorCode(str, Enum):
     NETWORK_UNAVAILABLE = "network_unavailable"
     CONFIGURATION_INVALID = "configuration_invalid"
     SHUTDOWN_FAILED = "shutdown_failed"
+    CAPACITY_EXHAUSTED = "capacity_exhausted"
     INTERNAL = "internal"
 
 

@@ -454,7 +454,7 @@ import mcp.server.fastmcp
 from tongs.mcp.plugin import MCPPlugin
 
 commands = MCPPlugin().get_commands()
-assert len(commands) == 1 and commands[0][0] == "Start MCP Server"
+assert len(commands) == 1 and commands[0][0] == "MCP Server Setup"
 print("MCP command available with optional dependency")
 PY
 /usr/bin/python3 -E -P "$packaging_dir/verify_rpm_state.py" metadata \

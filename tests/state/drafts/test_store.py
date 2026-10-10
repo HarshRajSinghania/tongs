@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import multiprocessing
 import os
 import sqlite3
 import stat
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -16,14 +18,20 @@ import aiosqlite
 import pytest
 from platformdirs import user_cache_dir, user_data_dir
 
+from tongs.cache.store import CacheStore
+from tongs.config import Config
 from tongs.scanner.repo import ForgeType
 from tongs.services import RepositoryRef, ReviewRef, ReviewRevision
+from tongs.services.session import ApplicationSession
 from tongs.state.drafts import (
+    MAX_DRAFT_BODY_BYTES,
+    MAX_DRAFT_COMMENTS,
     DiffSide,
     DraftAttemptOwnedError,
     DraftConflictError,
     DraftContent,
     DraftCorruptionError,
+    DraftLimitError,
     DraftNotFoundError,
     DraftNotOpenError,
     DraftPermissionError,
@@ -933,3 +941,349 @@ async def test_owned_active_attempts_are_listed_only_on_request(
         assert {
             item.id for item in await owner.list_recovery_attempts(include_owned=True)
         } == {partial.id, unknown.id}
+
+
+def _age_draft(db_path: Path, draft_id: UUID, age: timedelta) -> None:
+    """Move a stored draft's last change into the past."""
+    stamp = (datetime.now(UTC) - age).isoformat()
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE drafts SET updated_at = ? WHERE id = ?", (stamp, str(draft_id))
+        )
+
+
+def _row_counts(db_path: Path, draft_id: UUID) -> tuple[int, int]:
+    with sqlite3.connect(db_path) as connection:
+        drafts = connection.execute(
+            "SELECT count(*) FROM drafts WHERE id = ?", (str(draft_id),)
+        ).fetchone()[0]
+        attempts = connection.execute(
+            "SELECT count(*) FROM submission_attempts WHERE draft_id = ?",
+            (str(draft_id),),
+        ).fetchone()[0]
+    return drafts, attempts
+
+
+async def _submitted(store: DraftStore) -> tuple[UUID, UUID]:
+    draft = await store.create_draft(REVIEW, REVISION, make_content("sent"))
+    attempt = await store.lock_submission(draft.id, draft.version)
+    await store.record_receipt(attempt.id, "review", "remote-1")
+    await store.complete_submission(attempt.id)
+    return draft.id, attempt.id
+
+
+@pytest.mark.asyncio
+async def test_submitted_draft_stays_readable_then_is_pruned_after_the_window(
+    db_path: Path,
+) -> None:
+    store = DraftStore(db_path)
+    await store.open()
+    draft_id, attempt_id = await _submitted(store)
+
+    # The attempt stays readable right after completion, for a status poll.
+    assert (await store.get_attempt(attempt_id)).state is DraftState.SUBMITTED
+    assert (await store.get_draft(draft_id)).state is DraftState.SUBMITTED
+    await store.close()
+
+    _age_draft(db_path, draft_id, timedelta(hours=23))
+    await store.open()
+    assert (await store.get_draft(draft_id)).state is DraftState.SUBMITTED
+    await store.close()
+    assert _row_counts(db_path, draft_id) == (1, 1)
+
+    _age_draft(db_path, draft_id, timedelta(hours=25))
+    await store.open()
+    with pytest.raises(DraftNotFoundError):
+        await store.get_draft(draft_id)
+    with pytest.raises(DraftNotFoundError):
+        await store.get_attempt(attempt_id)
+    await store.close()
+    assert _row_counts(db_path, draft_id) == (0, 0)
+    with sqlite3.connect(db_path) as connection:
+        receipts = connection.execute(
+            "SELECT count(*) FROM submission_receipts WHERE attempt_id = ?",
+            (str(attempt_id),),
+        ).fetchone()[0]
+    assert receipts == 0
+
+
+@pytest.mark.asyncio
+async def test_prune_never_touches_editable_in_progress_or_unknown_drafts(
+    db_path: Path,
+) -> None:
+    store = DraftStore(db_path)
+    await store.open()
+    editable = await store.create_draft(REVIEW, REVISION, make_content("old"))
+    old_revision = await store.create_draft(
+        REVIEW, ReviewRevision("head-0", "base-0", "start-0"), DraftContent("text")
+    )
+    submitting = await store.create_draft(REVIEW, REVISION, make_content("lock"))
+    await store.lock_submission(submitting.id, submitting.version)
+    partial = await store.create_draft(REVIEW, REVISION, make_content("part"))
+    partial_attempt = await store.lock_submission(partial.id, partial.version)
+    await store.record_receipt(partial_attempt.id, "comment:one", "remote-1")
+    unknown = await store.create_draft(REVIEW, REVISION, make_content("unknown"))
+    unknown_attempt = await store.lock_submission(unknown.id, unknown.version)
+    await store.mark_attempt_unknown(unknown_attempt.id)
+    # A draft marked submitted while its latest attempt is still unknown is
+    # inconsistent; pruning must leave it for recovery rather than delete it.
+    mismatched = await store.create_draft(REVIEW, REVISION, make_content("odd"))
+    mismatched_attempt = await store.lock_submission(mismatched.id, mismatched.version)
+    await store.mark_attempt_unknown(mismatched_attempt.id)
+    await store.close()
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE drafts SET state = ?, active_attempt_id = NULL WHERE id = ?",
+            (DraftState.SUBMITTED.value, str(mismatched.id)),
+        )
+    kept = (editable, old_revision, submitting, partial, unknown, mismatched)
+    for draft in kept:
+        _age_draft(db_path, draft.id, timedelta(days=400))
+
+    reopened = DraftStore(db_path)
+    await reopened.open()
+    states = {draft.id: (await reopened.get_draft(draft.id)).state for draft in kept}
+    await reopened.close()
+
+    assert states == {
+        editable.id: DraftState.EDITABLE,
+        old_revision.id: DraftState.EDITABLE,
+        submitting.id: DraftState.SUBMITTING,
+        partial.id: DraftState.PARTIAL,
+        unknown.id: DraftState.UNKNOWN,
+        mismatched.id: DraftState.SUBMITTED,
+    }
+    for draft in (submitting, partial, unknown, mismatched):
+        assert _row_counts(db_path, draft.id) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_completion_prunes_expired_drafts_but_keeps_the_new_one(
+    db_path: Path,
+) -> None:
+    store = DraftStore(db_path)
+    await store.open()
+    expired_id, _expired_attempt = await _submitted(store)
+    await store.close()
+    _age_draft(db_path, expired_id, timedelta(days=2))
+    # Opening with a three-day window keeps it; the window shrinks before the
+    # next completion, which then prunes it.
+    store = DraftStore(db_path, submitted_retention=timedelta(days=3))
+    await store.open()
+    assert (await store.get_draft(expired_id)).state is DraftState.SUBMITTED
+    store.submitted_retention = timedelta(days=1)
+
+    fresh_id, fresh_attempt = await _submitted(store)
+
+    with pytest.raises(DraftNotFoundError):
+        await store.get_draft(expired_id)
+    assert (await store.get_attempt(fresh_attempt)).state is DraftState.SUBMITTED
+    assert (await store.get_draft(fresh_id)).state is DraftState.SUBMITTED
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_marked_submitted_reconciliation_keeps_the_attempt_readable(
+    db_path: Path,
+) -> None:
+    store = DraftStore(db_path)
+    await store.open()
+    draft = await store.create_draft(REVIEW, REVISION, make_content())
+    attempt = await store.lock_submission(draft.id, draft.version)
+    await store.mark_attempt_unknown(attempt.id)
+
+    reconciled = await store.reconcile_attempt(
+        attempt.id, ReconciliationResolution.MARK_SUBMITTED
+    )
+
+    assert reconciled.state is DraftState.SUBMITTED
+    assert (await store.get_attempt(attempt.id)).state is DraftState.SUBMITTED
+    await store.close()
+    _age_draft(db_path, draft.id, timedelta(hours=25))
+    await store.open()
+    with pytest.raises(DraftNotFoundError):
+        await store.get_attempt(attempt.id)
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_configured_retention_window_decides_what_is_pruned(
+    db_path: Path,
+) -> None:
+    store = DraftStore(db_path)
+    await store.open()
+    recent_id, _ = await _submitted(store)
+    older_id, _ = await _submitted(store)
+    await store.close()
+    _age_draft(db_path, recent_id, timedelta(days=2))
+    _age_draft(db_path, older_id, timedelta(days=8))
+
+    week = DraftStore(db_path, submitted_retention=timedelta(days=7))
+    await week.open()
+    assert (await week.get_draft(recent_id)).state is DraftState.SUBMITTED
+    with pytest.raises(DraftNotFoundError):
+        await week.get_draft(older_id)
+    await week.close()
+
+
+@pytest.mark.asyncio
+async def test_session_passes_the_configured_window_to_the_draft_store(
+    tmp_path: Path, db_path: Path
+) -> None:
+    store = DraftStore(db_path)
+    await store.open()
+    recent_id, _ = await _submitted(store)
+    older_id, _ = await _submitted(store)
+    await store.close()
+    _age_draft(db_path, recent_id, timedelta(days=2))
+    _age_draft(db_path, older_id, timedelta(days=8))
+
+    class _NoHosts:
+        def active_hostnames(self) -> list[str]:
+            return []
+
+        async def close_all(self) -> None:
+            return None
+
+    session = ApplicationSession(
+        config=Config(submitted_draft_retention=timedelta(days=7)),
+        cache=CacheStore(db_path=tmp_path / "cache.db"),
+        draft_db_path=db_path,
+        forge_registry=_NoHosts(),  # type: ignore[arg-type]
+    )
+    await session.start()
+    try:
+        assert session.drafts.submitted_retention == timedelta(days=7)
+        assert (await session.drafts.get_draft(recent_id)).id == recent_id
+        with pytest.raises(DraftNotFoundError):
+            await session.drafts.get_draft(older_id)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_session_falls_back_to_the_default_window_for_an_invalid_config(
+    tmp_path: Path, db_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = DraftStore(db_path)
+    await store.open()
+    recent_id, _ = await _submitted(store)
+    older_id, _ = await _submitted(store)
+    await store.close()
+    _age_draft(db_path, recent_id, timedelta(hours=2))
+    _age_draft(db_path, older_id, timedelta(hours=25))
+
+    class _NoHosts:
+        def active_hostnames(self) -> list[str]:
+            return []
+
+        async def close_all(self) -> None:
+            return None
+
+    # Only a Config built in code can hold a window load_config would refuse.
+    session = ApplicationSession(
+        config=Config(submitted_draft_retention=timedelta(minutes=5)),
+        cache=CacheStore(db_path=tmp_path / "cache.db"),
+        draft_db_path=db_path,
+        forge_registry=_NoHosts(),  # type: ignore[arg-type]
+    )
+    with caplog.at_level(logging.WARNING, logger="tongs.services.session"):
+        await session.start()
+    try:
+        assert session.drafts.submitted_retention == store_module.SUBMITTED_RETENTION
+        assert (await session.drafts.get_draft(recent_id)).id == recent_id
+        with pytest.raises(DraftNotFoundError):
+            await session.drafts.get_draft(older_id)
+        assert [record.getMessage() for record in caplog.records] == [
+            "Ignoring an invalid submitted draft retention window"
+        ]
+    finally:
+        await session.close()
+
+
+@pytest.mark.parametrize(
+    "window", [timedelta(0), timedelta(minutes=59), timedelta(days=366)]
+)
+def test_retention_outside_the_accepted_range_is_rejected(
+    db_path: Path, window: timedelta
+) -> None:
+    with pytest.raises(ValueError, match="between 1 hour and 365 days"):
+        DraftStore(db_path, submitted_retention=window)
+
+
+@pytest.mark.asyncio
+async def test_create_and_save_enforce_the_draft_limits(db_path: Path) -> None:
+    store = DraftStore(db_path)
+    await store.open()
+    too_many = DraftContent(
+        comments=tuple(
+            GeneralDraftComment(uuid4(), "note") for _ in range(MAX_DRAFT_COMMENTS + 1)
+        )
+    )
+    with pytest.raises(DraftLimitError, match="at most 200 comments"):
+        await store.create_draft(REVIEW, REVISION, too_many)
+    assert await store.list_drafts(review=REVIEW) == ()
+
+    at_limit = DraftContent(
+        body="\u00e9" * (MAX_DRAFT_BODY_BYTES // 2),
+        comments=tuple(
+            GeneralDraftComment(uuid4(), "tab\tand\nnewline")
+            for _ in range(MAX_DRAFT_COMMENTS)
+        ),
+    )
+    draft = await store.create_draft(REVIEW, REVISION, at_limit)
+
+    for content, message in (
+        (
+            DraftContent(body="\u00e9" * (MAX_DRAFT_BODY_BYTES // 2) + "x"),
+            "summary is over",
+        ),
+        (
+            DraftContent(comments=(GeneralDraftComment(uuid4(), "x" * 70_000),)),
+            "A comment is over the 65,536-byte limit",
+        ),
+        (DraftContent(body="bell\x07"), "control character"),
+        (
+            DraftContent(comments=(GeneralDraftComment(uuid4(), "cr\r"),)),
+            "control character",
+        ),
+        (DraftContent(body="\ud800"), "cannot be stored"),
+    ):
+        with pytest.raises(DraftLimitError, match=message) as raised:
+            await store.save_draft(
+                draft.id, draft.version, content, current_revision=REVISION
+            )
+        assert "x" * 100 not in str(raised.value)
+
+    stored = await store.get_draft(draft.id)
+    assert stored.version == draft.version
+    assert stored.content == at_limit
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_stored_draft_over_the_limits_still_loads(db_path: Path) -> None:
+    store = DraftStore(db_path)
+    await store.open()
+    draft = await store.create_draft(REVIEW, REVISION, DraftContent("short"))
+    await store.close()
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE drafts SET body = ? WHERE id = ?", ("x" * 70_000, str(draft.id))
+        )
+
+    await store.open()
+    loaded = await store.get_draft(draft.id)
+    listed = await store.list_drafts(review=REVIEW)
+    with pytest.raises(DraftLimitError):
+        await store.save_draft(
+            draft.id, draft.version, loaded.content, current_revision=REVISION
+        )
+    trimmed = await store.save_draft(
+        draft.id, draft.version, DraftContent("short again"), current_revision=REVISION
+    )
+    await store.close()
+
+    assert len(loaded.body) == 70_000
+    assert [item.id for item in listed] == [draft.id]
+    assert trimmed.body == "short again"

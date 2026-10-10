@@ -9,12 +9,19 @@ import pytest
 
 from tongs.services import ReviewRevision
 from tongs.state.drafts import (
+    MAX_DRAFT_BODY_BYTES,
+    MAX_DRAFT_COMMENTS,
     DiffSide,
     DraftContent,
+    DraftLimitError,
+    DraftStoreError,
     GeneralDraftComment,
     InlineAnchor,
     InlineDraftComment,
+    ReplyDraftComment,
     context_fingerprint,
+    draft_text_problem,
+    validate_draft_content,
 )
 
 
@@ -128,3 +135,95 @@ def test_anchor_rejects_non_integer_line_numbers() -> None:
             DiffSide.NEW,
             "fingerprint",
         )
+
+
+def test_draft_limits_match_the_documented_values() -> None:
+    assert MAX_DRAFT_BODY_BYTES == 65_536
+    assert MAX_DRAFT_COMMENTS == 200
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "plain",
+        "tab\tand\nnewline",
+        "x" * MAX_DRAFT_BODY_BYTES,
+        "\u00e9" * (MAX_DRAFT_BODY_BYTES // 2),
+        "\u00a0 non-breaking and \u2028 separator",
+    ],
+)
+def test_text_within_the_limits_has_no_problem(text: str) -> None:
+    assert draft_text_problem(text) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ("x" * (MAX_DRAFT_BODY_BYTES + 1), "is over the 65,536-byte limit"),
+        ("\u00e9" * (MAX_DRAFT_BODY_BYTES // 2) + "x", "is over the 65,536-byte limit"),
+        ("carriage\rreturn", "contains a control character"),
+        ("nul\x00", "contains a control character"),
+        ("escape\x1b[0m", "contains a control character"),
+        ("lone \ud800 surrogate", "contains text that cannot be stored"),
+        (b"bytes", "is not text"),
+    ],
+)
+def test_text_breaking_a_limit_names_the_problem(text: object, problem: str) -> None:
+    found = draft_text_problem(text)
+    assert found is not None
+    assert found.startswith(problem)
+
+
+def test_content_over_the_limits_still_constructs_but_fails_validation() -> None:
+    # Stored drafts written before the limits existed must keep loading.
+    oversized = DraftContent(
+        body="x" * 70_000,
+        comments=tuple(
+            GeneralDraftComment(uuid4(), "note") for _ in range(MAX_DRAFT_COMMENTS + 5)
+        ),
+    )
+    assert len(oversized.comments) == MAX_DRAFT_COMMENTS + 5
+    with pytest.raises(DraftLimitError) as raised:
+        validate_draft_content(oversized)
+    assert isinstance(raised.value, DraftStoreError)
+    assert str(raised.value) == "A draft can hold at most 200 comments."
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        (
+            DraftContent(body="x" * 70_000),
+            "The review summary is over the 65,536-byte limit.",
+        ),
+        (
+            DraftContent(comments=(ReplyDraftComment(uuid4(), "y" * 70_000, "t-1"),)),
+            "A comment is over the 65,536-byte limit.",
+        ),
+        (
+            DraftContent(
+                comments=(InlineDraftComment(uuid4(), "a\x07", make_anchor()),)
+            ),
+            "A comment contains a control character; only tab and newline are allowed.",
+        ),
+    ],
+)
+def test_validation_message_is_plain_and_never_quotes_the_text(
+    content: DraftContent, message: str
+) -> None:
+    with pytest.raises(DraftLimitError) as raised:
+        validate_draft_content(content)
+    assert str(raised.value) == message
+
+
+def test_content_at_the_limits_passes_validation() -> None:
+    validate_draft_content(
+        DraftContent(
+            body="x" * MAX_DRAFT_BODY_BYTES,
+            comments=tuple(
+                GeneralDraftComment(uuid4(), "z" * MAX_DRAFT_BODY_BYTES)
+                for _ in range(MAX_DRAFT_COMMENTS)
+            ),
+        )
+    )

@@ -4,6 +4,13 @@ import test, { afterEach } from "node:test";
 
 import { QueryCoordinator } from "../../../desktop/dist/src/renderer/core/query.js";
 import { createDiffFeature } from "../../../desktop/dist/src/renderer/features/diff/index.js";
+import {
+  capabilitiesReady,
+  enabledButton,
+  waitForCount,
+  waitForFlag,
+  waitForText,
+} from "./wait.mjs";
 
 const desktopRequire = createRequire(
   new URL("../../../desktop/package.json", import.meta.url),
@@ -18,11 +25,14 @@ Object.assign(globalThis, {
   HTMLElement: dom.window.HTMLElement,
   Node: dom.window.Node,
 });
-const { cleanup, fireEvent, render, waitFor } = desktopRequire(
+const { cleanup, fireEvent, render } = desktopRequire(
   "@testing-library/react",
 );
 const React = desktopRequire("react");
 afterEach(cleanup);
+
+/** The reply composer's resolve toggle, a capability-gated input. */
+const RESOLVE_TOGGLE = ".diff-thread-resolve input";
 
 const REVISION = {
   head_sha: "f8bbf4877cd1a58f2a3a9d1a1a86bd2f4b7a1c33",
@@ -104,11 +114,9 @@ test("the keyboard opens the composer, takes focus, closes on Escape, and fires 
     }),
     review,
   );
-  await waitFor(() =>
-    assert.equal(
-      view.container.querySelectorAll('.line-content[role="button"]').length,
-      3,
-    ),
+  await waitForCount(
+    () => view.container.querySelectorAll('.line-content[role="button"]').length,
+    3,
   );
   const lines = view.container.querySelectorAll('.line-content[role="button"]');
   fireEvent.keyDown(lines[1], { key: "c" });
@@ -145,7 +153,7 @@ test("the keyboard opens the composer, takes focus, closes on Escape, and fires 
   const editor = await view.findByLabelText("Inline review comment");
   fireEvent.change(editor, { target: { value: "Opened from the keyboard" } });
   fireEvent.keyDown(editor, { key: "Enter", ctrlKey: true });
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   assert.equal(saves[0].content.comments[0].body, "Opened from the keyboard");
   assert.equal(saves[0].content.comments[0].anchor.new_line, 11);
 });
@@ -174,7 +182,7 @@ test("Start a review saves an inline entry for the row and then offers Add to re
     target: { value: "Guard the zero divisor" },
   });
   fireEvent.click(view.getByRole("button", { name: "Start a review" }));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   assert.equal(creates.length, 1);
   assert.equal(creates[0].revision.head_sha, REVISION.head_sha);
   assert.equal(saves[0].expected_version, 1);
@@ -189,8 +197,9 @@ test("Start a review saves an inline entry for the row and then offers Add to re
   assert.equal(first.anchor.new_line, 11);
   assert.equal(first.anchor.side, "new");
   assert.equal(first.anchor.context_fingerprint.length, 64);
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".inline-composer").length, 0),
+  await waitForCount(
+    () => view.container.querySelectorAll(".inline-composer").length,
+    0,
   );
 
   // A second anchor keeps its own entry, so no inline target is retargeted.
@@ -209,7 +218,7 @@ test("Start a review saves an inline entry for the row and then offers Add to re
     target: { value: "This branch is unreachable" },
   });
   fireEvent.click(view.getByRole("button", { name: "Add to review" }));
-  await waitFor(() => assert.equal(saves.length, 2));
+  await waitForCount(() => saves.length, 2);
   assert.equal(creates.length, 1);
   assert.equal(saves[1].expected_version, 2);
   assert.deepEqual(
@@ -252,7 +261,7 @@ test("a retry after a failed save writes the entry once", async () => {
     target: { value: "Guard the zero divisor" },
   });
   fireEvent.click(view.getByRole("button", { name: "Start a review" }));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
 
   // The composer stays open with the text, so pressing the primary again is
   // the obvious next move.
@@ -260,14 +269,12 @@ test("a retry after a failed save writes the entry once", async () => {
     view.getByLabelText("Inline review comment").value,
     "Guard the zero divisor",
   );
-  await waitFor(() =>
-    assert.equal(
-      view.getByRole("button", { name: "Add to review" }).disabled,
-      false,
-    ),
+  await waitForFlag(
+    () => view.getByRole("button", { name: "Add to review" }).disabled,
+    false,
   );
   fireEvent.click(view.getByRole("button", { name: "Add to review" }));
-  await waitFor(() => assert.equal(saves.length, 2));
+  await waitForCount(() => saves.length, 2);
   assert.equal(creates.length, 1);
   assert.equal(saves[1].expected_version, 1);
   assert.equal(
@@ -300,7 +307,7 @@ test("a draft conflict refuses the primary action instead of appending again", a
     target: { value: "Guard the zero divisor" },
   });
   fireEvent.click(view.getByRole("button", { name: "Start a review" }));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   await view.findByText(
     "This pending review was changed elsewhere. Resolve the conflict in Your review before adding inline feedback.",
   );
@@ -360,7 +367,7 @@ test("a durable pending review is visible before the first press and is adopted,
     target: { value: "Guard the zero divisor" },
   });
   fireEvent.click(view.getByRole("button", { name: "Add to review" }));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   assert.equal(creates.length, 0);
   assert.equal(saves[0].expected_version, 3);
   assert.equal(saves[0].content.comments.length, 2);
@@ -489,11 +496,9 @@ test("a partial diff context refuses the draft path in its own words", async () 
 test("the gutter keeps an existing multi-line selection and the composer claims it", async () => {
   const review = "review-composer-range";
   const view = renderDiff(diffBridge(review), review);
-  await waitFor(() =>
-    assert.equal(
-      view.container.querySelectorAll('.line-content[role="button"]').length,
-      3,
-    ),
+  await waitForCount(
+    () => view.container.querySelectorAll('.line-content[role="button"]').length,
+    3,
   );
   const lines = view.container.querySelectorAll('.line-content[role="button"]');
   fireEvent.click(lines[0]);
@@ -532,7 +537,7 @@ test("Add comment now posts the immediate inline mutation and writes no draft", 
     target: { value: "Immediate note" },
   });
   fireEvent.click(view.getByRole("button", { name: "Add comment now" }));
-  await waitFor(() => assert.equal(posts.length, 1));
+  await waitForCount(() => posts.length, 1);
   assert.equal(saves.length, 0);
   assert.equal(posts[0].body, "Immediate note");
   assert.equal(posts[0].revision.head_sha, REVISION.head_sha);
@@ -542,8 +547,9 @@ test("Add comment now posts the immediate inline mutation and writes no draft", 
     line: 11,
     side: "RIGHT",
   });
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".inline-composer").length, 0),
+  await waitForCount(
+    () => view.container.querySelectorAll(".inline-composer").length,
+    0,
   );
   fireEvent.click(view.getByRole("button", { name: "Comment on new line 11" }));
   assert.equal((await view.findByLabelText("Inline review comment")).value, "");
@@ -585,10 +591,11 @@ test("the split layout keeps one composer and aligns the other pane with a space
   const review = "review-composer-split";
   const view = renderDiff(diffBridge(review), review);
   fireEvent.click(await view.findByText("Split"));
-  await waitFor(() =>
-    assert.ok(
-      view.container.querySelector('.split-cell[data-anchor-side="new"]'),
-    ),
+  await waitForFlag(
+    () =>
+      view.container.querySelector('.split-cell[data-anchor-side="new"]') !==
+      null,
+    true,
   );
   fireEvent.click(view.getByRole("button", { name: "Comment on new line 11" }));
   await view.findByLabelText("Inline comment composer");
@@ -612,7 +619,7 @@ test("a drag over the line numbers selects the range and the composer claims it"
   const review = "review-composer-drag";
   const saves = [];
   const view = renderDiff(wideBridge(review, { saveReviewDraft: recorder(review, saves) }), review);
-  await waitFor(() => assert.equal(lineAnchors(view).length, 6));
+  await waitForCount(() => lineAnchors(view).length, 6);
   fireEvent.mouseDown(lineAnchor(view, "new", 11));
   fireEvent.mouseOver(lineAnchor(view, "new", 13), { buttons: 1 });
   fireEvent.mouseUp(document);
@@ -648,7 +655,7 @@ test("a drag over the line numbers selects the range and the composer claims it"
     target: { value: "Guard the zero divisor" },
   });
   fireEvent.click(view.getByRole("button", { name: "Start a review" }));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   const anchor = saves[0].content.comments[0].anchor;
   assert.equal(anchor.side, "new");
   assert.equal(anchor.new_line, 13);
@@ -662,7 +669,7 @@ test("a Shift-click range built upward still records the start before the end", 
   const review = "review-composer-shift-range";
   const saves = [];
   const view = renderDiff(wideBridge(review, { saveReviewDraft: recorder(review, saves) }), review);
-  await waitFor(() => assert.equal(lineAnchors(view).length, 6));
+  await waitForCount(() => lineAnchors(view).length, 6);
   fireEvent.click(lineAnchor(view, "new", 13));
   fireEvent.click(lineAnchor(view, "new", 11), { shiftKey: true });
   assert.equal(view.container.querySelectorAll(".line-selected").length, 3);
@@ -676,7 +683,7 @@ test("a Shift-click range built upward still records the start before the end", 
     target: { value: "Reads as three statements" },
   });
   fireEvent.click(view.getByRole("button", { name: "Start a review" }));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   const anchor = saves[0].content.comments[0].anchor;
   assert.equal(anchor.new_line, 13);
   assert.equal(anchor.start_line, 11);
@@ -699,7 +706,7 @@ test("a range refuses both writes when the forge has no multiline capability", a
     }),
     review,
   );
-  await waitFor(() => assert.equal(lineAnchors(view).length, 6));
+  await waitForCount(() => lineAnchors(view).length, 6);
   fireEvent.mouseDown(lineAnchor(view, "new", 11));
   fireEvent.mouseOver(lineAnchor(view, "new", 12), { buttons: 1 });
   fireEvent.mouseUp(document);
@@ -744,7 +751,7 @@ test("Insert suggestion pre-fills the GitHub block and the entry keeps the range
   const review = "review-composer-suggest-github";
   const saves = [];
   const view = renderDiff(wideBridge(review, { saveReviewDraft: recorder(review, saves) }), review);
-  await waitFor(() => assert.equal(lineAnchors(view).length, 6));
+  await waitForCount(() => lineAnchors(view).length, 6);
   fireEvent.mouseDown(lineAnchor(view, "new", 11));
   fireEvent.mouseOver(lineAnchor(view, "new", 13), { buttons: 1 });
   fireEvent.mouseUp(document);
@@ -778,7 +785,7 @@ test("Insert suggestion pre-fills the GitHub block and the entry keeps the range
   );
 
   fireEvent.click(view.getByRole("button", { name: "Start a review" }));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   const comment = saves[0].content.comments[0];
   assert.equal(comment.kind, "inline");
   assert.equal(comment.body, expected);
@@ -802,7 +809,7 @@ test("Insert suggestion writes the GitLab directive and anchors the first line",
     review,
     "gitlab",
   );
-  await waitFor(() => assert.equal(lineAnchors(view).length, 6));
+  await waitForCount(() => lineAnchors(view).length, 6);
   fireEvent.mouseDown(lineAnchor(view, "new", 11));
   fireEvent.mouseOver(lineAnchor(view, "new", 13), { buttons: 1 });
   fireEvent.mouseUp(document);
@@ -821,7 +828,7 @@ test("Insert suggestion writes the GitLab directive and anchors the first line",
   // GitLab encodes the span in the fence, so the note itself anchors the
   // first line of the range and carries no range anchor.
   fireEvent.click(view.getByRole("button", { name: "Add comment now" }));
-  await waitFor(() => assert.equal(posts.length, 1));
+  await waitForCount(() => posts.length, 1);
   assert.equal(posts[0].body, expected);
   assert.deepEqual(posts[0].anchor, {
     old_path: "src/calc.py",
@@ -912,10 +919,11 @@ test("the Preview toggle renders the typed Markdown and hands focus back", async
     key: "Enter",
     ctrlKey: true,
   });
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   assert.equal(saves[0].content.comments[0].body, "**Guard** the divisor");
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".inline-composer").length, 0),
+  await waitForCount(
+    () => view.container.querySelectorAll(".inline-composer").length,
+    0,
   );
 
   // The typed text is cleared with the entry, and reopening starts empty.
@@ -931,12 +939,11 @@ test("a drag over the split line numbers selects the range and the composer clai
     review,
   );
   fireEvent.click(await view.findByText("Split"));
-  await waitFor(() =>
-    assert.equal(
+  await waitForCount(
+    () =>
       view.container.querySelectorAll('.split-cell[data-anchor-side="new"]')
         .length,
-      4,
-    ),
+    4,
   );
   fireEvent.mouseDown(splitNumber(view, "new", 11));
   fireEvent.mouseOver(splitNumber(view, "new", 13), { buttons: 1 });
@@ -965,7 +972,7 @@ test("a drag over the split line numbers selects the range and the composer clai
     target: { value: "Three statements at once" },
   });
   fireEvent.click(view.getByRole("button", { name: "Start a review" }));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   const anchor = saves[0].content.comments[0].anchor;
   assert.equal(anchor.side, "new");
   assert.equal(anchor.new_line, 13);
@@ -981,12 +988,11 @@ test("a split Shift-click range built upward records the start before the end", 
     review,
   );
   fireEvent.click(await view.findByText("Split"));
-  await waitFor(() =>
-    assert.equal(
+  await waitForCount(
+    () =>
       view.container.querySelectorAll('.split-cell[data-anchor-side="new"]')
         .length,
-      4,
-    ),
+    4,
   );
   fireEvent.click(splitCell(view, "new", 13));
   fireEvent.click(splitCell(view, "new", 11), { shiftKey: true });
@@ -1004,7 +1010,7 @@ test("a split Shift-click range built upward records the start before the end", 
     target: { value: "Built from the bottom up" },
   });
   fireEvent.click(view.getByRole("button", { name: "Start a review" }));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   const anchor = saves[0].content.comments[0].anchor;
   assert.equal(anchor.new_line, 13);
   assert.equal(anchor.start_line, 11);
@@ -1014,7 +1020,7 @@ test("a split Shift-click range built upward records the start before the end", 
 test("the drag affordance is the line number, so diff code stays selectable", async () => {
   const review = "review-composer-selectable";
   const view = renderDiff(wideBridge(review), review);
-  await waitFor(() => assert.equal(lineAnchors(view).length, 6));
+  await waitForCount(() => lineAnchors(view).length, 6);
 
   // fireEvent returns false when a handler called preventDefault, which is
   // what suppresses the browser's own text selection.
@@ -1027,12 +1033,11 @@ test("the drag affordance is the line number, so diff code stays selectable", as
   assert.equal(fireEvent.mouseDown(lineAnchor(view, "new", 12)), false);
 
   fireEvent.click(view.getByText("Split"));
-  await waitFor(() =>
-    assert.equal(
+  await waitForCount(
+    () =>
       view.container.querySelectorAll('.split-cell[data-anchor-side="new"]')
         .length,
-      4,
-    ),
+    4,
   );
   assert.equal(
     fireEvent.mouseDown(
@@ -1055,7 +1060,7 @@ test("a drag that overshoots into the next hunk stops at the boundary", async ()
     }),
     review,
   );
-  await waitFor(() => assert.equal(lineAnchors(view).length, 9));
+  await waitForCount(() => lineAnchors(view).length, 9);
   fireEvent.mouseDown(lineAnchor(view, "new", 11));
   fireEvent.mouseOver(lineAnchor(view, "new", 13), { buttons: 1 });
   assert.equal(view.container.querySelectorAll(".line-selected").length, 3);
@@ -1087,7 +1092,7 @@ test("a saved entry becomes a pending card under its own row", async () => {
   });
   assert.equal(view.container.querySelectorAll(".pending-card").length, 0);
   fireEvent.click(view.getByRole("button", { name: "Start a review" }));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
 
   const card = await view.findByLabelText("Pending review comment on new line 11");
   assert.equal(view.container.querySelectorAll(".pending-card").length, 1);
@@ -1151,7 +1156,7 @@ test("Edit round-trips the body and replaces the entry instead of appending", as
 
   fireEvent.change(editor, { target: { value: "Raise ZeroDivisionError instead" } });
   fireEvent.click(view.getByRole("button", { name: "Save changes" }));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   assert.equal(saves[0].expected_version, 4);
   assert.deepEqual(
     saves[0].content.comments.map((comment) => `${comment.id}:${comment.body}`),
@@ -1192,14 +1197,15 @@ test("Delete saves the draft without the entry", async () => {
   fireEvent.click(
     view.getByRole("button", { name: "Delete pending comment on new line 11" }),
   );
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   assert.equal(saves[0].expected_version, 6);
   assert.deepEqual(
     saves[0].content.comments.map((comment) => `${comment.id}:${comment.body}`),
     ["entry-b:Second note"],
   );
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".pending-card").length, 1),
+  await waitForCount(
+    () => view.container.querySelectorAll(".pending-card").length,
+    1,
   );
   assert.equal(
     view.queryAllByLabelText("Pending review comment on new line 11").length,
@@ -1362,17 +1368,18 @@ test("a failed entry delete restores the pending card and reports the failure", 
   fireEvent.click(
     view.getByRole("button", { name: "Delete pending comment on new line 11" }),
   );
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   // The entry is put back exactly as it was, so the obvious retry sends the
   // same removal once rather than saving a review the store never lost.
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".pending-card").length, 1),
+  await waitForCount(
+    () => view.container.querySelectorAll(".pending-card").length,
+    1,
   );
   assert.equal(view.getByText("1 pending").textContent, "1 pending");
   fireEvent.click(
     view.getByRole("button", { name: "Delete pending comment on new line 11" }),
   );
-  await waitFor(() => assert.equal(saves.length, 2));
+  await waitForCount(() => saves.length, 2);
   assert.equal(saves[1].expected_version, 5);
   assert.deepEqual(
     saves[1].content.comments.map((comment) => comment.id),
@@ -1411,7 +1418,7 @@ test("switching a row's composer from a new comment to Edit keeps the two texts 
 
   fireEvent.change(editor, { target: { value: "Raise ZeroDivisionError instead" } });
   fireEvent.click(view.getByRole("button", { name: "Save changes" }));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   assert.deepEqual(
     saves[0].content.comments.map((comment) => `${comment.id}:${comment.body}`),
     ["entry-a:Raise ZeroDivisionError instead"],
@@ -1453,7 +1460,7 @@ test("switching a row's composer from Edit to a new comment keeps the two texts 
 
   fireEvent.change(composer, { target: { value: "A second note on this line" } });
   fireEvent.click(view.getByRole("button", { name: "Add to review" }));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   // The abandoned edit is not appended, and the stored body is untouched.
   assert.deepEqual(
     saves[0].content.comments.map((comment) => comment.body),
@@ -1483,8 +1490,9 @@ test("saving a pending comment that was not changed writes no new version", asyn
   );
   await view.findByLabelText("Edit pending comment composer");
   fireEvent.click(view.getByRole("button", { name: "Save changes" }));
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".inline-composer").length, 0),
+  await waitForCount(
+    () => view.container.querySelectorAll(".inline-composer").length,
+    0,
   );
   // No version was burned, and the entry is back as a card unchanged.
   assert.equal(saves.length, 0);
@@ -1535,7 +1543,7 @@ test("editing one entry then another on the same row never writes one body into 
 
   fireEvent.change(editor, { target: { value: "BBB edited" } });
   fireEvent.click(view.getByRole("button", { name: "Save changes" }));
-  await waitFor(() => assert.equal(saves.length, 1));
+  await waitForCount(() => saves.length, 1);
   assert.deepEqual(
     saves[0].content.comments.map((comment) => `${comment.id}:${comment.body}`),
     ["entry-a:AAA body", "entry-b:BBB edited"],
@@ -1658,8 +1666,9 @@ test("expanding a thread renders its bodies in place and collapsing takes them a
     "Summary of the discussion on new line 11",
   );
   fireEvent.click(summary);
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".diff-thread-body").length, 1),
+  await waitForCount(
+    () => view.container.querySelectorAll(".diff-thread-body").length,
+    1,
   );
   assert.equal(summary.getAttribute("aria-expanded"), "true");
   assert.equal(
@@ -1676,8 +1685,9 @@ test("expanding a thread renders its bodies in place and collapsing takes them a
     1,
   );
   fireEvent.click(summary);
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".diff-thread-body").length, 0),
+  await waitForCount(
+    () => view.container.querySelectorAll(".diff-thread-body").length,
+    0,
   );
   assert.equal(
     view.container.querySelectorAll(".thread-row.thread-row-expanded").length,
@@ -1701,8 +1711,9 @@ test("a thread body renders remote Markdown through the safe renderer only", asy
   fireEvent.click(
     await view.findByLabelText("Summary of the discussion on new line 11"),
   );
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".diff-thread-body").length, 1),
+  await waitForCount(
+    () => view.container.querySelectorAll(".diff-thread-body").length,
+    1,
   );
   assert.equal(
     view.container.querySelectorAll(
@@ -1734,7 +1745,7 @@ test("Reply publishes exactly one reply, without a resolution, and keeps its tex
     review,
   );
   fireEvent.click(
-    await view.findByRole("button", { name: "Reply to the discussion on new line 11" }),
+    await enabledButton(view, "Reply to the discussion on new line 11"),
   );
   const editor = await view.findByLabelText(
     "Reply body for the discussion on new line 11",
@@ -1763,13 +1774,11 @@ test("Reply publishes exactly one reply, without a resolution, and keeps its tex
   );
 
   fireEvent.click(view.getByRole("button", { name: "Reply now" }));
-  await waitFor(() => assert.equal(calls.length, 1));
+  await waitForCount(() => calls.length, 1);
   assert.deepEqual(calls, [["reply", "d1", "Guarded now"]]);
-  await waitFor(() =>
-    assert.equal(
-      view.container.querySelector(".diff-thread-summary").textContent,
-      "1 reply, unresolved, last by @you",
-    ),
+  await waitForText(
+    () => view.container.querySelector(".diff-thread-summary").textContent,
+    "1 reply, unresolved, last by @you",
   );
   // One press is one mutation, and no resolution was written.
   assert.equal(calls.length, 1);
@@ -1797,11 +1806,12 @@ test("the Resolve thread toggle resolves the thread with the same press that rep
     review,
   );
   fireEvent.click(
-    await view.findByRole("button", { name: "Reply to the discussion on new line 11" }),
+    await enabledButton(view, "Reply to the discussion on new line 11"),
   );
   const editor = await view.findByLabelText(
     "Reply body for the discussion on new line 11",
   );
+  await capabilitiesReady(view.container, RESOLVE_TOGGLE);
   const toggle = view.getByLabelText("Resolve thread");
   assert.equal(toggle.disabled, false);
   assert.equal(toggle.checked, false);
@@ -1809,16 +1819,14 @@ test("the Resolve thread toggle resolves the thread with the same press that rep
   assert.equal(toggle.checked, true);
   fireEvent.change(editor, { target: { value: "Guarded now" } });
   fireEvent.keyDown(editor, { key: "Enter", ctrlKey: true });
-  await waitFor(() => assert.equal(calls.length, 2));
+  await waitForCount(() => calls.length, 2);
   assert.deepEqual(calls, [
     ["reply", "d1", "Guarded now"],
     ["resolve", "d1", true],
   ]);
-  await waitFor(() =>
-    assert.equal(
-      view.container.querySelector(".diff-thread-summary").textContent,
-      "1 reply, resolved, last by @you",
-    ),
+  await waitForText(
+    () => view.container.querySelector(".diff-thread-summary").textContent,
+    "1 reply, resolved, last by @you",
   );
   // Exactly one mutation per action: no second reply and no second resolution.
   assert.equal(calls.length, 2);
@@ -1843,14 +1851,12 @@ test("a resolved thread offers Reopen thread and reopens it with the reply", asy
     ),
     review,
   );
-  await waitFor(() =>
-    assert.equal(
-      view.container.querySelector(".diff-thread-summary").textContent,
-      "1 reply, resolved, last by @author",
-    ),
+  await waitForText(
+    () => view.container.querySelector(".diff-thread-summary").textContent,
+    "1 reply, resolved, last by @author",
   );
   fireEvent.click(
-    view.getByRole("button", { name: "Reply to the discussion on new line 11" }),
+    await enabledButton(view, "Reply to the discussion on new line 11"),
   );
   const editor = await view.findByLabelText(
     "Reply body for the discussion on new line 11",
@@ -1860,16 +1866,14 @@ test("a resolved thread offers Reopen thread and reopens it with the reply", asy
   fireEvent.click(toggle);
   fireEvent.change(editor, { target: { value: "Still wrong" } });
   fireEvent.click(view.getByRole("button", { name: "Reply now" }));
-  await waitFor(() => assert.equal(calls.length, 2));
+  await waitForCount(() => calls.length, 2);
   assert.deepEqual(calls, [
     ["reply", "d1", "Still wrong"],
     ["resolve", "d1", false],
   ]);
-  await waitFor(() =>
-    assert.equal(
-      view.container.querySelector(".diff-thread-summary").textContent,
-      "2 replies, unresolved, last by @you",
-    ),
+  await waitForText(
+    () => view.container.querySelector(".diff-thread-summary").textContent,
+    "2 replies, unresolved, last by @you",
   );
 });
 
@@ -1890,7 +1894,7 @@ test("a second press while a reply is in flight writes one mutation, not two", a
     review,
   );
   fireEvent.click(
-    await view.findByRole("button", { name: "Reply to the discussion on new line 11" }),
+    await enabledButton(view, "Reply to the discussion on new line 11"),
   );
   const editor = await view.findByLabelText(
     "Reply body for the discussion on new line 11",
@@ -1902,8 +1906,9 @@ test("a second press while a reply is in flight writes one mutation, not two", a
   fireEvent.keyDown(editor, { key: "Enter", ctrlKey: true });
   assert.equal(calls.length, 1);
   release();
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".diff-thread-composer").length, 0),
+  await waitForCount(
+    () => view.container.querySelectorAll(".diff-thread-composer").length,
+    0,
   );
   assert.equal(calls.length, 1);
 });
@@ -1919,12 +1924,13 @@ test("the resolve toggle is refused in the forge's own words when the capability
     review,
   );
   fireEvent.click(
-    await view.findByRole("button", { name: "Reply to the discussion on new line 11" }),
+    await enabledButton(view, "Reply to the discussion on new line 11"),
   );
   const editor = await view.findByLabelText(
     "Reply body for the discussion on new line 11",
   );
   const refusal = "Resolution is unsupported for this review.";
+  await capabilitiesReady(view.container, RESOLVE_TOGGLE);
   const toggle = view.getByLabelText("Resolve thread");
   assert.equal(toggle.disabled, true);
   assert.equal(toggle.title, refusal);
@@ -1936,7 +1942,7 @@ test("the resolve toggle is refused in the forge's own words when the capability
   // The reply still works, and it writes no resolution.
   fireEvent.change(editor, { target: { value: "Guarded now" } });
   fireEvent.click(view.getByRole("button", { name: "Reply now" }));
-  await waitFor(() => assert.equal(calls.length, 1));
+  await waitForCount(() => calls.length, 1);
   assert.deepEqual(calls, [["reply", "d1", "Guarded now"]]);
 });
 
@@ -1947,10 +1953,11 @@ test("a thread the forge cannot resolve says so about the thread, not the review
     review,
   );
   fireEvent.click(
-    await view.findByRole("button", { name: "Reply to the discussion on new line 11" }),
+    await enabledButton(view, "Reply to the discussion on new line 11"),
   );
   await view.findByLabelText("Reply body for the discussion on new line 11");
   const refusal = "Resolution is unsupported for this discussion.";
+  await capabilitiesReady(view.container, RESOLVE_TOGGLE);
   assert.equal(view.getByLabelText("Resolve thread").disabled, true);
   assert.equal(view.getByLabelText("Resolve thread").title, refusal);
   assert.equal(
@@ -1971,8 +1978,9 @@ test("a review without the reply capability refuses Reply in its own words", asy
   const button = await view.findByRole("button", {
     name: "Reply to the discussion on new line 11",
   });
-  await waitFor(() =>
-    assert.equal(button.title, "Replies are unsupported for this review."),
+  await waitForText(
+    () => button.title,
+    "Replies are unsupported for this review.",
   );
   assert.equal(button.disabled, true);
   fireEvent.click(button);
@@ -2046,11 +2054,9 @@ test("the split layout renders a thread in its own pane and mirrors the other", 
   fireEvent.click(
     view.getByLabelText("Summary of the discussion on new line 11"),
   );
-  await waitFor(() =>
-    assert.equal(
-      view.container.querySelectorAll(".split-pane-new .thread-row-expanded").length,
-      1,
-    ),
+  await waitForCount(
+    () => view.container.querySelectorAll(".split-pane-new .thread-row-expanded").length,
+    1,
   );
   assert.equal(
     view.container.querySelectorAll(
@@ -2090,8 +2096,9 @@ test("a review with two hundred threads renders only the threads its window hold
   );
 
   fireEvent.click(view.getByRole("button", { name: "Next rows" }));
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".diff-thread").length, 2),
+  await waitForCount(
+    () => view.container.querySelectorAll(".diff-thread").length,
+    2,
   );
   assert.equal(
     view.container.querySelector(".window-position").textContent,
@@ -2138,7 +2145,7 @@ test("a resolution refused after the reply is said on the thread the reply was w
     review,
   );
   fireEvent.click(
-    await view.findByRole("button", { name: "Reply to the discussion on new line 11" }),
+    await enabledButton(view, "Reply to the discussion on new line 11"),
   );
   const editor = await view.findByLabelText(
     "Reply body for the discussion on new line 11",
@@ -2146,10 +2153,11 @@ test("a resolution refused after the reply is said on the thread the reply was w
   fireEvent.click(view.getByLabelText("Resolve thread"));
   fireEvent.change(editor, { target: { value: "Guarded now" } });
   fireEvent.click(view.getByRole("button", { name: "Reply now" }));
-  await waitFor(() => assert.equal(calls.length, 2));
+  await waitForCount(() => calls.length, 2);
   // The composer is gone, and the sentence is on the thread that asked for it.
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".diff-thread-notice").length, 1),
+  await waitForCount(
+    () => view.container.querySelectorAll(".diff-thread-notice").length,
+    1,
   );
   assert.equal(view.container.querySelectorAll(".diff-thread-composer").length, 0);
   assert.equal(
@@ -2201,16 +2209,17 @@ test("a failed reread after the reply is named and blocks a second reply on that
     review,
   );
   fireEvent.click(
-    await view.findByRole("button", { name: "Reply to the discussion on new line 11" }),
+    await enabledButton(view, "Reply to the discussion on new line 11"),
   );
   fireEvent.change(
     await view.findByLabelText("Reply body for the discussion on new line 11"),
     { target: { value: "Guarded now" } },
   );
   fireEvent.click(view.getByRole("button", { name: "Reply now" }));
-  await waitFor(() => assert.equal(calls.length, 1));
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".diff-thread-notice").length, 1),
+  await waitForCount(() => calls.length, 1);
+  await waitForCount(
+    () => view.container.querySelectorAll(".diff-thread-notice").length,
+    1,
   );
   const refusal =
     "The reply was published. Rereading the discussions failed, so this thread is out of date. Refresh the diff before replying again.";
@@ -2237,8 +2246,9 @@ test("a failed reread after the reply is named and blocks a second reply on that
   // Refresh rereads the discussions, which is what the sentence tells the
   // reader to do, and the thread takes replies again.
   fireEvent.click(view.getByRole("button", { name: "Refresh" }));
-  await waitFor(() =>
-    assert.equal(view.container.querySelectorAll(".diff-thread-notice").length, 0),
+  await waitForCount(
+    () => view.container.querySelectorAll(".diff-thread-notice").length,
+    0,
   );
   assert.equal(reads, 3);
   assert.equal(
@@ -2267,7 +2277,7 @@ test("a reply composer opened while a review is pending says the reply publishes
   );
   await view.findByLabelText("Pending review comment on new line 11");
   fireEvent.click(
-    view.getByRole("button", { name: "Reply to the discussion on new line 11" }),
+    await enabledButton(view, "Reply to the discussion on new line 11"),
   );
   const composer = await view.findByLabelText(
     "Reply composer for the discussion on new line 11",
@@ -2284,7 +2294,7 @@ test("a reply composer with no pending review does not claim one", async () => {
   const review = "review-thread-no-pending-note";
   const view = renderDiff(threadBridge(review, [[thread("d1")]], []), review);
   fireEvent.click(
-    await view.findByRole("button", { name: "Reply to the discussion on new line 11" }),
+    await enabledButton(view, "Reply to the discussion on new line 11"),
   );
   await view.findByLabelText("Reply body for the discussion on new line 11");
   assert.equal(
@@ -2327,14 +2337,14 @@ test("two threads on one line are named by their place among them", async () => 
 
   // Answering the second one reaches the second one.
   fireEvent.click(
-    view.getByRole("button", { name: "Reply to discussion 2 of 2 on new line 11" }),
+    await enabledButton(view, "Reply to discussion 2 of 2 on new line 11"),
   );
   fireEvent.change(
     await view.findByLabelText("Reply body for discussion 2 of 2 on new line 11"),
     { target: { value: "The second one" } },
   );
   fireEvent.click(view.getByRole("button", { name: "Reply now" }));
-  await waitFor(() => assert.equal(calls.length, 1));
+  await waitForCount(() => calls.length, 1);
   assert.deepEqual(calls, [["reply", "d2", "The second one"]]);
 });
 
