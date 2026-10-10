@@ -10,16 +10,26 @@ import httpx
 import pytest
 
 import tongs.forges.github as github_module
+from tests.test_forges.github_ci_batch import (
+    answer_ci_batch,
+    batch_pulls,
+    check_run,
+    is_ci_batch,
+    pull_node,
+    status_context,
+)
 from tongs.errors import (
     ConflictError,
     ForgeError,
     NotFoundError,
     PartialResultsError,
+    RateLimitError,
     ValidationError,
 )
 from tongs.forges.github import (
     GitHubClient,
-    _aggregate_check_runs,
+    _aggregate_ci_states,
+    _check_run_state,
     _parse_ci_status,
 )
 from tongs.forges.models import (
@@ -696,13 +706,29 @@ def _run(conclusion: str | None, status: str = "completed") -> dict:
     return {"status": status, "conclusion": conclusion}
 
 
+def _rest_ci(handler):
+    """Answer GraphQL with 404, as a GitHub Enterprise host without it does.
+
+    CI reads then use the REST check runs and commit statuses that
+    ``handler`` answers. The GraphQL request is not passed on.
+    """
+
+    def wrapped(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/graphql":
+            return httpx.Response(404, json={"message": "Not Found"})
+        return handler(request)
+
+    return wrapped
+
+
 def _no_commit_statuses(handler):
     """Answer the combined commit status request with no statuses.
 
     Every other request goes to ``handler``, so check-run tests see only
-    their own requests.
+    their own requests. CI reads use REST (see ``_rest_ci``).
     """
 
+    @_rest_ci
     def wrapped(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/status"):
             # GitHub reports "pending" for a commit without any status.
@@ -735,7 +761,8 @@ class TestCheckRunAggregation:
         ],
     )
     def test_aggregate(self, runs: list[dict], expected: CIStatus) -> None:
-        assert _aggregate_check_runs(runs) == expected
+        states = [_check_run_state(run) for run in runs]
+        assert _aggregate_ci_states(states) == expected
 
     @pytest.mark.parametrize(
         ("status", "conclusion", "expected"),
@@ -841,8 +868,10 @@ def _ci_sources_handler(
     """Answer one commit's check runs and combined status from fixed data.
 
     A list is one complete page; a response is returned as is, for errors.
+    CI reads use REST (see ``_rest_ci``).
     """
 
+    @_rest_ci
     def handler(request: httpx.Request) -> httpx.Response:
         if paths is not None:
             paths.append(request.url.path)
@@ -878,6 +907,44 @@ def _bad_gateway() -> httpx.Response:
     return httpx.Response(502, json={"message": "bad gateway"})
 
 
+# Check runs and commit statuses of one commit, and the CI they combine to.
+_MERGE_RULE_CASES = [
+    # A pull request that only reports through commit statuses.
+    ([], [_commit_status("success")], CIStatus.SUCCESS),
+    ([], [_commit_status("failure")], CIStatus.FAILED),
+    ([], [_commit_status("error")], CIStatus.FAILED),
+    ([], [_commit_status("pending")], CIStatus.PENDING),
+    (
+        [],
+        [_commit_status("success", "a"), _commit_status("pending", "b")],
+        CIStatus.PENDING,
+    ),
+    # Both sources: any failure wins.
+    ([_run("success")], [_commit_status("failure")], CIStatus.FAILED),
+    ([_run("failure")], [_commit_status("success")], CIStatus.FAILED),
+    ([_run("failure")], [_commit_status("pending")], CIStatus.FAILED),
+    # Then pending work, whichever source reports it.
+    ([_run("success")], [_commit_status("pending")], CIStatus.PENDING),
+    (
+        [_run(None, "in_progress")],
+        [_commit_status("success")],
+        CIStatus.RUNNING,
+    ),
+    ([_run(None, "queued")], [_commit_status("success")], CIStatus.PENDING),
+    # Then success.
+    ([_run("success")], [_commit_status("success")], CIStatus.SUCCESS),
+    ([_run("skipped")], [_commit_status("success")], CIStatus.SUCCESS),
+    # Check runs alone keep their own aggregate.
+    ([_run("success")], [], CIStatus.SUCCESS),
+    ([_run("skipped")], [], CIStatus.SKIPPED),
+    ([_run("cancelled")], [], CIStatus.CANCELED),
+    # Nothing at all stays unknown, despite the combined "pending".
+    ([], [], CIStatus.UNKNOWN),
+    # A state GitHub may add later is not read as success.
+    ([], [_commit_status("something_new")], CIStatus.UNKNOWN),
+]
+
+
 class TestCommitStatuses:
     """Check runs and legacy commit statuses combine into one CI state (#385).
 
@@ -885,44 +952,7 @@ class TestCommitStatuses:
     with neither stays unknown.
     """
 
-    @pytest.mark.parametrize(
-        ("runs", "statuses", "expected"),
-        [
-            # A pull request that only reports through commit statuses.
-            ([], [_commit_status("success")], CIStatus.SUCCESS),
-            ([], [_commit_status("failure")], CIStatus.FAILED),
-            ([], [_commit_status("error")], CIStatus.FAILED),
-            ([], [_commit_status("pending")], CIStatus.PENDING),
-            (
-                [],
-                [_commit_status("success", "a"), _commit_status("pending", "b")],
-                CIStatus.PENDING,
-            ),
-            # Both sources: any failure wins.
-            ([_run("success")], [_commit_status("failure")], CIStatus.FAILED),
-            ([_run("failure")], [_commit_status("success")], CIStatus.FAILED),
-            ([_run("failure")], [_commit_status("pending")], CIStatus.FAILED),
-            # Then pending work, whichever source reports it.
-            ([_run("success")], [_commit_status("pending")], CIStatus.PENDING),
-            (
-                [_run(None, "in_progress")],
-                [_commit_status("success")],
-                CIStatus.RUNNING,
-            ),
-            ([_run(None, "queued")], [_commit_status("success")], CIStatus.PENDING),
-            # Then success.
-            ([_run("success")], [_commit_status("success")], CIStatus.SUCCESS),
-            ([_run("skipped")], [_commit_status("success")], CIStatus.SUCCESS),
-            # Check runs alone keep their own aggregate.
-            ([_run("success")], [], CIStatus.SUCCESS),
-            ([_run("skipped")], [], CIStatus.SKIPPED),
-            ([_run("cancelled")], [], CIStatus.CANCELED),
-            # Nothing at all stays unknown, despite the combined "pending".
-            ([], [], CIStatus.UNKNOWN),
-            # A state GitHub may add later is not read as success.
-            ([], [_commit_status("something_new")], CIStatus.UNKNOWN),
-        ],
-    )
+    @pytest.mark.parametrize(("runs", "statuses", "expected"), _MERGE_RULE_CASES)
     @pytest.mark.asyncio
     async def test_merge_rule(
         self, runs: list[dict], statuses: list[dict], expected: CIStatus
@@ -1030,6 +1060,7 @@ class TestCommitStatuses:
     async def test_statuses_page_up_to_total_count(self) -> None:
         pages: list[str] = []
 
+        @_rest_ci
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path.endswith("/check-runs"):
                 return httpx.Response(200, json={"total_count": 0, "check_runs": []})
@@ -1052,6 +1083,7 @@ class TestCommitStatuses:
 
     @pytest.mark.asyncio
     async def test_statuses_beyond_the_page_limit_never_claim_success(self) -> None:
+        @_rest_ci
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path.endswith("/check-runs"):
                 return httpx.Response(
@@ -1518,11 +1550,12 @@ class TestLazyCI:
         assert detail.head_sha == "abc123def456"
 
     @pytest.mark.asyncio
-    async def test_lookup_with_a_head_reads_its_check_runs_and_statuses(
+    async def test_lookup_without_graphql_reads_its_check_runs_and_statuses(
         self,
     ) -> None:
         paths: list[str] = []
 
+        @_rest_ci
         def handler(request: httpx.Request) -> httpx.Response:
             paths.append(request.url.path)
             if request.url.path.endswith("/status"):
@@ -1594,3 +1627,331 @@ class TestLazyCI:
             status = await client.get_mr_ci_status("acme/repo", 10, "sha-1")
 
         assert status is CIStatus.UNKNOWN
+
+
+def _rollup_node(run_or_status: dict) -> dict:
+    """Return the GraphQL rollup node of a REST check run or commit status."""
+    if "conclusion" in run_or_status:
+        return check_run(run_or_status["conclusion"], run_or_status["status"])
+    return status_context(run_or_status["state"])
+
+
+class TestBatchedCI:
+    """Per-pull-request CI reads share GraphQL queries (#396 follow-up).
+
+    Reads that arrive together become one query of up to 50 pull requests,
+    across repositories, and the answer equals the REST reads. A pull request
+    the batch cannot answer is read over REST.
+    """
+
+    @pytest.mark.parametrize(("runs", "statuses", "expected"), _MERGE_RULE_CASES)
+    @pytest.mark.asyncio
+    async def test_the_batch_answers_like_the_rest_reads(
+        self, runs: list[dict], statuses: list[dict], expected: CIStatus
+    ) -> None:
+        paths: list[str] = []
+        checks = [_rollup_node(item) for item in runs + statuses]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            assert is_ci_batch(request)
+            return answer_ci_batch(
+                request,
+                lambda _owner, _repo, _number: pull_node(
+                    "abc", checks if checks else None
+                ),
+            )
+
+        client, http = _make_github_client(handler)
+        async with http:
+            assert await client.get_mr_ci_status("acme/repo", 10, "abc") is expected
+        assert paths == ["/graphql"]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_reads_become_one_query_per_fifty(self) -> None:
+        batches: list[list[tuple[str, str, int]]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert is_ci_batch(request), request.url.path
+            batches.append(batch_pulls(request))
+            return answer_ci_batch(
+                request,
+                lambda _owner, repo, number: pull_node(
+                    f"{repo}-{number}",
+                    [check_run("failure" if number % 2 else "success")],
+                ),
+            )
+
+        client, http = _make_github_client(handler)
+        reads = [(f"repo{index % 3}", index) for index in range(1, 121)]
+        async with http:
+            statuses = await asyncio.gather(
+                *(
+                    client.get_mr_ci_status(f"acme/{repo}", number, f"{repo}-{number}")
+                    for repo, number in reads
+                )
+            )
+
+        # 120 reads over three repositories: ceil(120 / 50) queries.
+        assert [len(batch) for batch in batches] == [50, 50, 20]
+        assert sorted(pull for batch in batches for pull in batch) == sorted(
+            ("acme", repo, number) for repo, number in reads
+        )
+        assert {len({repo for _owner, repo, _n in batch}) for batch in batches} == {3}
+        assert statuses == [
+            CIStatus.FAILED if number % 2 else CIStatus.SUCCESS for _r, number in reads
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_page_with_ci_is_one_list_and_one_query(self) -> None:
+        paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            if request.url.path == "/repos/acme/repo/pulls":
+                return httpx.Response(
+                    200,
+                    json=[
+                        _pr_api_json(
+                            {"number": n, "head": {"ref": "x", "sha": f"s{n}"}}
+                        )
+                        for n in (1, 2, 3)
+                    ],
+                )
+            return answer_ci_batch(
+                request,
+                lambda _owner, _repo, number: pull_node(
+                    f"s{number}", [check_run(None, "in_progress")]
+                ),
+            )
+
+        client, http = _make_github_client(handler)
+        async with http:
+            page = await client.list_mrs_page("acme/repo")
+
+        assert paths == ["/repos/acme/repo/pulls", "/graphql"]
+        assert {item.ci_status for item in page.items} == {CIStatus.RUNNING}
+
+    @pytest.mark.asyncio
+    async def test_a_lookup_without_a_head_uses_the_current_head(self) -> None:
+        paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            return answer_ci_batch(
+                request,
+                lambda _owner, _repo, _number: pull_node(
+                    "current", [status_context("error")]
+                ),
+            )
+
+        client, http = _make_github_client(handler)
+        async with http:
+            assert await client.get_mr_ci_status("acme/repo", 10) is CIStatus.FAILED
+        assert paths == ["/graphql"]
+
+    @pytest.mark.parametrize(
+        "node",
+        [
+            # More checks than one query reads.
+            pull_node("abc", [check_run("success")] * 100, total=101),
+            # The head moved since the list read named "abc".
+            pull_node("newer", [check_run("success")]),
+            # The newest commit is not the head asked for.
+            pull_node("abc", [check_run("success")], commit="other"),
+            # Not a pull request node at all.
+            None,
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_pull_request_the_batch_cannot_answer_reads_rest(
+        self, node: dict | None
+    ) -> None:
+        paths: list[str] = []
+        rest = _ci_sources_handler([_run("failure")], [], paths)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if is_ci_batch(request):
+                paths.append("/graphql")
+                return answer_ci_batch(
+                    request,
+                    lambda _owner, _repo, number: (
+                        node
+                        if number == 10
+                        else pull_node("def", [check_run("success")])
+                    ),
+                )
+            return rest(request)
+
+        client, http = _make_github_client(handler)
+        async with http:
+            statuses = await asyncio.gather(
+                client.get_mr_ci_status("acme/repo", 10, "abc"),
+                client.get_mr_ci_status("acme/repo", 11, "def"),
+            )
+
+        assert statuses == [CIStatus.FAILED, CIStatus.SUCCESS]
+        # Only the pull request the batch could not answer is read over REST.
+        assert sorted(paths) == [
+            "/graphql",
+            "/repos/acme/repo/commits/abc/check-runs",
+            "/repos/acme/repo/commits/abc/status",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_an_alias_error_reads_only_that_pull_request_over_rest(
+        self,
+    ) -> None:
+        paths: list[str] = []
+        rest = _ci_sources_handler([], [_commit_status("pending")], paths)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if is_ci_batch(request):
+                paths.append("/graphql")
+                return answer_ci_batch(
+                    request,
+                    lambda _owner, _repo, number: (
+                        None
+                        if number == 10
+                        else pull_node("def", [check_run("success")])
+                    ),
+                    errors=[
+                        {
+                            "type": "FORBIDDEN",
+                            "path": ["r0", "p10"],
+                            "message": "Resource not accessible",
+                        }
+                    ],
+                )
+            return rest(request)
+
+        client, http = _make_github_client(handler)
+        async with http:
+            statuses = await asyncio.gather(
+                client.get_mr_ci_status("acme/repo", 10, "abc"),
+                client.get_mr_ci_status("acme/repo", 11, "def"),
+            )
+
+        assert statuses == [CIStatus.PENDING, CIStatus.SUCCESS]
+        assert paths.count("/graphql") == 1
+        assert not any("/def/" in path for path in paths)
+
+    @pytest.mark.parametrize("status_code", [404, 403])
+    @pytest.mark.asyncio
+    async def test_a_host_without_graphql_reads_rest_from_then_on(
+        self, status_code: int
+    ) -> None:
+        paths: list[str] = []
+        rest = _ci_sources_handler([_run("success")], [], paths)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/graphql":
+                paths.append("/graphql")
+                return httpx.Response(status_code, json={"message": "Not available"})
+            return rest(request)
+
+        client, http = _make_github_client(handler)
+        async with http:
+            first = await client.get_mr_ci_status("acme/repo", 10, "abc")
+            second = await client.get_mr_ci_status("acme/repo", 10, "abc")
+
+        assert first is second is CIStatus.SUCCESS
+        # GraphQL is tried once; every later read goes straight to REST.
+        assert paths.count("/graphql") == 1
+        assert paths.count("/repos/acme/repo/commits/abc/check-runs") == 2
+
+    @pytest.mark.asyncio
+    async def test_a_server_error_falls_back_for_that_batch_only(self) -> None:
+        paths: list[str] = []
+        rest = _ci_sources_handler([_run("success")], [], paths)
+        answers = iter(
+            [
+                httpx.Response(502, json={"message": "bad gateway"}),
+                None,
+            ]
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/graphql":
+                paths.append("/graphql")
+                answer = next(answers)
+                if answer is not None:
+                    return answer
+                return answer_ci_batch(
+                    request,
+                    lambda _o, _r, _n: pull_node("abc", [check_run("success")]),
+                )
+            return rest(request)
+
+        client, http = _make_github_client(handler)
+        async with http:
+            assert await client.get_mr_ci_status("acme/repo", 10, "abc") is (
+                CIStatus.SUCCESS
+            )
+            assert await client.get_mr_ci_status("acme/repo", 10, "abc") is (
+                CIStatus.SUCCESS
+            )
+        assert paths.count("/graphql") == 2
+        assert paths.count("/repos/acme/repo/commits/abc/check-runs") == 1
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            httpx.Response(
+                200,
+                json={
+                    "data": None,
+                    "errors": [{"type": "RATE_LIMITED", "message": "API rate limit"}],
+                },
+                headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": "99"},
+            ),
+            httpx.Response(
+                403,
+                json={"message": "You have exceeded a secondary rate limit."},
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_rate_limit_raises_without_trying_rest(
+        self, response: httpx.Response
+    ) -> None:
+        paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            return response
+
+        client, http = _make_github_client(handler)
+        async with http:
+            results = await asyncio.gather(
+                client.get_mr_ci_status("acme/repo", 10, "abc"),
+                client.get_mr_ci_status("acme/repo", 11, "def"),
+                return_exceptions=True,
+            )
+
+        assert all(isinstance(result, RateLimitError) for result in results)
+        assert paths == ["/graphql"]
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_read_leaves_the_batch(self) -> None:
+        batches: list[list[tuple[str, str, int]]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            batches.append(batch_pulls(request))
+            return answer_ci_batch(
+                request,
+                lambda _o, _r, _n: pull_node("abc", [check_run("success")]),
+            )
+
+        client, http = _make_github_client(handler)
+        async with http:
+            cancelled = asyncio.create_task(
+                client.get_mr_ci_status("acme/repo", 10, "abc")
+            )
+            kept = asyncio.create_task(client.get_mr_ci_status("acme/repo", 11, "abc"))
+            await asyncio.sleep(0)
+            cancelled.cancel()
+            assert await kept is CIStatus.SUCCESS
+
+        assert cancelled.cancelled()
+        assert batches == [[("acme", "repo", 11)]]

@@ -95,6 +95,10 @@ class _Forge:
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        if path == "/graphql":
+            # Without GraphQL (as on some GitHub Enterprise hosts) the client
+            # reads each page's CI over REST, which these tests count.
+            return httpx.Response(404, json={"message": "Not Found"})
         headers = self.rate_limited.get(path)
         if headers is not None:
             self.rate_limited_requests.append(path)

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import cast
 
 import pytest
 
+import tongs.services.session as session_module
 from tests.services.test_session import (
     NOW,
     FakeClient,
@@ -14,7 +15,7 @@ from tests.services.test_session import (
     make_summary,
     start_session,
 )
-from tongs.errors import NetworkError
+from tongs.errors import NetworkError, PartialResultsError, RateLimitError
 from tongs.forges.models import CIStatus, MRPage, MRState
 from tongs.services import (
     RepositoryRef,
@@ -450,4 +451,81 @@ async def test_a_client_without_a_ci_lookup_reports_unknown() -> None:
     status = await session.get_review_ci_status(ReviewRef(_REPOSITORY, 7))
 
     assert status is CIStatus.UNKNOWN
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_ci_rate_limit_is_kept_with_its_reset_until_it_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 10, 10, 18, 0, tzinfo=UTC)
+    monkeypatch.setattr(session_module, "_utcnow", lambda: now)
+    client = _LazyClient()
+    client.lookup_error = RateLimitError("Rate limited", retry_after=1800)
+    session = await _session_with(client)
+    assert session.host_rate_limit("github.com") is None
+
+    with pytest.raises(ServiceError) as caught:
+        await session.get_review_ci_status(ReviewRef(_REPOSITORY, 7))
+
+    assert caught.value.code is ServiceErrorCode.RATE_LIMITED
+    limit = session.host_rate_limit("github.com")
+    assert limit is not None
+    assert limit.resets_at == limit.until == now + timedelta(minutes=30)
+    assert session.host_rate_limit("gitlab.com") is None
+
+    # Once the reset passes the limit is gone.
+    monkeypatch.setattr(
+        session_module, "_utcnow", lambda: now + timedelta(minutes=30, seconds=1)
+    )
+    assert session.host_rate_limit("github.com") is None
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_list_rate_limit_without_a_reset_waits_a_few_minutes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 10, 10, 18, 0, tzinfo=UTC)
+    monkeypatch.setattr(session_module, "_utcnow", lambda: now)
+
+    class _LimitedClient(_PagedClient):
+        limited = False
+
+        async def list_mrs_page(self, *args: object, **kwargs: object) -> MRPage:
+            if self.limited:
+                raise RateLimitError("Rate limited")
+            return await super().list_mrs_page(*args, **kwargs)  # type: ignore[arg-type]
+
+    client = _LimitedClient()
+    session = await _session_with(client)
+    client.limited = True
+    page = await session.list_reviews(
+        ReviewQuery(ReviewScope.ALL_OPEN, repository=_REPOSITORY, paged=True)
+    )
+
+    assert [failure.code for failure in page.failures] == [
+        ServiceErrorCode.RATE_LIMITED
+    ]
+    limit = session.host_rate_limit("github.com")
+    assert limit is not None
+    assert limit.resets_at is None
+    assert limit.until == now + session_module.RATE_LIMIT_UNKNOWN_WAIT
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_search_cut_short_by_a_rate_limit_records_it() -> None:
+    class _CutShort(_PagedClient):
+        async def list_my_reviews(self) -> list:
+            raise PartialResultsError(
+                [], cause=RateLimitError("Rate limited", retry_after=60)
+            )
+
+    session = await _session_with(_CutShort())
+    page = await session.list_reviews(ReviewQuery(ReviewScope.MY_REVIEWS))
+
+    assert page.failures[0].code is ServiceErrorCode.RATE_LIMITED
+    limit = session.host_rate_limit("github.com")
+    assert limit is not None and limit.resets_at is not None
     await session.close()

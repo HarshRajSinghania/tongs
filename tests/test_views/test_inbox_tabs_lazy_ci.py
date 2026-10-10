@@ -20,6 +20,13 @@ import httpx
 import pytest
 from textual.pilot import Pilot
 
+from tests.test_forges.github_ci_batch import (
+    answer_ci_batch,
+    check_run,
+    is_ci_batch,
+    pull_node,
+    status_context,
+)
 from tests.test_tui_session import (
     MockForgeClient,
     MockForgeRegistry,
@@ -123,8 +130,10 @@ GITHUB_STATUSES = {
 class GitHubForge:
     """A mocked GitHub API that records the kind of every request."""
 
-    def __init__(self, numbers: tuple[int, ...]) -> None:
+    def __init__(self, numbers: tuple[int, ...], *, graphql: bool = True) -> None:
         self.numbers = numbers
+        # False answers GraphQL with 404, as GitHub Enterprise without it.
+        self.graphql = graphql
         self.requests: list[str] = []
         self.searches: list[str] = []
 
@@ -133,6 +142,12 @@ class GitHubForge:
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        if path == "/graphql":
+            self.requests.append("graphql")
+            if not self.graphql:
+                return httpx.Response(404, json={"message": "Not Found"})
+            assert is_ci_batch(request)
+            return answer_ci_batch(request, self._pull_node)
         if path == "/search/issues":
             self.requests.append("search")
             self.searches.append(request.url.params["q"])
@@ -170,12 +185,22 @@ class GitHubForge:
             )
         raise AssertionError(path)
 
+    @staticmethod
+    def _pull_node(_owner: str, _repo: str, number: int) -> dict:
+        sha = f"sha-{number}"
+        checks = [
+            check_run(run["conclusion"], run["status"])
+            for run in GITHUB_CHECK_RUNS[sha]
+        ] + [status_context(status["state"]) for status in GITHUB_STATUSES[sha]]
+        return pull_node(sha, checks or None)
+
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("graphql", [True, False], ids=["graphql", "rest"])
 async def test_github_reviews_and_my_mrs_show_real_ci_with_pinned_requests(
-    tmp_path: Path,
+    tmp_path: Path, graphql: bool
 ) -> None:
-    forge = GitHubForge((1, 2, 3, 4))
+    forge = GitHubForge((1, 2, 3, 4), graphql=graphql)
     http = httpx.AsyncClient(
         transport=httpx.MockTransport(forge.handler), base_url=GITHUB.api_base
     )
@@ -193,11 +218,11 @@ async def test_github_reviews_and_my_mrs_show_real_ci_with_pinned_requests(
             3: CIStatus.UNKNOWN,
             4: CIStatus.PENDING,
         }
-        # One search page and one read per pull request, as before, then two
-        # CI requests per row: its check runs and its commit statuses.
-        assert forge.counts() == Counter(
-            {"search": 1, "pull": 4, "check-runs": 4, "status": 4}
-        )
+        # One search page and one read per pull request, as before, then one
+        # GraphQL query for every row's CI. Without GraphQL, two REST CI
+        # requests per row: its check runs and its commit statuses.
+        ci = {"graphql": 1} if graphql else {"graphql": 1, "check-runs": 4, "status": 4}
+        assert forge.counts() == Counter({"search": 1, "pull": 4, **ci})
 
         # My MRs lists the same heads, so their CI comes from the cache.
         forge.requests.clear()
@@ -208,15 +233,15 @@ async def test_github_reviews_and_my_mrs_show_real_ci_with_pinned_requests(
         assert ci_cells(my_mrs) == expected
         assert forge.counts() == Counter({"search": 1, "pull": 4})
 
-        # A refresh reads the list and every row's CI past the cache.
+        # A refresh reads the list and every row's CI past the cache. A host
+        # that answered GraphQL with 404 is not asked again.
         forge.requests.clear()
         await pilot.press("ctrl+r")
         await settle(app)
         await wait_for_rows(pilot, my_mrs, 4)
         assert ci_cells(my_mrs) == expected
-        assert forge.counts() == Counter(
-            {"search": 1, "pull": 4, "check-runs": 4, "status": 4}
-        )
+        ci = {"graphql": 1} if graphql else {"check-runs": 4, "status": 4}
+        assert forge.counts() == Counter({"search": 1, "pull": 4, **ci})
         assert forge.searches == [
             "is:pr is:open review-requested:@me",
             "is:pr is:open author:@me",

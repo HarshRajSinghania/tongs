@@ -4,24 +4,32 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from urllib.parse import quote as urlquote
 
 import httpx
 
 from tongs.errors import (
+    AuthError,
     ConflictError,
     ForgeError,
     ForgePermissionError,
     NetworkError,
     NotFoundError,
     PartialResultsError,
+    RateLimitError,
     ValidationError,
     redact_credentials,
 )
 from tongs.forges.base import ForgeClient
-from tongs.forges.http import map_http_error, paginate, request, request_page
+from tongs.forges.http import (
+    graphql_rate_limit_error,
+    map_http_error,
+    paginate,
+    request,
+    request_page,
+)
 from tongs.forges.models import (
     CIStatus,
     Commit,
@@ -65,6 +73,42 @@ _COMMIT_STATUS_STATES = {
 # A CI source the token may not read counts as empty when the other answers:
 # a token without the commit statuses permission still shows its check runs.
 _UNREADABLE_CI_SOURCE = (ForgePermissionError, NotFoundError)
+
+# Per-pull-request CI reads share one GraphQL query of up to this many pull
+# requests, across repositories. A batch goes out once no read arrived for
+# the window, at most the longest wait after its first read, or at once when
+# it is full.
+_CI_BATCH_WINDOW_SECONDS = 0.015
+_CI_BATCH_MAX_WAIT_SECONDS = 0.06
+_CI_BATCH_SIZE = 50
+# A head commit with more checks than one query reads (the ``contexts(first:
+# 100)`` of the fragment below) is read over REST.
+_CI_ROLLUP_PAGE_SIZE = 100
+
+# The head commit and its checks for one pull request of a CI batch. Check
+# runs and commit statuses are classified like the REST reads.
+_CI_ROLLUP_FRAGMENT = """
+fragment ci on PullRequest {
+    headRefOid
+    commits(last: 1) {
+        nodes {
+            commit {
+                oid
+                statusCheckRollup {
+                    contexts(first: 100) {
+                        totalCount
+                        nodes {
+                            __typename
+                            ... on CheckRun { status conclusion }
+                            ... on StatusContext { state }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+"""
 
 # Review threads are read in GraphQL pages of 100, up to this many pages.
 _REVIEW_THREADS_MAX_PAGES = 50
@@ -155,11 +199,6 @@ def _check_run_state(run: dict) -> CIStatus:
     }.get(str(run.get("conclusion") or "").lower(), CIStatus.UNKNOWN)
 
 
-def _aggregate_check_runs(runs: list[dict]) -> CIStatus:
-    """Combine a commit's check runs into one status."""
-    return _aggregate_ci_states([_check_run_state(run) for run in runs])
-
-
 def _commit_status_state(status: object) -> CIStatus:
     """Classify one legacy commit status for the commit-level aggregate."""
     state = status.get("state") if isinstance(status, dict) else None
@@ -193,6 +232,95 @@ def _head_sha(head: object) -> str:
     """Return a pull request head's commit SHA, or an empty string."""
     sha = head.get("sha") if isinstance(head, dict) else None
     return sha if isinstance(sha, str) else ""
+
+
+def _rollup_context_state(node: object) -> CIStatus:
+    """Classify one check of a GraphQL status check rollup.
+
+    A check run and a commit status map exactly as their REST reads do, so a
+    batched read and a REST read agree.
+    """
+    if not isinstance(node, dict):
+        return CIStatus.UNKNOWN
+    kind = node.get("__typename")
+    if kind == "CheckRun":
+        return _check_run_state(
+            {"status": node.get("status"), "conclusion": node.get("conclusion")}
+        )
+    if kind == "StatusContext":
+        return _commit_status_state({"state": node.get("state")})
+    return CIStatus.UNKNOWN
+
+
+def _rollup_ci_status(pull: object, head_sha: str) -> CIStatus | None:
+    """Return a batched pull request's CI, or None to read it over REST.
+
+    The answer is used only for the head commit asked for (the pull request's
+    current head when none was named) and only when every check was read.
+    """
+    if not isinstance(pull, dict):
+        return None
+    commits = pull.get("commits")
+    nodes = commits.get("nodes") if isinstance(commits, dict) else None
+    if not isinstance(nodes, list) or len(nodes) != 1:
+        return None
+    commit = nodes[0].get("commit") if isinstance(nodes[0], dict) else None
+    if not isinstance(commit, dict):
+        return None
+    oid = commit.get("oid")
+    wanted = head_sha or pull.get("headRefOid")
+    if not isinstance(oid, str) or not oid or oid != wanted:
+        return None
+    rollup = commit.get("statusCheckRollup")
+    if rollup is None:
+        # No check run and no commit status, as the REST reads would find.
+        return CIStatus.UNKNOWN
+    contexts = rollup.get("contexts") if isinstance(rollup, dict) else None
+    if not isinstance(contexts, dict):
+        return None
+    total = contexts.get("totalCount")
+    checks = contexts.get("nodes")
+    if (
+        type(total) is not int
+        or not isinstance(checks, list)
+        or total > _CI_ROLLUP_PAGE_SIZE
+        or len(checks) < total
+    ):
+        return None
+    return _aggregate_ci_states([_rollup_context_state(node) for node in checks])
+
+
+def _graphql_error_paths(errors: object) -> tuple[tuple[str, ...], ...] | None:
+    """Return the alias path of each GraphQL error, or None for one without.
+
+    An error without a path concerns the whole query.
+    """
+    if not errors:
+        return ()
+    if not isinstance(errors, list):
+        return None
+    paths: list[tuple[str, ...]] = []
+    for error in errors:
+        path = error.get("path") if isinstance(error, dict) else None
+        if not isinstance(path, list) or not path:
+            return None
+        paths.append(tuple(str(part) for part in path[:2]))
+    return tuple(paths)
+
+
+@dataclass
+class _CIRead:
+    """One pull request's CI read waiting for, or riding in, a GraphQL batch.
+
+    The future resolves to the status, to None when the read falls back to
+    REST, or to the error that failed the whole batch.
+    """
+
+    owner: str
+    repo: str
+    number: int
+    head_sha: str
+    future: asyncio.Future[CIStatus | None]
 
 
 def _parse_mr_state(value: str) -> MRState:
@@ -333,6 +461,13 @@ class GitHubClient(ForgeClient):
     def __init__(self, host: ForgeHost, http_client: httpx.AsyncClient):
         self._host = host
         self._http = http_client
+        # Per-pull-request CI reads waiting for the next GraphQL batch.
+        self._ci_reads: list[_CIRead] = []
+        self._ci_timer: asyncio.TimerHandle | None = None
+        self._ci_batch_deadline = 0.0
+        self._ci_batches: set[asyncio.Task[None]] = set()
+        # False once the host answered that it has no usable GraphQL API.
+        self._ci_graphql = True
 
     @property
     def _graphql_url(self) -> str:
@@ -340,8 +475,14 @@ class GitHubClient(ForgeClient):
             return "https://api.github.com/graphql"
         return f"https://{self._host.hostname}/api/graphql"
 
-    async def _graphql(self, query: str, variables: dict | None = None) -> dict:
-        """Execute a GraphQL query against GitHub's API."""
+    async def _graphql_response(
+        self, query: str, variables: dict | None = None
+    ) -> dict:
+        """Send a GraphQL query and return the whole response document.
+
+        A failed request or a rate-limit error raises ForgeError; other
+        errors stay in the document's ``errors`` beside any ``data``.
+        """
         payload: dict = {"query": query}
         if variables:
             payload["variables"] = variables
@@ -358,7 +499,17 @@ class GitHubClient(ForgeClient):
         if response.status_code >= 400:
             raise map_http_error(response)
         data = response.json()
-        errors = data.get("errors") if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            raise TypeError("GraphQL response is not an object")
+        rate_limited = graphql_rate_limit_error(response, data.get("errors"))
+        if rate_limited is not None:
+            raise rate_limited
+        return data
+
+    async def _graphql(self, query: str, variables: dict | None = None) -> dict:
+        """Execute a GraphQL query against GitHub's API."""
+        data = await self._graphql_response(query, variables)
+        errors = data.get("errors")
         if errors:
             first = errors[0] if isinstance(errors, list) else None
             msg = first.get("message") if isinstance(first, dict) else None
@@ -380,11 +531,9 @@ class GitHubClient(ForgeClient):
             per_page=per_page,
             params={"state": state},
         )
-        ci_tasks = [
-            self._fetch_ci_status(owner, repo, pr.get("head", {}).get("sha", ""))
-            for pr in data
-        ]
-        ci_results = await asyncio.gather(*ci_tasks)
+        ci_results = await asyncio.gather(
+            *(self._fetch_pr_ci_status(owner, repo, pr) for pr in data)
+        )
         return [
             self._parse_pr_summary(pr, repo_path, ci_status=ci)
             for pr, ci in zip(data, ci_results)
@@ -419,10 +568,7 @@ class GitHubClient(ForgeClient):
                 has_next=has_next,
             )
         ci_results = await asyncio.gather(
-            *(
-                self._fetch_ci_status(owner, repo, pr.get("head", {}).get("sha", ""))
-                for pr in data
-            )
+            *(self._fetch_pr_ci_status(owner, repo, pr) for pr in data)
         )
         return MRPage(
             tuple(
@@ -437,13 +583,18 @@ class GitHubClient(ForgeClient):
     ) -> CIStatus:
         """Read the CI status of one pull request's head commit.
 
-        Check runs and commit statuses are read together (two requests, more
-        only past 100 of either) and combined. Without ``head_sha`` the pull
-        request is read first to find its head. A failed request raises, so a
-        caller never caches a failure as a status; a head with no usable check
-        run or commit status is UNKNOWN.
+        Reads that arrive together share one GraphQL query (see
+        ``_batched_ci_status``). A read the batch cannot answer reads check
+        runs and commit statuses over REST (two requests, more only past 100
+        of either) and combines them the same way; without ``head_sha`` the
+        pull request is read first to find its head. A failed request raises,
+        so a caller never caches a failure as a status; a head with no usable
+        check run or commit status is UNKNOWN.
         """
         owner, repo = _split_repo_path(repo_path)
+        status = await self._batched_ci_status(owner, repo, number, head_sha)
+        if status is not None:
+            return status
         if not head_sha:
             data = await request(
                 self._http, "GET", f"/repos/{owner}/{repo}/pulls/{number}"
@@ -1144,7 +1295,153 @@ class GitHubClient(ForgeClient):
         return True
 
     async def close(self) -> None:
+        self._cancel_ci_batches()
         await self._http.aclose()
+
+    async def _batched_ci_status(
+        self, owner: str, repo: str, number: int, head_sha: str
+    ) -> CIStatus | None:
+        """Read one pull request's CI in the next GraphQL batch.
+
+        Reads that arrive within ``_CI_BATCH_WINDOW_SECONDS`` of each other
+        (and within ``_CI_BATCH_MAX_WAIT_SECONDS`` of the first), from any
+        repository, go out as one query of up to ``_CI_BATCH_SIZE`` pull
+        requests, which takes one slot of the per-host request limit.
+        Returns None when this read must use REST instead: GraphQL is
+        unavailable on this host, the batch could not answer for this pull
+        request, its head moved, or it has more checks than one query reads.
+        A rate limit, a sign-in failure or a network failure raises.
+        """
+        if not self._ci_graphql or type(number) is not int or number < 1:
+            return None
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[CIStatus | None] = loop.create_future()
+        self._ci_reads.append(_CIRead(owner, repo, number, head_sha, future))
+        if len(self._ci_reads) >= _CI_BATCH_SIZE:
+            self._send_ci_batch()
+        else:
+            now = loop.time()
+            if self._ci_timer is None:
+                self._ci_batch_deadline = now + _CI_BATCH_MAX_WAIT_SECONDS
+            else:
+                self._ci_timer.cancel()
+            self._ci_timer = loop.call_at(
+                min(now + _CI_BATCH_WINDOW_SECONDS, self._ci_batch_deadline),
+                self._send_ci_batch,
+            )
+        # A cancelled caller cancels its future, and the batch skips it.
+        return await future
+
+    def _send_ci_batch(self) -> None:
+        """Send the waiting CI reads, up to one full batch per query."""
+        if self._ci_timer is not None:
+            self._ci_timer.cancel()
+            self._ci_timer = None
+        reads = [read for read in self._ci_reads if not read.future.done()]
+        self._ci_reads = []
+        for start in range(0, len(reads), _CI_BATCH_SIZE):
+            batch = reads[start : start + _CI_BATCH_SIZE]
+            task = asyncio.get_running_loop().create_task(self._run_ci_batch(batch))
+            self._ci_batches.add(task)
+            task.add_done_callback(self._ci_batches.discard)
+
+    def _cancel_ci_batches(self) -> None:
+        if self._ci_timer is not None:
+            self._ci_timer.cancel()
+            self._ci_timer = None
+        for read in self._ci_reads:
+            read.future.cancel()
+        self._ci_reads = []
+        for task in tuple(self._ci_batches):
+            task.cancel()
+
+    async def _run_ci_batch(self, batch: list[_CIRead]) -> None:
+        """Answer every read of one batch, falling back to REST where needed."""
+        try:
+            results = await self._query_ci_batch(batch)
+        except asyncio.CancelledError:
+            for read in batch:
+                read.future.cancel()
+            raise
+        except (NotFoundError, ForgePermissionError):
+            # The host has no GraphQL API (an older GitHub Enterprise) or the
+            # token may not use it, so this client reads CI over REST.
+            self._ci_graphql = False
+            results = [None] * len(batch)
+        except (RateLimitError, AuthError, NetworkError) as error:
+            # A rate limit, a sign-in failure or an unreachable host would
+            # fail the REST reads too, so it is reported instead of retried.
+            for read in batch:
+                if not read.future.done():
+                    read.future.set_exception(error)
+            return
+        except (ForgeError, ValueError, KeyError, TypeError, AttributeError):
+            # Any other failed or unreadable query falls back to REST.
+            results = [None] * len(batch)
+        except Exception as error:  # noqa: BLE001 - Never leave a reader waiting.
+            for read in batch:
+                if not read.future.done():
+                    read.future.set_exception(error)
+            return
+        for read, result in zip(batch, results):
+            if not read.future.done():
+                read.future.set_result(result)
+
+    async def _query_ci_batch(self, batch: list[_CIRead]) -> list[CIStatus | None]:
+        """Read the CI of a batch of pull requests in one GraphQL query.
+
+        Pull requests are grouped by repository; each repository and pull
+        request gets an alias, and the repository names travel as variables.
+        A pull request the query errored on, or answered without a usable
+        head commit, gets None.
+        """
+        repositories: dict[tuple[str, str], int] = {}
+        for read in batch:
+            repositories.setdefault((read.owner, read.repo), len(repositories))
+        numbers: dict[int, list[int]] = {}
+        for read in batch:
+            index = repositories[(read.owner, read.repo)]
+            wanted = numbers.setdefault(index, [])
+            if read.number not in wanted:
+                wanted.append(read.number)
+        declarations: list[str] = []
+        selections: list[str] = []
+        variables: dict[str, str] = {}
+        for (owner, repo), index in repositories.items():
+            declarations.append(f"$o{index}: String!, $n{index}: String!")
+            variables[f"o{index}"] = owner
+            variables[f"n{index}"] = repo
+            pulls = " ".join(
+                f"p{number}: pullRequest(number: {number}) {{ ...ci }}"
+                for number in numbers[index]
+            )
+            selections.append(
+                f"r{index}: repository(owner: $o{index}, name: $n{index}) {{ {pulls} }}"
+            )
+        query = (
+            f"query({', '.join(declarations)}) {{ {' '.join(selections)} }}"
+            + _CI_ROLLUP_FRAGMENT
+        )
+        document = await self._graphql_response(query, variables)
+        failed = _graphql_error_paths(document.get("errors"))
+        data = document.get("data")
+        if failed is None or not isinstance(data, dict):
+            return [None] * len(batch)
+        results: list[CIStatus | None] = []
+        for read in batch:
+            index = repositories[(read.owner, read.repo)]
+            repo_alias = f"r{index}"
+            pull_alias = f"p{read.number}"
+            if any(
+                path[0] == repo_alias and (len(path) == 1 or path[1] == pull_alias)
+                for path in failed
+            ):
+                results.append(None)
+                continue
+            repository = data.get(repo_alias)
+            pull = repository.get(pull_alias) if isinstance(repository, dict) else None
+            results.append(_rollup_ci_status(pull, read.head_sha))
+        return results
 
     def _parse_pr_summary(
         self, data: dict, repo_path: str, ci_status: CIStatus = CIStatus.UNKNOWN
@@ -1176,6 +1473,17 @@ class GitHubClient(ForgeClient):
             deletions=data.get("deletions"),
             head_commit_sha=_head_sha(head),
         )
+
+    async def _fetch_pr_ci_status(self, owner: str, repo: str, pr: dict) -> CIStatus:
+        """Read a listed pull request's CI, batched, reporting failure as UNKNOWN."""
+        sha = _head_sha(pr.get("head"))
+        try:
+            status = await self._batched_ci_status(owner, repo, pr.get("number"), sha)
+        except (ForgeError, ValueError, KeyError, TypeError, AttributeError):
+            return CIStatus.UNKNOWN
+        if status is not None:
+            return status
+        return await self._fetch_ci_status(owner, repo, sha)
 
     async def _fetch_ci_status(self, owner: str, repo: str, sha: str) -> CIStatus:
         """Fetch combined CI status, reporting any failure to read as UNKNOWN."""

@@ -11,6 +11,12 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+from tests.test_forges.github_ci_batch import (
+    answer_ci_batch,
+    check_run,
+    is_ci_batch,
+    pull_node,
+)
 from tongs.errors import AuthError
 from tongs.forges.github import GitHubClient
 from tongs.forges.gitlab import GitLabClient
@@ -19,6 +25,7 @@ from tongs.forges.http import (
     create_client,
     request,
 )
+from tongs.forges.models import CIStatus
 from tongs.forges.registry import ForgeRegistry
 from tongs.scanner.repo import ForgeType
 
@@ -99,6 +106,13 @@ class _Forge:
                 200,
                 json={"check_runs": [{"status": "completed", "conclusion": "success"}]},
             )
+        if is_ci_batch(request):
+            return answer_ci_batch(
+                request,
+                lambda _owner, _repo, number: pull_node(
+                    f"sha-{number}", [check_run("success")]
+                ),
+            )
         if path == "/graphql":
             return httpx.Response(200, json={"data": {"viewer": {"login": "a"}}})
         if path.endswith(("/logs", "/trace")):
@@ -159,8 +173,11 @@ async def test_fifty_mrs_stay_within_the_bound_across_list_ci_graphql_and_logs(
     assert len(results[0]) == _MR_COUNT
     github_paths = forge.paths["api.github.com"]
     assert github_paths.count("/repos/acme/repo/pulls") == 1
-    assert sum(path.endswith("/check-runs") for path in github_paths) == _MR_COUNT
-    assert github_paths.count("/graphql") == 10
+    # The fifty pull requests' CI is one batched GraphQL query, which takes
+    # one slot like any other request; no REST CI read is sent.
+    assert not any(path.endswith(("/check-runs", "/status")) for path in github_paths)
+    assert github_paths.count("/graphql") == 10 + 1
+    assert {mr.ci_status for mr in results[0]} == {CIStatus.SUCCESS}
     assert sum(path.endswith("/logs") for path in github_paths) == 10
     assert sum(path.endswith("/trace") for path in forge.paths["gitlab.com"]) == 10
     # Each host reaches its bound and never passes it, and the hosts are
@@ -178,7 +195,7 @@ async def test_registry_without_a_bound_leaves_requests_unbounded(
     assert registry.max_parallel is None
     with patch("tongs.forges.registry.resolve_token", return_value="tok"):
         github = await registry.get_client("github.com")
-    await github.list_mrs("acme/repo")
+    await asyncio.gather(*(github.get_job_log("acme/repo", job) for job in range(10)))
     await registry.close_all()
     assert forge.peak["api.github.com"] > 4
 

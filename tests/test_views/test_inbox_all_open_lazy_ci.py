@@ -19,6 +19,13 @@ import pytest
 from textual.pilot import Pilot
 from textual.widgets import Static
 
+from tests.test_forges.github_ci_batch import (
+    answer_ci_batch,
+    batch_pulls,
+    check_run,
+    is_ci_batch,
+    pull_node,
+)
 from tests.test_tui_session import (
     NOW,
     MockForgeClient,
@@ -142,6 +149,10 @@ def status_text(app: TongsApp) -> str:
     return str(app.screen.query_one("#all-open-status", Static).render())
 
 
+def notices(app: TongsApp) -> list[str]:
+    return [str(notice.message) for notice in app._notifications]
+
+
 async def wait_until(pilot: Pilot, condition: Callable[[], bool]) -> None:
     async def poll() -> None:
         while not condition():
@@ -158,6 +169,7 @@ async def test_first_paint_reads_one_page_per_repository_before_any_ci_request(
     projects = ["acme/one", "acme/two", "acme/three"]
     table_holder: list[MRTable] = []
     requests: list[tuple[str, int]] = []
+    batches: list[list[tuple[str, str, int]]] = []
     release_ci = asyncio.Event()
 
     def pull(project: str, number: int) -> dict[str, object]:
@@ -187,18 +199,15 @@ async def test_first_paint_reads_one_page_per_repository_before_any_ci_request(
                 return httpx.Response(
                     200, json=[pull(project, base + 1), pull(project, base + 2)]
                 )
-        if path.endswith("/check-runs"):
+        if is_ci_batch(request):
             await release_ci.wait()
-            return httpx.Response(
-                200,
-                json={
-                    "total_count": 1,
-                    "check_runs": [{"status": "completed", "conclusion": "failure"}],
-                },
+            batches.append(batch_pulls(request))
+            return answer_ci_batch(
+                request,
+                lambda _owner, _repo, number: pull_node(
+                    f"sha-{number}", [check_run("failure")]
+                ),
             )
-        if path.endswith("/status"):
-            await release_ci.wait()
-            return httpx.Response(200, json={"total_count": 0, "statuses": []})
         raise AssertionError(path)
 
     http = httpx.AsyncClient(
@@ -227,24 +236,20 @@ async def test_first_paint_reads_one_page_per_repository_before_any_ci_request(
         release_ci.set()
         await wait_until(pilot, lambda: LOADING not in ci_cells(table).values())
 
-        ci_requests = [
-            (path, rows) for path, rows in requests if path.endswith("/check-runs")
-        ]
+        # The six rows' CI is one GraphQL query, sent with rows on screen,
+        # and no REST CI read.
         loaded = {11, 12, 21, 22, 31, 32}
-        assert sorted(path for path, _rows in ci_requests) == sorted(
-            f"/repos/{project}/commits/sha-{number}/check-runs"
-            for project, number in (
-                (projects[number // 10 - 1], number) for number in loaded
-            )
+        assert len(batches) == 1
+        assert sorted(batches[0]) == sorted(
+            ("acme", projects[number // 10 - 1].split("/")[1], number)
+            for number in loaded
         )
-        status_requests = [
-            (path, rows) for path, rows in requests if path.endswith("/status")
-        ]
-        assert sorted(path for path, _rows in status_requests) == sorted(
-            path.replace("/check-runs", "/status") for path, _rows in ci_requests
+        ci_requests = [(path, rows) for path, rows in requests if path == "/graphql"]
+        assert len(ci_requests) == 1
+        assert all(rows > 0 for _path, rows in ci_requests)
+        assert not any(
+            path.endswith(("/check-runs", "/status")) for path, _rows in requests
         )
-        # Every CI request was sent with rows already on screen.
-        assert all(rows > 0 for _path, rows in ci_requests + status_requests)
         assert {mr.ci_status for mr in table._mr_data.values()} == {CIStatus.FAILED}
         assert len(lists) == 3
     await http.aclose()
@@ -268,9 +273,9 @@ async def test_rows_show_loading_ci_then_their_own_status(tmp_path: Path) -> Non
 
         assert ci_cells(table) == {1: LOADING, 2: LOADING, 3: LOADING}
         assert sorted(client.page_reads) == [("acme/a", 1, False), ("acme/b", 1, False)]
-        await wait_until(pilot, lambda: len(client.ci_calls) == 2)
-        # Lookups run a few at a time (max_parallel is 2 here).
-        assert len(client.ci_calls) == 2
+        # Every row in view is looked up at once; the per-host request limit
+        # (max_parallel is 2 here) bounds the requests, not the lookups.
+        await wait_until(pilot, lambda: len(client.ci_calls) == 3)
 
         gate.set()
         await wait_until(pilot, lambda: LOADING not in ci_cells(table).values())
@@ -356,9 +361,11 @@ async def test_load_more_reads_only_repositories_with_a_next_page(
         assert client.page_reads == [("acme/big", 2, False)]
         # The next page lands in update order among the rows already shown.
         assert numbers(table) == [1, 2, 9, 3, 4]
+        # For a few seconds the status line counts what the load added.
         assert status_text(app) == (
-            "5 open MRs loaded across 2 repositories, more to load (m)"
+            "5 open MRs loaded across 2 repositories (+2), more to load (m)"
         )
+        assert notices(app)[-1] == "Loaded 2 more open MRs; 1 repository has more (m)"
 
         # Reaching the last row loads the next page as well.
         client.page_reads.clear()
@@ -369,7 +376,10 @@ async def test_load_more_reads_only_repositories_with_a_next_page(
 
         assert client.page_reads == [("acme/big", 3, False)]
         assert numbers(table) == [1, 2, 9, 3, 4, 5]
-        assert status_text(app) == "6 open MRs across 2 repositories"
+        assert status_text(app) == "6 open MRs across 2 repositories (+1)"
+        assert notices(app)[-1] == "All open MRs loaded"
+        # The cursor was on the last row, so it moved to the row that arrived.
+        assert table.get_selected_mr().number == 5  # type: ignore[union-attr]
 
         # Nothing has a next page now, so the key reads nothing.
         client.page_reads.clear()
@@ -423,7 +433,7 @@ async def test_a_failed_later_page_keeps_its_cursor_for_another_try(
         await settle(app)
         assert [read[1] for read in client.page_reads] == [1, 2, 2]
         assert numbers(table) == [1, 2, 3]
-        assert status_text(app) == "3 open MRs across 1 repository"
+        assert status_text(app) == "3 open MRs across 1 repository (+1)"
 
 
 @pytest.mark.asyncio
@@ -561,7 +571,7 @@ async def test_a_scoped_inbox_pages_its_repository_too(tmp_path: Path) -> None:
         await pilot.press("m")
         await settle(app)
         assert numbers(table) == [1, 2, 3]
-        assert status_text(app) == "3 open MRs"
+        assert status_text(app) == "3 open MRs (+1)"
 
 
 @pytest.mark.asyncio
