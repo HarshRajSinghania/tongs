@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import secrets
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -45,14 +45,20 @@ class _HandleRecord:
 
 
 class HandleRegistry:
-    """Issue unpredictable handles valid only for one sidecar connection."""
+    """Issue unpredictable handles valid only for one sidecar connection.
+
+    The registry holds at most ``max_handles`` handles. When it is full, a new
+    handle replaces the one used least recently, where issuing, finding and
+    resolving a handle all count as use. A replaced handle then resolves as
+    invalid, and the client refetches the list that issued it.
+    """
 
     def __init__(self, *, max_handles: int = _DEFAULT_MAX_HANDLES) -> None:
         if max_handles <= 0:
             raise ValueError("max_handles must be positive")
         self.session_id = secrets.token_urlsafe(24)
         self._max_handles = max_handles
-        self._records: dict[str, _HandleRecord] = {}
+        self._records: OrderedDict[str, _HandleRecord] = OrderedDict()
         self._reverse: dict[tuple[HandleKind, object, object | None], str] = {}
 
     def issue(
@@ -61,13 +67,10 @@ class HandleRegistry:
         key = (kind, value, parent)
         existing = self._reverse.get(key)
         if existing is not None:
+            self._records.move_to_end(existing)
             return existing
-        if len(self._records) >= self._max_handles:
-            raise ProtocolError(
-                ProtocolErrorCode.TOO_MANY_REQUESTS,
-                "The session resource-handle limit was reached.",
-                retryable=True,
-            )
+        while len(self._records) >= self._max_handles:
+            self._evict_least_recent()
         token = self._new_token()
         self._records[token] = _HandleRecord(kind, value, parent)
         self._reverse[key] = token
@@ -97,6 +100,7 @@ class HandleRegistry:
                 ProtocolErrorCode.INTERNAL,
                 "The resource handle could not be resolved safely.",
             )
+        self._records.move_to_end(token)
         return cast(_HandleT, record.value)
 
     def resolve_with_parent(
@@ -119,11 +123,18 @@ class HandleRegistry:
     def find(
         self, kind: HandleKind, value: object, *, parent: object | None = None
     ) -> str | None:
-        return self._reverse.get((kind, value, parent))
+        token = self._reverse.get((kind, value, parent))
+        if token is not None:
+            self._records.move_to_end(token)
+        return token
 
     def clear(self) -> None:
         self._records.clear()
         self._reverse.clear()
+
+    def _evict_least_recent(self) -> None:
+        _token, record = self._records.popitem(last=False)
+        del self._reverse[(record.kind, record.value, record.parent)]
 
     def _new_token(self) -> str:
         while True:
