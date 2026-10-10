@@ -163,6 +163,12 @@ def _aggregate_check_runs(runs: list[dict]) -> CIStatus:
     return CIStatus.SUCCESS
 
 
+def _head_sha(head: object) -> str:
+    """Return a pull request head's commit SHA, or an empty string."""
+    sha = head.get("sha") if isinstance(head, dict) else None
+    return sha if isinstance(sha, str) else ""
+
+
 def _parse_mr_state(value: str) -> MRState:
     return {
         "open": MRState.OPEN,
@@ -341,8 +347,6 @@ class GitHubClient(ForgeClient):
         state: str = "open",
         per_page: int = 100,
     ) -> list[MRSummary]:
-        import asyncio
-
         owner, repo = _split_repo_path(repo_path)
         data = await paginate(
             self._http,
@@ -366,13 +370,15 @@ class GitHubClient(ForgeClient):
         state: str = "open",
         page: int = 1,
         per_page: int = 100,
+        *,
+        with_ci: bool = True,
     ) -> MRPage:
         """Read one page of pull requests, most recently updated first.
 
-        CI status is fetched only for the pull requests on this page.
+        CI status is fetched only for the pull requests on this page, and not
+        at all when ``with_ci`` is false: each row then has UNKNOWN CI and its
+        head commit for ``get_mr_ci_status``.
         """
-        import asyncio
-
         owner, repo = _split_repo_path(repo_path)
         data, has_next = await request_page(
             self._http,
@@ -381,6 +387,11 @@ class GitHubClient(ForgeClient):
             per_page=per_page,
             params={"state": state, "sort": "updated", "direction": "desc"},
         )
+        if not with_ci:
+            return MRPage(
+                tuple(self._parse_pr_summary(pr, repo_path) for pr in data),
+                has_next=has_next,
+            )
         ci_results = await asyncio.gather(
             *(
                 self._fetch_ci_status(owner, repo, pr.get("head", {}).get("sha", ""))
@@ -394,6 +405,27 @@ class GitHubClient(ForgeClient):
             ),
             has_next=has_next,
         )
+
+    async def get_mr_ci_status(
+        self, repo_path: str, number: int, head_sha: str = ""
+    ) -> CIStatus:
+        """Read the combined check-run status of one pull request's head.
+
+        Without ``head_sha`` the pull request is read first to find its head.
+        A failed request raises, so a caller never caches a failure as a
+        status; a response without usable check runs is UNKNOWN.
+        """
+        owner, repo = _split_repo_path(repo_path)
+        if not head_sha:
+            data = await request(
+                self._http, "GET", f"/repos/{owner}/{repo}/pulls/{number}"
+            )
+            head = data.get("head") if isinstance(data, dict) else None
+            sha = head.get("sha") if isinstance(head, dict) else None
+            if not isinstance(sha, str) or not sha:
+                return CIStatus.UNKNOWN
+            head_sha = sha
+        return await self._read_ci_status(owner, repo, head_sha)
 
     async def list_my_reviews(self) -> list[MRSummary]:
         return await self._search_prs("is:pr is:open review-requested:@me")
@@ -1079,6 +1111,10 @@ class GitHubClient(ForgeClient):
     def supports_batched_review(self) -> bool:
         return True
 
+    @property
+    def supports_lazy_ci(self) -> bool:
+        return True
+
     async def close(self) -> None:
         await self._http.aclose()
 
@@ -1110,14 +1146,23 @@ class GitHubClient(ForgeClient):
             labels=tuple(labels),
             additions=data.get("additions"),
             deletions=data.get("deletions"),
+            head_commit_sha=_head_sha(head),
         )
 
     async def _fetch_ci_status(self, owner: str, repo: str, sha: str) -> CIStatus:
-        """Fetch combined CI status from the check-runs API.
+        """Fetch combined CI status, reporting any failure to read as UNKNOWN."""
+        try:
+            return await self._read_ci_status(owner, repo, sha)
+        except (ForgeError, ValueError, KeyError, TypeError, AttributeError):
+            return CIStatus.UNKNOWN
+
+    async def _read_ci_status(self, owner: str, repo: str, sha: str) -> CIStatus:
+        """Read combined CI status from the check-runs API.
 
         Check runs are paged up to the reported ``total_count``. When a commit
         has more runs than the page limit reads, a failure among the runs read
-        is still reported, but no other aggregate is claimed.
+        is still reported, but no other aggregate is claimed. A failed request
+        raises ForgeError; an unreadable response is UNKNOWN.
         """
         try:
             runs: list[dict] = []
@@ -1126,7 +1171,7 @@ class GitHubClient(ForgeClient):
                 data = await request(
                     self._http,
                     "GET",
-                    f"/repos/{owner}/{repo}/commits/{sha}/check-runs",
+                    f"/repos/{owner}/{repo}/commits/{urlquote(sha, safe='')}/check-runs",
                     params={"per_page": _CHECK_RUNS_PAGE_SIZE, "page": page},
                 )
                 if not isinstance(data, dict):
@@ -1147,7 +1192,7 @@ class GitHubClient(ForgeClient):
                 # Some runs were never read, so only a failure is certain.
                 return status if status == CIStatus.FAILED else CIStatus.UNKNOWN
             return status
-        except (ForgeError, ValueError, KeyError, TypeError, AttributeError):
+        except (ValueError, KeyError, TypeError, AttributeError):
             return CIStatus.UNKNOWN
 
     async def _fetch_approvals(

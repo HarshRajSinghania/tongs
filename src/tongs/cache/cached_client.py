@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from tongs.cache.store import CacheStore
-from tongs.forges.base import ForgeClient, read_mr_page
+from tongs.forges.base import ForgeClient, read_mr_ci_status, read_mr_page
 from tongs.forges.models import (
     CIStatus,
     ForgeMergeResult,
@@ -110,6 +110,10 @@ def _dict_to_mr_summary(d: dict) -> MRSummary:
         ),
         additions=d.get("additions"),
         deletions=d.get("deletions"),
+        # Rows cached before the head commit was listed have none.
+        head_commit_sha=(
+            d["head_commit_sha"] if isinstance(d.get("head_commit_sha"), str) else ""
+        ),
     )
 
 
@@ -229,21 +233,34 @@ class CachedForgeClient:
         state: str = "open",
         page: int = 1,
         per_page: int = 100,
+        *,
+        with_ci: bool = True,
     ) -> MRPage:
         """Cache the first page only, below the repository list prefix.
 
         Offset pages are not stable over time: a review updated between two
         reads moves up a page. A later page is therefore always read from the
-        forge, and reading one drops the cached first page, so the next read
+        forge, and reading one drops the cached first pages, so the next read
         of this repository never starts from a first page older than the
-        later pages already shown.
+        later pages already shown. A first page read without CI is cached
+        apart from one read with it, so neither stands in for the other.
         """
-        key = self._key(repo_path, "mrs", state, "page", per_page, 1)
+        lazy = not with_ci and self.supports_lazy_ci
+        key = self._first_page_key(repo_path, state, per_page, lazy=lazy)
+
+        async def read() -> MRPage:
+            return await read_mr_page(
+                self._inner, repo_path, state, page, per_page, with_ci=not lazy
+            )
+
         if page != 1:
-            await self._cache.invalidate(key)
-            return await read_mr_page(self._inner, repo_path, state, page, per_page)
+            for first_page in (False, True):
+                await self._cache.invalidate(
+                    self._first_page_key(repo_path, state, per_page, lazy=first_page)
+                )
+            return await read()
         if self._is_dirty(key):
-            return await read_mr_page(self._inner, repo_path, state, page, per_page)
+            return await read()
         cached = await self._cache.get_json(key)
         if isinstance(cached, dict) and isinstance(cached.get("items"), list):
             return MRPage(
@@ -252,7 +269,7 @@ class CachedForgeClient:
             )
         generation = self._begin_read()
         try:
-            result = await read_mr_page(self._inner, repo_path, state, page, per_page)
+            result = await read()
             if self._may_store(key, generation):
                 await self._cache.put_json(
                     key,
@@ -261,6 +278,58 @@ class CachedForgeClient:
                         "has_next": result.has_next,
                     },
                     self._mr_list_ttl,
+                )
+        finally:
+            self._end_read(generation)
+        return result
+
+    @property
+    def supports_lazy_ci(self) -> bool:
+        return getattr(self._inner, "supports_lazy_ci", False) is True
+
+    def _first_page_key(
+        self, repo_path: str, state: str, per_page: int, *, lazy: bool
+    ) -> str:
+        parts: tuple[str | int, ...] = (repo_path, "mrs", state, "page", per_page, 1)
+        return self._key(*parts, "noci") if lazy else self._key(*parts)
+
+    async def get_mr_ci_status(
+        self, repo_path: str, number: int, head_sha: str = ""
+    ) -> CIStatus:
+        """Cache one review's CI status for the review list lifetime.
+
+        The entry sits below the repository list prefix, so everything that
+        drops cached review lists (a refresh, a review write, a CI retry or
+        cancel) drops it too, and a new head commit has its own entry.
+        """
+        key = self._key(repo_path, "mrs", "ci", number, head_sha)
+        if not self._is_dirty(key):
+            cached = await self._cache.get_json(key)
+            if isinstance(cached, dict) and isinstance(cached.get("status"), str):
+                try:
+                    return CIStatus(cached["status"])
+                except ValueError:
+                    pass
+        return await self._read_ci_status(key, repo_path, number, head_sha)
+
+    async def get_mr_ci_status_fresh(
+        self, repo_path: str, number: int, head_sha: str = ""
+    ) -> CIStatus:
+        """Read past a cached CI status and store what the forge returns."""
+        key = self._key(repo_path, "mrs", "ci", number, head_sha)
+        return await self._read_ci_status(key, repo_path, number, head_sha)
+
+    async def _read_ci_status(
+        self, key: str, repo_path: str, number: int, head_sha: str
+    ) -> CIStatus:
+        if self._is_dirty(key):
+            return await read_mr_ci_status(self._inner, repo_path, number, head_sha)
+        generation = self._begin_read()
+        try:
+            result = await read_mr_ci_status(self._inner, repo_path, number, head_sha)
+            if isinstance(result, CIStatus) and self._may_store(key, generation):
+                await self._cache.put_json(
+                    key, {"status": result.value}, self._mr_list_ttl
                 )
         finally:
             self._end_read(generation)

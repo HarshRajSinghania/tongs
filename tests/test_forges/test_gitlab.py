@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import httpx
 import pytest
 
+from tongs.errors import ForgeError
 from tongs.forges.gitlab import (
     GitLabClient,
     _encode_project,
@@ -913,3 +914,104 @@ class TestDiscussionResolution:
             (parsed,) = await client.get_mr_discussions("acme/widgets", 42)
 
         assert (parsed.resolvable, parsed.is_resolved) == (False, False)
+
+
+class TestLazyCI:
+    """All Open pages without CI, and CI looked up for one merge request (#396)."""
+
+    @staticmethod
+    def _listed(iid: int) -> dict:
+        data = _mr_api_json({"iid": iid, "sha": f"sha-{iid}"})
+        # List responses carry no pipeline and no diff_refs.
+        del data["head_pipeline"]
+        del data["diff_refs"]
+        return data
+
+    @pytest.mark.asyncio
+    async def test_a_page_without_ci_is_one_request(self) -> None:
+        paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            return httpx.Response(200, json=[self._listed(1), self._listed(2)])
+
+        client, http = _make_gitlab_client(handler)
+        async with http:
+            page = await client.list_mrs_page("acme/widgets", with_ci=False)
+
+        assert client.supports_lazy_ci is True
+        assert paths == ["/api/v4/projects/acme/widgets/merge_requests"]
+        assert [item.head_commit_sha for item in page.items] == ["sha-1", "sha-2"]
+        assert {item.ci_status for item in page.items} == {CIStatus.UNKNOWN}
+
+    @pytest.mark.asyncio
+    async def test_a_page_with_ci_still_reads_each_pipeline(self) -> None:
+        paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            if request.url.path.endswith("/pipelines"):
+                return httpx.Response(200, json=[{"id": 1, "status": "failed"}])
+            return httpx.Response(200, json=[self._listed(1)])
+
+        client, http = _make_gitlab_client(handler)
+        async with http:
+            page = await client.list_mrs_page("acme/widgets")
+
+        assert paths == [
+            "/api/v4/projects/acme/widgets/merge_requests",
+            "/api/v4/projects/acme/widgets/merge_requests/1/pipelines",
+        ]
+        assert page.items[0].ci_status is CIStatus.FAILED
+
+    @pytest.mark.asyncio
+    async def test_lookup_reads_the_newest_merge_request_pipeline(self) -> None:
+        seen: list[tuple[str, dict[str, str]]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append((request.url.path, dict(request.url.params)))
+            return httpx.Response(200, json=[{"id": 2, "status": "running"}])
+
+        client, http = _make_gitlab_client(handler)
+        async with http:
+            status = await client.get_mr_ci_status("acme/widgets", 42, "sha-42")
+
+        assert status is CIStatus.RUNNING
+        assert seen == [
+            (
+                "/api/v4/projects/acme/widgets/merge_requests/42/pipelines",
+                {"per_page": "1"},
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_merge_request_without_pipelines_is_unknown(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=[])
+
+        client, http = _make_gitlab_client(handler)
+        async with http:
+            assert await client.get_mr_ci_status("acme/widgets", 42) is (
+                CIStatus.UNKNOWN
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_failed_lookup_raises_instead_of_reporting_unknown(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, json={"message": "boom"})
+
+        client, http = _make_gitlab_client(handler)
+        async with http:
+            with pytest.raises(ForgeError):
+                await client.get_mr_ci_status("acme/widgets", 42, "sha-42")
+
+    def test_detail_keeps_its_revision_head_and_lists_the_head_commit(self) -> None:
+        client, _http = _make_gitlab_client(lambda request: httpx.Response(200))
+        detail = client._parse_mr_detail(
+            _mr_api_json({"sha": "listed-head"}), "acme/widgets"
+        )
+        without_sha = client._parse_mr_summary(_mr_api_json(), "acme/widgets")
+
+        assert detail.head_commit_sha == "listed-head"
+        assert detail.head_sha == _mr_api_json()["diff_refs"]["head_sha"]
+        assert without_sha.head_commit_sha == _mr_api_json()["diff_refs"]["head_sha"]

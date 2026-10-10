@@ -16,7 +16,7 @@ from tongs.forges.models import (
 )
 from tongs.helpers import forge_label
 from tongs.scanner.repo import ForgeType
-from tongs.widgets.mr_table import MRTable, sort_mrs
+from tongs.widgets.mr_table import MRTable, mr_row_key, sort_mrs
 
 
 def _make_mr(
@@ -140,3 +140,102 @@ class TestForgeMarker:
             second = [str(cell) for cell in table.get_row_at(1)]
             assert any("GH" in cell for cell in first), first
             assert any("GL" in cell for cell in second), second
+
+
+class _TableApp(App):
+    def compose(self) -> ComposeResult:
+        yield MRTable()
+
+
+def _ci_cell(table: MRTable, mr: MRSummary) -> str:
+    return str(table.get_cell(mr_row_key(mr), "ci"))
+
+
+class TestPendingCI:
+    """Rows wait for CI with a loading marker and fill in place (#396)."""
+
+    @pytest.mark.asyncio
+    async def test_only_unknown_rows_wait_and_fill_in_place(self):
+        waiting = _make_mr(number=1, ci_status=CIStatus.UNKNOWN)
+        known = _make_mr(number=2, ci_status=CIStatus.FAILED)
+        app = _TableApp()
+        async with app.run_test():
+            table = app.query_one(MRTable)
+            table.setup_columns()
+            table.merge_mrs([waiting, known], ci_pending=True)
+
+            assert _ci_cell(table, waiting) == "…"
+            assert _ci_cell(table, known) == "●"
+            assert table.pending_ci_mrs() == [waiting]
+
+            assert table.set_ci_status(waiting, CIStatus.RUNNING) is True
+            assert _ci_cell(table, waiting) == "▶"
+            assert table.pending_ci_mrs() == []
+            # A second result for the same row changes nothing.
+            assert table.set_ci_status(waiting, CIStatus.FAILED) is False
+            assert table._mr_data[mr_row_key(waiting)].ci_status is CIStatus.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_a_result_for_a_replaced_or_removed_row_is_dropped(self):
+        old = _make_mr(number=1, title="Old", ci_status=CIStatus.UNKNOWN)
+        new = _make_mr(number=1, title="New", ci_status=CIStatus.UNKNOWN)
+        app = _TableApp()
+        async with app.run_test():
+            table = app.query_one(MRTable)
+            table.setup_columns()
+            table.merge_mrs([old], ci_pending=True)
+            table.merge_mrs([new], ci_pending=True)
+
+            assert table.set_ci_status(old, CIStatus.FAILED) is False
+            assert _ci_cell(table, new) == "…"
+
+            table.clear()
+            assert table.set_ci_status(new, CIStatus.FAILED) is False
+            assert table.row_count == 0
+
+    @pytest.mark.asyncio
+    async def test_ascii_marker_and_status(self):
+        waiting = _make_mr(number=1, ci_status=CIStatus.UNKNOWN)
+        app = _TableApp()
+        async with app.run_test():
+            table = app.query_one(MRTable)
+            table.setup_columns()
+            table.merge_mrs([waiting], ascii_mode=True, ci_pending=True)
+            assert _ci_cell(table, waiting) == ".."
+
+            table.set_ci_status(waiting, CIStatus.SUCCESS, ascii_mode=True)
+            assert _ci_cell(table, waiting) == "OK"
+
+    @pytest.mark.asyncio
+    async def test_ci_sort_moves_a_filled_row_and_keeps_the_cursor(self):
+        alpha = _make_mr(number=1, title="Alpha", ci_status=CIStatus.UNKNOWN)
+        bravo = _make_mr(number=2, title="Bravo", ci_status=CIStatus.UNKNOWN)
+        charlie = _make_mr(number=3, title="Charlie", ci_status=CIStatus.UNKNOWN)
+        app = _TableApp()
+        async with app.run_test(notifications=True) as pilot:
+            table = app.query_one(MRTable)
+            table.setup_columns()
+            table.cursor_type = "row"
+            table.merge_mrs([alpha, bravo, charlie], ci_pending=True)
+            table.focus()
+            await pilot.press("s", "s")
+            assert table._sort_key == "ci"
+            # Cycling the sort rebuilds the rows but keeps them waiting.
+            assert [_ci_cell(table, mr) for mr in (alpha, bravo, charlie)] == [
+                "…",
+                "…",
+                "…",
+            ]
+            await pilot.press("down")
+            assert table.get_selected_mr() == bravo
+
+            table.set_ci_status(charlie, CIStatus.FAILED)
+
+            order = [table._mr_data[row.key.value].number for row in table.ordered_rows]
+            assert order == [3, 1, 2]
+            assert table.get_selected_mr().number == 2  # type: ignore[union-attr]
+            assert table.cursor_row == 2
+            for index, row in enumerate(table.ordered_rows):
+                assert str(table.get_row_at(index)[2]) == str(
+                    table._mr_data[row.key.value].number
+                )

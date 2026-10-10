@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import aclosing
 from dataclasses import dataclass, replace
 from uuid import UUID, uuid4
@@ -12,6 +12,7 @@ from tongs.diff.conversion import convert_forge_changes
 from tongs.diff.models import DiffFile
 from tongs.diff.position import DiffPosition
 from tongs.forges.models import (
+    CIStatus,
     Commit,
     Discussion,
     MRSummary,
@@ -101,7 +102,8 @@ class TUIRepositoryProgress:
     """One step of an All Open read that reports repositories as they finish.
 
     The first step has no repository and an empty page, and reports the total
-    before any read completes. Each later step carries one repository's page.
+    before any read completes. Each later step carries one repository's page,
+    whose ``next_cursor`` is set while that repository has another page.
     """
 
     repository: RepositoryRef | None
@@ -253,6 +255,21 @@ class TUIServiceAdapter:
 
     async def get_commits(self, summary: MRSummary) -> tuple[Commit, ...]:
         return await self.session.get_commits(self.review_ref(summary))
+
+    async def get_ci_status(
+        self, summary: MRSummary, *, fresh: bool = False
+    ) -> CIStatus:
+        """Look up the CI status of one listed review.
+
+        This fills in a row from an All Open page read without CI. The lookup
+        is cached for the review list lifetime unless ``fresh`` is set, and its
+        requests share the per-host request limit with every other read.
+        """
+        return await self.session.get_review_ci_status(
+            self.review_ref(summary),
+            head_sha=summary.head_commit_sha,
+            fresh=fresh,
+        )
 
     async def list_review_pipelines(self, summary: MRSummary) -> tuple[Pipeline, ...]:
         return await self.session.list_review_pipelines(self.review_ref(summary))
@@ -674,32 +691,74 @@ class TUIServiceAdapter:
         )
 
     async def stream_all_open(
-        self, *, fresh: bool = False
+        self, *, fresh: bool = False, repository: Repo | None = None
     ) -> AsyncIterator[TUIRepositoryProgress]:
-        """Read every discovered repository and yield each as it finishes.
+        """Read the newest page of every discovered repository, yielding each.
 
-        Each repository is its own read, so one failing repository never hides
-        the others on its host, and reads overlap up to ``max_parallel``. The
-        unscoped session read is not used because it covers every repository
-        the session ever issued. Closing the iterator early, or cancelling the
-        task that drives it, cancels the reads still in flight.
+        Each repository is its own paged read without CI, so one failing
+        repository never hides the others on its host, rows carry their head
+        commit for ``get_ci_status``, and reads overlap up to
+        ``max_parallel``. ``repository`` limits the read to that one
+        repository. The unscoped session read is not used because it covers
+        every repository the session ever issued. Closing the iterator early,
+        or cancelling the task that drives it, cancels the reads still in
+        flight.
         """
-        refs = tuple(dict.fromkeys(self._repository_refs.values()))
-        total = len(refs)
+        refs = (
+            (self.repository_ref(repository),)
+            if repository is not None
+            else tuple(dict.fromkeys(self._repository_refs.values()))
+        )
+        async with aclosing(
+            self._stream_pages(tuple((ref, None) for ref in refs), fresh=fresh)
+        ) as steps:
+            async for step in steps:
+                yield step
+
+    async def stream_all_open_more(
+        self, cursors: Mapping[RepositoryRef, str]
+    ) -> AsyncIterator[TUIRepositoryProgress]:
+        """Read the next page of each repository that has one, yielding each.
+
+        ``cursors`` maps a repository to the ``next_cursor`` of the page last
+        shown for it; repositories without one are not read. A later page that
+        fails comes back with a failure and the same cursor, so it can be read
+        again. Closing the iterator cancels the reads still in flight.
+        """
+        async with aclosing(self._stream_pages(tuple(cursors.items()))) as steps:
+            async for step in steps:
+                yield step
+
+    async def _stream_pages(
+        self,
+        requests: tuple[tuple[RepositoryRef, str | None], ...],
+        *,
+        fresh: bool = False,
+    ) -> AsyncIterator[TUIRepositoryProgress]:
+        total = len(requests)
         yield TUIRepositoryProgress(None, ReviewPage(()), 0, total)
-        if not refs:
+        if not requests:
             return
         semaphore = asyncio.Semaphore(self.session.config.max_parallel)
 
-        async def fetch_repository(ref: RepositoryRef) -> ReviewPage:
+        async def fetch_repository(
+            ref: RepositoryRef, cursor: str | None
+        ) -> ReviewPage:
             async with semaphore:
                 return await self.session.list_reviews(
-                    ReviewQuery(ReviewScope.ALL_OPEN, repository=ref, fresh=fresh)
+                    ReviewQuery(
+                        ReviewScope.ALL_OPEN,
+                        repository=ref,
+                        paged=True,
+                        cursor=cursor,
+                        fresh=fresh,
+                        with_ci=False,
+                    )
                 )
 
         tasks = {
-            asyncio.create_task(fetch_repository(ref)): (index, ref)
-            for index, ref in enumerate(refs)
+            asyncio.create_task(fetch_repository(ref, cursor)): (index, ref)
+            for index, (ref, cursor) in enumerate(requests)
         }
         pending = set(tasks)
         completed = 0

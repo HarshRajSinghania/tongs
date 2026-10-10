@@ -2,22 +2,31 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections import deque
+from collections.abc import Iterable, Sequence
 from contextlib import aclosing, suppress
 from typing import ClassVar
 
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.css.query import NoMatches
 from textual.dom import NoScreen
 from textual.reactive import reactive
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, TabPane
 
+from tongs.forges.models import CIStatus, MRSummary
 from tongs.scanner.repo import Repo
 from tongs.services.errors import ServiceError, ServiceErrorCode
-from tongs.services.models import HostFailure, ReviewListItem, ReviewScope
-from tongs.widgets.mr_table import MRTable
+from tongs.services.models import (
+    HostFailure,
+    RepositoryRef,
+    ReviewListItem,
+    ReviewScope,
+)
+from tongs.tui_services import TUIRepositoryProgress
+from tongs.widgets.mr_table import MRTable, mr_row_key
 
 
 class InboxScreen(Screen):
@@ -40,6 +49,7 @@ class InboxScreen(Screen):
         Binding("2", "focus_tab('my-mrs')", "My MRs", show=False),
         Binding("3", "focus_tab('all-open')", "All Open", show=False),
         Binding("o", "open_in_browser", "Open", show=True),
+        Binding("m", "load_more", "More", show=True),
         Binding("ctrl+r", "refresh", "Refresh", show=True),
         Binding("escape", "go_back", "Back", show=False),
         Binding("q", "quit_or_back", "Quit", show=True),
@@ -58,6 +68,16 @@ class InboxScreen(Screen):
         # longer current has been replaced or stopped and must not touch the tab.
         self._all_open_load = 0
         self._all_open_pending = False
+        # The next page of each All Open repository that has more to show.
+        self._all_open_cursors: dict[RepositoryRef, str] = {}
+        self._all_open_total = 0
+        # CI lookups for All Open rows. Each refresh, stop or tab switch takes
+        # the next generation, and a lookup of an older one never lands.
+        self._ci_generation = 0
+        # Each entry says whether its lookup reads past the CI cache.
+        self._ci_queue: deque[tuple[MRSummary, bool]] = deque()
+        self._ci_queued: set[str] = set()
+        self._ci_workers = 0
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -90,6 +110,8 @@ class InboxScreen(Screen):
         """Reconcile inbox tabs with one successful repository refresh."""
         self._repository_generation = generation
         self._stop_all_open()
+        self._stop_ci_lookups()
+        self._all_open_cursors.clear()
         self._loaded_tabs.clear()
         scoped_repo_removed = False
         if self.scoped_repo is not None:
@@ -132,10 +154,15 @@ class InboxScreen(Screen):
         tab_id = event.pane.id
         if self.query_one(TabbedContent).active != "all-open":
             # Leaving All Open mid-load stops it; coming back loads it again.
+            # CI lookups stop too and resume for the rows still waiting.
             self._stop_all_open()
+            self._stop_ci_lookups()
+        elif tab_id == "all-open" and tab_id in self._loaded_tabs:
+            self._resume_ci_lookups()
         if tab_id and tab_id not in self._loaded_tabs:
             self._loaded_tabs.add(tab_id)
             self._load_tab(tab_id)
+        self.refresh_bindings()
 
     def action_focus_tab(self, tab_id: str) -> None:
         tabbed = self.query_one(TabbedContent)
@@ -144,6 +171,43 @@ class InboxScreen(Screen):
             return
         self._loaded_tabs.add(tab_id)
         self._load_tab(tab_id)
+
+    def on_unmount(self) -> None:
+        self._stop_ci_lookups()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "load_more":
+            return self._can_load_more()
+        return True
+
+    def action_load_more(self) -> None:
+        """Read the next page of every All Open repository that has one."""
+        if not self._can_load_more():
+            return
+        self._all_open_pending = True
+        self.loading_all_open = True
+        self.refresh_bindings()
+        self.load_more_all_open(self._all_open_load)
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        """Load more once the cursor reaches the last All Open row."""
+        table = event.data_table
+        if table.id != "all-open-table" or table.row_count == 0:
+            return
+        if event.cursor_row >= table.row_count - 1:
+            self.action_load_more()
+
+    def _can_load_more(self) -> bool:
+        try:
+            active = self.query_one(TabbedContent).active
+        except NoMatches:
+            return False
+        return (
+            active == "all-open"
+            and "all-open" in self._loaded_tabs
+            and not self._all_open_pending
+            and bool(self._all_open_cursors)
+        )
 
     def _load_tab(self, tab_id: str, *, fresh: bool = False) -> None:
         if tab_id == "reviews":
@@ -216,48 +280,88 @@ class InboxScreen(Screen):
         status = self.query_one("#all-open-status", Static)
         table.loading = True
         status.update("")
+        # A new load replaces the rows, so lookups for the old ones stop.
+        self._stop_ci_lookups()
+        self._all_open_cursors.clear()
         try:
             if not self.scoped_repo and not self.app.repos:
                 table.clear()
                 return
-            if self.scoped_repo:
-                await self._load_page(
-                    table, ReviewScope.ALL_OPEN, "All Open", fresh=fresh
-                )
-                if load == self._all_open_load:
-                    status.update(f"[dim]{_open_count(table.row_count)}[/]")
-            else:
-                await self._stream_all_open(table, status, load, fresh=fresh)
+            await self._stream_all_open(table, status, load, fresh=fresh)
         finally:
             if load == self._all_open_load:
                 self._all_open_pending = False
                 self.loading_all_open = False
                 with suppress(NoScreen):
                     table.loading = False
+                    self.refresh_bindings()
+
+    @work(exclusive=True, group="all-open")
+    async def load_more_all_open(self, load: int) -> None:
+        """Read the next page of the repositories that have one."""
+        if load != self._all_open_load:
+            return
+        table = self.query_one("#all-open-table", MRTable)
+        status = self.query_one("#all-open-status", Static)
+        cursors = dict(self._all_open_cursors)
+        items: list[ReviewListItem] = []
+        failures: list[HostFailure] = []
+        status.update(f"[dim]{_loading_more(len(cursors))}[/]")
+        try:
+            async with aclosing(
+                self.app.services.stream_all_open_more(cursors)
+            ) as steps:
+                async for step in steps:
+                    if load != self._all_open_load:
+                        return
+                    self._apply_all_open_step(table, step, replace=False, fresh=False)
+                    items.extend(step.page.items)
+                    failures.extend(step.page.failures)
+                    if step.completed < step.total:
+                        status.update(
+                            f"[dim]{_loading_more(step.total - step.completed)}[/]"
+                        )
+        except ServiceError as error:
+            if load == self._all_open_load:
+                self.notify(
+                    f"All Open: {error.message}", severity="warning", markup=False
+                )
+        finally:
+            if load == self._all_open_load:
+                self._all_open_pending = False
+                self.loading_all_open = False
+                with suppress(NoScreen):
+                    status.update(f"[dim]{self._all_open_summary(table)}[/]")
+                    self.refresh_bindings()
+        if load == self._all_open_load:
+            self._notify_failures(
+                "All Open", items, self.app.services.deduplicate_failures(failures)
+            )
 
     async def _stream_all_open(
         self, table: MRTable, status: Static, load: int, *, fresh: bool
     ) -> None:
         """Show each repository's rows as soon as that repository finishes."""
-        ascii_mode = self.app.config.ascii_mode
         items: list[ReviewListItem] = []
         failures: list[HostFailure] = []
         total = 0
+        stream = (
+            self.app.services.stream_all_open(fresh=fresh, repository=self.scoped_repo)
+            if self.scoped_repo is not None
+            else self.app.services.stream_all_open(fresh=fresh)
+        )
         try:
-            async with aclosing(
-                self.app.services.stream_all_open(fresh=fresh)
-            ) as steps:
+            async with aclosing(stream) as steps:
                 async for step in steps:
                     if load != self._all_open_load:
                         return
                     total = step.total
+                    self._all_open_total = total
+                    # The previous rows stay until the first new ones arrive.
+                    self._apply_all_open_step(
+                        table, step, replace=not items, fresh=fresh
+                    )
                     if step.page.items:
-                        # The previous rows stay until the first new ones arrive.
-                        table.merge_mrs(
-                            (item.summary for item in step.page.items),
-                            ascii_mode,
-                            replace=not items,
-                        )
                         table.loading = False
                         items.extend(step.page.items)
                     failures.extend(step.page.failures)
@@ -297,14 +401,121 @@ class InboxScreen(Screen):
                 if table.row_count
                 else f"[dim]{unloaded[0].upper()}{unloaded[1:]}[/]"
             )
+            # Earlier rows still waiting for CI get their lookups again.
+            self._queue_ci_lookups(table, table.pending_ci_mrs())
         else:
-            status.update(
-                f"[dim]{_open_count(table.row_count)} across {total} "
-                f"{_repositories(total)}[/]"
-            )
+            status.update(f"[dim]{self._all_open_summary(table)}[/]")
         self._notify_failures(
             "All Open", items, self.app.services.deduplicate_failures(failures)
         )
+
+    def _apply_all_open_step(
+        self,
+        table: MRTable,
+        step: TUIRepositoryProgress,
+        *,
+        replace: bool,
+        fresh: bool,
+    ) -> None:
+        """Show one repository page, keep its cursor, and queue its CI lookups.
+
+        ``fresh`` marks rows from an explicit refresh, whose lookups read past
+        the CI cache.
+        """
+        if step.repository is not None:
+            if step.page.next_cursor is not None:
+                self._all_open_cursors[step.repository] = step.page.next_cursor
+            else:
+                self._all_open_cursors.pop(step.repository, None)
+        if not step.page.items:
+            return
+        summaries = [item.summary for item in step.page.items]
+        table.merge_mrs(
+            summaries, self.app.config.ascii_mode, replace=replace, ci_pending=True
+        )
+        self._queue_ci_lookups(table, summaries, fresh=fresh)
+
+    def _all_open_summary(self, table: MRTable) -> str:
+        """Count the loaded rows and say whether more can be loaded."""
+        count = table.row_count
+        total = self._all_open_total
+        loaded = " loaded" if self._all_open_cursors else ""
+        text = (
+            f"{_open_count(count)}{loaded}"
+            if self.scoped_repo is not None
+            else f"{_open_count(count)}{loaded} across {total} {_repositories(total)}"
+        )
+        if self._all_open_cursors:
+            text += ", more to load (m)"
+        return text
+
+    def _queue_ci_lookups(
+        self,
+        table: MRTable,
+        summaries: Iterable[MRSummary],
+        *,
+        fresh: bool = False,
+    ) -> None:
+        """Look up CI for rows that still show the loading marker.
+
+        Lookups run in table order, a few at a time, so a load more or a
+        refresh never waits behind every row's lookup. Each request also takes
+        a slot of the per-host request limit shared with every other read.
+        """
+        for summary in summaries:
+            key = mr_row_key(summary)
+            if key in self._ci_queued or not table.is_ci_pending(summary):
+                continue
+            self._ci_queued.add(key)
+            self._ci_queue.append((summary, fresh))
+        limit = max(1, self.app.config.max_parallel)
+        while self._ci_workers < min(limit, len(self._ci_queue)):
+            self._ci_workers += 1
+            self.run_worker(
+                self._run_ci_lookups(table, self._ci_generation),
+                group="all-open-ci",
+                exit_on_error=False,
+            )
+
+    async def _run_ci_lookups(self, table: MRTable, generation: int) -> None:
+        try:
+            while generation == self._ci_generation and self._ci_queue:
+                summary, fresh = self._ci_queue.popleft()
+                key = mr_row_key(summary)
+                if table.is_ci_pending(summary):
+                    try:
+                        status = await self.app.services.get_ci_status(
+                            summary, fresh=fresh
+                        )
+                    except ServiceError:
+                        status = CIStatus.UNKNOWN
+                    if generation != self._ci_generation:
+                        return
+                    table.set_ci_status(summary, status, self.app.config.ascii_mode)
+                # The key stays queued until its lookup ends, so a row is never
+                # looked up twice at once. A newer summary that replaced the row
+                # meanwhile is looked up next.
+                self._ci_queued.discard(key)
+                current = table.get_mr(key)
+                if current is not None and table.is_ci_pending(current):
+                    self._queue_ci_lookups(table, (current,), fresh=fresh)
+        finally:
+            if generation == self._ci_generation:
+                self._ci_workers -= 1
+
+    def _stop_ci_lookups(self) -> None:
+        """Drop queued CI lookups and make any in flight land nowhere."""
+        self._ci_generation += 1
+        self._ci_queue.clear()
+        self._ci_queued.clear()
+        self._ci_workers = 0
+        self.workers.cancel_group(self, "all-open-ci")
+
+    def _resume_ci_lookups(self) -> None:
+        """Queue lookups again for rows a stop left waiting for CI."""
+        with suppress(NoMatches):
+            table = self.query_one("#all-open-table", MRTable)
+            self._queue_ci_lookups(table, table.pending_ci_mrs())
 
     def _stop_all_open(self) -> None:
         """Cancel an All Open load in flight so the tab loads again on return."""
@@ -390,6 +601,10 @@ def _open_count(count: int) -> str:
 
 def _repositories(count: int) -> str:
     return "repository" if count == 1 else "repositories"
+
+
+def _loading_more(count: int) -> str:
+    return f"Loading more from {count} {_repositories(count)}"
 
 
 # Codes that describe the whole host rather than one repository, so every

@@ -1194,3 +1194,119 @@ class TestMRPipelines:
             assert await client.list_mr_pipelines("acme/repo", 10) == []
 
         assert paths == ["/repos/acme/repo/pulls/10"]
+
+
+class TestLazyCI:
+    """All Open pages without CI, and CI looked up for one pull request (#396)."""
+
+    @pytest.mark.asyncio
+    async def test_a_page_without_ci_is_one_request(self) -> None:
+        paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            return httpx.Response(
+                200,
+                json=[
+                    _pr_api_json({"number": 1, "head": {"ref": "a", "sha": "sha-1"}}),
+                    _pr_api_json({"number": 2, "head": {"ref": "b", "sha": "sha-2"}}),
+                ],
+            )
+
+        client, http = _make_github_client(handler)
+        async with http:
+            page = await client.list_mrs_page("acme/repo", with_ci=False)
+
+        assert client.supports_lazy_ci is True
+        assert paths == ["/repos/acme/repo/pulls"]
+        assert [item.head_commit_sha for item in page.items] == ["sha-1", "sha-2"]
+        assert {item.ci_status for item in page.items} == {CIStatus.UNKNOWN}
+
+    @pytest.mark.asyncio
+    async def test_list_rows_and_detail_carry_the_head_commit(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/repos/acme/repo/pulls":
+                return httpx.Response(200, json=[_pr_api_json()])
+            if request.url.path == "/repos/acme/repo/pulls/10":
+                return httpx.Response(200, json=_pr_api_json())
+            return httpx.Response(200, json={"total_count": 0, "check_runs": []})
+
+        client, http = _make_github_client(handler)
+        async with http:
+            listed = await client.list_mrs("acme/repo")
+            detail = await client.get_mr("acme/repo", 10)
+
+        assert listed[0].head_commit_sha == "abc123def456"
+        assert detail.head_commit_sha == "abc123def456"
+        assert detail.head_sha == "abc123def456"
+
+    @pytest.mark.asyncio
+    async def test_lookup_with_a_head_reads_only_its_check_runs(self) -> None:
+        paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            return httpx.Response(
+                200,
+                json={
+                    "total_count": 2,
+                    "check_runs": [
+                        {"status": "completed", "conclusion": "success"},
+                        {"status": "in_progress"},
+                    ],
+                },
+            )
+
+        client, http = _make_github_client(handler)
+        async with http:
+            status = await client.get_mr_ci_status("acme/repo", 10, "sha-1")
+
+        assert status is CIStatus.RUNNING
+        assert paths == ["/repos/acme/repo/commits/sha-1/check-runs"]
+
+    @pytest.mark.asyncio
+    async def test_lookup_without_a_head_reads_the_pull_request_first(self) -> None:
+        paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            if request.url.path == "/repos/acme/repo/pulls/10":
+                return httpx.Response(200, json=_pr_api_json())
+            return httpx.Response(
+                200,
+                json={
+                    "total_count": 1,
+                    "check_runs": [{"status": "completed", "conclusion": "failure"}],
+                },
+            )
+
+        client, http = _make_github_client(handler)
+        async with http:
+            status = await client.get_mr_ci_status("acme/repo", 10)
+
+        assert status is CIStatus.FAILED
+        assert paths == [
+            "/repos/acme/repo/pulls/10",
+            "/repos/acme/repo/commits/abc123def456/check-runs",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_lookup_raises_instead_of_reporting_unknown(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"message": "Not Found"})
+
+        client, http = _make_github_client(handler)
+        async with http:
+            with pytest.raises(ForgeError):
+                await client.get_mr_ci_status("acme/repo", 10, "sha-1")
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_check_run_response_is_unknown(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=["not", "an", "object"])
+
+        client, http = _make_github_client(handler)
+        async with http:
+            status = await client.get_mr_ci_status("acme/repo", 10, "sha-1")
+
+        assert status is CIStatus.UNKNOWN
