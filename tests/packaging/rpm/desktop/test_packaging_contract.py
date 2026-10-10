@@ -404,7 +404,7 @@ def test_textual_floor_is_the_oldest_release_the_terminal_app_passes_on() -> Non
     release_lock = (ROOT / "requirements" / "release.lock").read_text()
     locked = re.search(r"^textual==(\d+)\.", release_lock, re.MULTILINE)
     assert locked is not None and 4 <= int(locked.group(1)) < 9
-    assert re.search(r"^textual>=4\.0$", release_inputs, re.MULTILINE)
+    assert re.search(r"^textual>=4\.0,<9$", release_inputs, re.MULTILINE)
     assert "BuildRequires:  python3dist(textual) >= 4\n" in core_spec
     assert "Requires:       python3dist(textual) >= 4\n" in core_spec
     assert "python3dist(textual) >= 4" in manifest["core_runtime_requirements"]
