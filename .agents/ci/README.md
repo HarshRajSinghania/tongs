@@ -175,7 +175,7 @@ One more workflow runs on pull requests:
 
 | Workflow | Trigger |
 |---|---|
-| `release-desktop.yml` (Unpublished desktop candidate attestation) | PRs into `main` matching its path filter; pushes to its named branches; pushes of a stable `vX.Y.Z` tag; and a manual `workflow_dispatch` dry run |
+| `release-desktop.yml` (Unpublished desktop candidate attestation) | PRs into `main` matching its path filter; pushes of a stable `vX.Y.Z` tag; and a manual `workflow_dispatch` dry run from `main` (a dispatch from any other ref fails) |
 
 `desktop-rpm.yml` (Desktop Fedora RPM), `desktop-python-rpms.yml` (Desktop Python
 companion RPMs) and `desktop-archive.yml` (Reproducible desktop archive) are manual
@@ -210,7 +210,8 @@ that state and asks for a retry.
 A `workflow_dispatch` of `release-desktop.yml` from `main` with `dry_run` set
 runs the build, signing, verification and RPM rebuild and publishes nothing.
 It is the rehearsal to run before pushing a tag:
-`gh workflow run release-desktop.yml --ref main -f dry_run=true`. The publish
+`gh workflow run release-desktop.yml --ref main -f dry_run=true`. A dispatch
+from any other ref fails in its first step. The publish
 job, including the draft-release lookup, only runs on the tag itself. `tests/ci/test_release_publication_workflow.py`
 pins the trigger, permission and step-order contract.
 
@@ -220,6 +221,44 @@ pins the trigger, permission and step-order contract.
 `gh release create --notes-file`. Write the prose so it reads on GitHub too:
 absolute `https://www.tongs.tools/...` links, inline code such as
 `` `Ctrl+G` `` instead of `++key++` markup.
+
+### Release gate
+
+On a tag push, both workflows run `.github/scripts/release_gate.py` right
+after checkout, in `publish.yml` `build` and `release-desktop.yml`
+`candidate-archive`, before anything is installed, built or uploaded. Every
+publishing job depends on those two, so a tag publishes nothing to PyPI or the
+GitHub Release unless all three checks pass for the tagged commit:
+
+1. It is on `main`: the compare `<sha>...main` reports `ahead` or `identical`.
+   Any commit `main` contains passes, not only its tip.
+2. `docs/releases/<tag>.md` exists in the tagged tree and is not empty.
+3. The newest `ci.yml` run for a push to `main` of exactly that commit, in this
+   repository, completed with conclusion `success`. A run reports its latest
+   attempt, so a partial re-run that turned green counts.
+
+The gate is a hard failure and never polls; each failed check prints its own
+line. One step before it is the only step that sees `GH_TOKEN`, and it only
+reads the two API responses into `$RUNNER_TEMP`; the jobs hold
+`contents: read` and `actions: read`. `tests/ci/test_release_gate.py` covers
+the checks against recorded API responses in `tests/ci/fixtures/release_gate/`,
+and `tests/ci/test_workflow_hygiene.py` holds every tag workflow to the gate.
+
+### Pre-tag checklist
+
+1. Merge the release notes pull request, the last change of the release.
+2. Wait for the `ci.yml` push run on `main` for that merge commit to finish
+   green. Its full graph includes the RPM lifecycle and takes about two hours.
+3. Run the dry run from `main`:
+   `gh workflow run release-desktop.yml --ref main -f dry_run=true`, and wait
+   for it to pass.
+4. Get the maintainer's go to tag. Tags are never delegated.
+5. Push the signed `vX.Y.Z` tag on that merge commit.
+6. If the gate fails because `main` CI was still running, wait for it to turn
+   green, then re-run both tag workflows (`publish.yml` and
+   `release-desktop.yml`) for the tag. Never delete, move or recreate the tag.
+   Any other gate failure means the tag cannot publish; nothing was uploaded,
+   so stop and raise it with the maintainer rather than retagging.
 
 ## Pinned actions and tools
 
