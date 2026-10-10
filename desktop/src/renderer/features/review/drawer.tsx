@@ -475,11 +475,24 @@ export function useReviewDrawer(
         expected_version: draft.version,
       });
       apply((state) => finishSubmission(state, progress));
-      setRecoveries((items) => [
-        progress,
-        ...items.filter((item) => item.attempt_id !== progress.attempt_id),
-      ]);
+      setRecoveries((items) => withAttempt(items, progress));
     } catch (reason) {
+      // A refused start can still have locked and released the draft, which
+      // moves its stored version on, so the stored draft is read and adopted
+      // before anything else is attempted, as a continued submission does.
+      const stored = await recoverDraft(bridge, review, draft.id);
+      if (stored) {
+        try {
+          apply((state) => adoptDraft(state, stored));
+          setDraftCandidates((items) => [
+            stored,
+            ...items.filter((item) => item.id !== stored.id),
+          ]);
+        } catch {
+          // Local edits made meanwhile keep the held draft; the next save
+          // reports the conflict.
+        }
+      }
       const recovered = await recoverLatestSubmission(
         bridge,
         review,
@@ -488,10 +501,7 @@ export function useReviewDrawer(
       );
       if (recovered) {
         apply((state) => recoverSubmission(state, recovered));
-        setRecoveries((items) => [
-          recovered,
-          ...items.filter((item) => item.attempt_id !== recovered.attempt_id),
-        ]);
+        setRecoveries((items) => withAttempt(items, recovered));
       } else {
         apply((state) => failSubmission(state, drawerFailureMessage(reason)));
       }
@@ -509,7 +519,7 @@ export function useReviewDrawer(
       const attempt = held.current.submission.progress;
       if (!attempt) return;
       try {
-        apply((state) => beginSubmission(state, mode));
+        apply((state) => beginSubmission(state, mode, resolution));
       } catch (reason) {
         setMessage(drawerFailureMessage(reason));
         return;
@@ -529,6 +539,7 @@ export function useReviewDrawer(
                 resolution: resolution ?? "retry_remaining",
               });
         apply((state) => finishSubmission(state, progress));
+        setRecoveries((items) => withAttempt(items, progress));
         if (progress.outcome === "editable") {
           const editable = await recoverDraft(bridge, review, progress.draft_id);
           if (editable) {
@@ -545,8 +556,11 @@ export function useReviewDrawer(
           review,
           attempt.attempt_id,
         );
-        if (recovered) apply((state) => recoverSubmission(state, recovered));
-        else apply((state) => failSubmission(state, drawerFailureMessage(reason)));
+        if (recovered) {
+          apply((state) => recoverSubmission(state, recovered));
+          setRecoveries((items) => withAttempt(items, recovered));
+        } else
+          apply((state) => failSubmission(state, drawerFailureMessage(reason)));
         setMessage(drawerFailureMessage(reason));
       } finally {
         setBusy(false);
@@ -1634,11 +1648,21 @@ function SubmissionProgress({
         <>
           <p>
             Confirmed steps stay excluded. Resume retries the next definitely
-            unconfirmed step.
+            unconfirmed step. Returning the draft to editing sends nothing more
+            and keeps everything the forge has not confirmed.
           </p>
-          <button className="button" disabled={pending} onClick={resume}>
-            Resume confirmed attempt
-          </button>
+          <div className="review-workflow-row">
+            <button className="button" disabled={pending} onClick={resume}>
+              Resume confirmed attempt
+            </button>
+            <button
+              className="button button-secondary"
+              disabled={pending}
+              onClick={() => reconcile("return_editable")}
+            >
+              Return draft to editing
+            </button>
+          </div>
         </>
       )}
       {progress.outcome === "unknown" && (
@@ -1722,6 +1746,21 @@ function DraftRecoveryList({
       ))}
     </section>
   );
+}
+
+/**
+ * The recovery rows after one attempt reported back. An attempt that was
+ * submitted or returned to editing has nothing left to recover, so its row is
+ * dropped; any other outcome replaces the row with the latest progress.
+ */
+function withAttempt(
+  items: readonly SubmissionProgressDto[],
+  progress: SubmissionProgressDto,
+): readonly SubmissionProgressDto[] {
+  const others = items.filter((item) => item.attempt_id !== progress.attempt_id);
+  if (progress.outcome === "editable" || progress.outcome === "submitted")
+    return others;
+  return [progress, ...others];
 }
 
 function RecoveryList({

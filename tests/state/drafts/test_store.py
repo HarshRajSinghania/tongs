@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import multiprocessing
 import os
 import sqlite3
@@ -168,25 +169,70 @@ async def test_database_and_sidecars_are_private(db_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_save_marks_anchor_stale_without_retargeting(db_path: Path) -> None:
+async def test_save_against_changed_revision_returns_stale_anchor_without_retargeting(
+    db_path: Path,
+) -> None:
     store = DraftStore(db_path)
     await store.open()
     draft = await store.create_draft(REVIEW, REVISION)
     caller = make_content()
+    changed = ReviewRevision("head-1", "different-base", "start-1")
 
     saved = await store.save_draft(
-        draft.id,
-        draft.version,
-        caller,
-        current_revision=ReviewRevision("head-1", "different-base", "start-1"),
+        draft.id, draft.version, caller, current_revision=changed
     )
 
     inline = saved.comments[1]
     assert isinstance(inline, InlineDraftComment)
-    assert inline.anchor.stale is True
     assert inline.anchor.revision == REVISION
     assert saved.version == 2
+    # The saved snapshot is assessed against the caller's current revision.
+    assert inline.anchor.stale is True
+    # The stored version is not retargeted, so a plain read is not stale.
+    stored = (await store.get_draft(draft.id)).comments[1]
+    assert isinstance(stored, InlineDraftComment)
+    assert stored.anchor.stale is False
+    # Staleness is derived from the revisions, never read back from storage.
+    assessed = saved.assessed_against(changed).comments[1]
+    assert isinstance(assessed, InlineDraftComment)
+    assert assessed.anchor.stale is True
+    current = saved.assessed_against(REVISION).comments[1]
+    assert isinstance(current, InlineDraftComment)
+    assert current.anchor.stale is False
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_stored_stale_flag_is_ignored_on_read(db_path: Path) -> None:
+    store = DraftStore(db_path)
+    await store.open()
+    draft = await store.create_draft(REVIEW, REVISION, make_content())
+    await store.close()
+    with sqlite3.connect(db_path) as db:
+        (raw,) = db.execute(
+            "SELECT comments_json FROM drafts WHERE id = ?", (str(draft.id),)
+        ).fetchone()
+        comments = json.loads(raw)
+        for comment in comments:
+            if comment["kind"] == "inline":
+                comment["anchor"]["stale"] = True
+        db.execute(
+            "UPDATE drafts SET comments_json = ? WHERE id = ?",
+            (json.dumps(comments), str(draft.id)),
+        )
+
+    reopened = DraftStore(db_path)
+    await reopened.open()
+    loaded = await reopened.get_draft(draft.id)
+    listed = await reopened.list_drafts(review=REVIEW)
+
+    assert [
+        comment.anchor.stale
+        for snapshot in (loaded, *listed)
+        for comment in snapshot.comments
+        if isinstance(comment, InlineDraftComment)
+    ] == [False, False]
+    await reopened.close()
 
 
 @pytest.mark.asyncio
@@ -333,6 +379,7 @@ async def test_unknown_attempt_is_noneditable_and_nonreplayable_until_reconciled
         )
     assert unknown.state == DraftState.UNKNOWN
     assert await store.list_recovery_attempts() == (unknown,)
+    assert await store.list_recovery_attempts(include_owned=True) == (unknown,)
 
     resumed = await store.reconcile_attempt(
         attempt.id, ReconciliationResolution.RETRY_REMAINING
@@ -845,3 +892,44 @@ async def test_cancelled_attempt_read_rolls_back_snapshot_transaction(
         assert store._db.in_transaction is False
         monkeypatch.setattr(store, "_row_to_attempt", original)
         assert await store.get_attempt(attempt.id) == attempt
+
+
+@pytest.mark.asyncio
+async def test_owned_active_attempts_are_listed_only_on_request(
+    db_path: Path,
+) -> None:
+    async with DraftStore(db_path) as owner, DraftStore(db_path) as observer:
+        submitting_draft = await owner.create_draft(REVIEW, REVISION)
+        partial_draft = await owner.create_draft(REVIEW, REVISION)
+        unknown_draft = await owner.create_draft(REVIEW, REVISION)
+        submitting = await owner.lock_submission(
+            submitting_draft.id, submitting_draft.version
+        )
+        partial = await owner.lock_submission(partial_draft.id, partial_draft.version)
+        partial = await owner.record_receipt(partial.id, "comment:1", "remote-1")
+        unknown = await owner.lock_submission(unknown_draft.id, unknown_draft.version)
+        unknown = await owner.mark_attempt_unknown(unknown.id)
+
+        assert partial.state == DraftState.PARTIAL
+        assert [item.id for item in await owner.list_recovery_attempts()] == [
+            unknown.id
+        ]
+        owned = await owner.list_recovery_attempts(include_owned=True)
+        assert sorted(str(item.id) for item in owned) == sorted(
+            str(item) for item in (submitting.id, partial.id, unknown.id)
+        )
+        assert {item.id: item.state for item in owned} == {
+            submitting.id: DraftState.SUBMITTING,
+            partial.id: DraftState.PARTIAL,
+            unknown.id: DraftState.UNKNOWN,
+        }
+        # Ownership is process-local, so another store never sees them.
+        assert [
+            item.id
+            for item in await observer.list_recovery_attempts(include_owned=True)
+        ] == [unknown.id]
+
+        await owner.complete_submission(submitting.id)
+        assert {
+            item.id for item in await owner.list_recovery_attempts(include_owned=True)
+        } == {partial.id, unknown.id}
