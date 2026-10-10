@@ -272,7 +272,12 @@ function DiffView({
       .catch((reason: unknown) => {
         if (current) {
           if (invalidatesSelection(reason)) selectInlineAnchor(null);
-          if (partial === null) {
+          // A layout switch can stop the previous layout mid-paging; its
+          // drawn pages are then still on screen waiting for the rest.
+          const drawn =
+            partial ??
+            (shown.current?.loaded.loadingMore ? shown.current.loaded : null);
+          if (drawn === null) {
             setError(reason);
           } else {
             // The pages already drawn stay, as a bounded partial snapshot
@@ -280,7 +285,7 @@ function DiffView({
             const stopped = partialFailure(reason);
             show(
               Object.freeze({
-                ...partial,
+                ...drawn,
                 loadingMore: false,
                 partialError: stopped,
               }),

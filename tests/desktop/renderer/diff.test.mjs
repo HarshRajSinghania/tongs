@@ -865,3 +865,59 @@ test("a page that fails after the first keeps the drawn rows as a partial diff",
   assert.deepEqual(filePaths(view), ["src/file_0.py"]);
   assert.deepEqual(loadingTexts(view), []);
 });
+
+test("a layout switch that fails while the old layout pages freezes it as a partial diff", async () => {
+  const review = "review-switch-partial";
+  const opens = [];
+  let pages = 0;
+  const bridge = diffBridge(review, {
+    openDiff: (params) => {
+      opens.push(params.from_snapshot ?? "fresh");
+      if (params.from_snapshot !== undefined)
+        return {
+          requestToken: crypto.randomUUID(),
+          result: Promise.reject({
+            code: "snapshot_expired",
+            message: "The resource snapshot is invalid or expired; refetch it.",
+            retryable: true,
+          }),
+        };
+      return settledRead({
+        snapshot_id: "snapshot-switch",
+        resource: review,
+        revision,
+        cursor: 0,
+        next_cursor: 3,
+        entries: fileRows(0, "unified"),
+      });
+    },
+    pageDiff: () => {
+      pages += 1;
+      // The rest of the unified diff never arrives before the switch.
+      return { requestToken: crypto.randomUUID(), result: new Promise(() => {}) };
+    },
+  });
+  const view = renderDiff(review, bridge);
+  await waitFor(() =>
+    assert.deepEqual(loadingTexts(view), ["Loading the rest of the diff…"]),
+  );
+  await waitFor(() => assert.equal(pages, 1));
+
+  fireEvent.click(view.getByText("Split"));
+  // The failure names why the rest is missing; a snapshot still marked as
+  // loading would read as an older one instead ("Showing the previous diff
+  // snapshot.") and keep waiting for pages that never come.
+  await waitFor(() =>
+    assert.deepEqual(lineTexts(view, ".notice-error"), [
+      "This diff snapshot expired. Reload the diff to continue.",
+    ]),
+  );
+  assert.deepEqual(opens, ["fresh", "snapshot-switch"]);
+  // The drawn page stays as a finished partial diff, not one still loading.
+  assert.deepEqual(loadingTexts(view), []);
+  assert.deepEqual(filePaths(view), ["src/file_0.py"]);
+  assert.deepEqual(lineTexts(view, ".diff-unified .line-content"), [
+    "+value_0 = 0",
+  ]);
+  assert.equal(view.getByText("Refresh").hasAttribute("disabled"), false);
+});
