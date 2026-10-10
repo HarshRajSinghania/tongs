@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
@@ -120,11 +120,12 @@ class MRSummary:
     additions: int | None = None
     deletions: int | None = None
     # The source branch head commit, when the list response names it, so CI
-    # can be looked up for one review after a list read without CI. Appended
-    # with a default so existing constructors and cached rows keep working.
-    # It is not named ``head_sha`` because MRDetail already has that field at
-    # a fixed position, filled from the revision the detail read returns.
-    head_commit_sha: str = ""
+    # can be looked up for one review after a list read without CI. It is
+    # keyword-only, so it never takes a positional slot: MRDetail's own fields
+    # keep their positions after MRSummary's. It is not named ``head_sha``
+    # because MRDetail already has that field, filled from the revision the
+    # detail read returns.
+    head_commit_sha: str = field(default="", kw_only=True)
 
 
 @dataclass(frozen=True)

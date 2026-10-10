@@ -34,6 +34,9 @@ DEFAULT_RETRY_AFTER_SECONDS = 5
 
 _MAX_HEADER_DIGITS = 12
 
+# Body text of a 403 that is a rate limit even without rate-limit headers.
+_RATE_LIMIT_403_MARKERS = ("secondary rate limit", "abuse detection")
+
 # Retry sleeps go through this name so tests can observe them without waiting.
 _sleep = asyncio.sleep
 #: Methods safe to send twice. A rate-limited write fails at once instead of
@@ -222,7 +225,7 @@ def map_http_error(
     """Map an HTTP error response to the appropriate ForgeError subclass.
 
     A 429, and a 403 that carries ``Retry-After`` or ``x-ratelimit-remaining:
-    0``, map to RateLimitError. ``now`` returns the current Unix time and
+    0`` or names a secondary rate limit in its body, map to RateLimitError. ``now`` returns the current Unix time and
     turns an HTTP-date ``Retry-After`` or an ``x-ratelimit-reset`` epoch into
     a wait in seconds.
     """
@@ -232,7 +235,7 @@ def map_http_error(
 
     if status == 401:
         return AuthError(f"Authentication failed: {body}")
-    if status == 403 and _is_rate_limited_403(headers):
+    if status == 403 and _is_rate_limited_403(headers, body):
         return RateLimitError(
             f"Rate limited: {body}", retry_after=_retry_after(headers, now)
         )
@@ -269,17 +272,43 @@ def map_http_error(
     return ForgeError(f"HTTP {status}: {body}")
 
 
-def _is_rate_limited_403(headers: httpx.Headers) -> bool:
+def _is_rate_limited_403(headers: httpx.Headers, body: str) -> bool:
     """Tell a rate-limit 403 from a permission 403.
 
     GitHub answers both an exhausted primary rate limit and a secondary rate
     limit with 403; the first sets ``x-ratelimit-remaining: 0`` and the second
-    sets ``Retry-After``.
+    usually sets ``Retry-After``. A secondary limit without ``Retry-After`` is
+    still named in the body ("You have exceeded a secondary rate limit").
     """
     if headers.get("Retry-After") is not None:
         return True
     remaining = headers.get("x-ratelimit-remaining")
-    return remaining is not None and remaining.strip() == "0"
+    if remaining is not None and remaining.strip() == "0":
+        return True
+    text = body.lower()
+    return any(marker in text for marker in _RATE_LIMIT_403_MARKERS)
+
+
+def graphql_rate_limit_error(
+    response: httpx.Response,
+    errors: object,
+    *,
+    now: Callable[[], float] = time.time,
+) -> RateLimitError | None:
+    """Return the rate limit a GraphQL error list reports, or ``None``.
+
+    GitHub answers a query past the GraphQL rate limit with 200 and an error
+    of type ``RATE_LIMITED``; the reset is in the usual rate-limit headers.
+    """
+    if not isinstance(errors, list):
+        return None
+    for error in errors:
+        if isinstance(error, dict) and error.get("type") == "RATE_LIMITED":
+            return RateLimitError(
+                "Rate limited: GraphQL rate limit exceeded",
+                retry_after=_retry_after(httpx.Headers(response.headers), now),
+            )
+    return None
 
 
 def _retry_after(headers: httpx.Headers, now: Callable[[], float]) -> int | None:
