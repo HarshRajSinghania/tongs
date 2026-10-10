@@ -98,6 +98,11 @@ class MRTable(DataTable):
 
     _show_repo: bool = True
 
+    @property
+    def sort_key(self) -> str:
+        """Return the active sort, one of ``MR_SORT_KEYS``."""
+        return self._sort_key
+
     def on_mount(self) -> None:
         self.watch(self, "scroll_y", self._scrolled, init=False)
 

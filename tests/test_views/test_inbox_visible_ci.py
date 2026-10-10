@@ -195,6 +195,51 @@ async def test_ci_sort_with_pending_rows_looks_up_only_rows_in_view(
 
 
 @pytest.mark.asyncio
+async def test_ci_sort_fills_rows_in_view_after_a_scroll_mid_list(
+    tmp_path: Path,
+) -> None:
+    client = AllOpenOnlyClient(many(["acme/a"], 300), page_size=300)
+    app = build(tmp_path, client, ["acme/a"])
+
+    async with app.run_test(notifications=True) as pilot:
+        await settle(app)
+        table = await open_all_open(pilot, app, 300)
+        view = rows_in_view(table)
+        await wait_until(pilot, lambda: len(client.ci_calls) == 2 * view)
+        await settle(app)
+
+        table.focus()
+        await pilot.press("s", "s")
+        assert table.sort_key == "ci"
+        await settle(app)
+        cursor = table.cursor_row
+        # A mouse wheel scroll: the view moves, the cursor does not.
+        table.scroll_to(y=200, animate=False)
+        await settle(app)
+        top = int(table.scroll_y)
+        assert top == 200
+        assert table.cursor_row == cursor
+
+        def in_view() -> list[int]:
+            return numbers(table)[top : top + view]
+
+        # Each landing moves its row up into the known rows and shifts a
+        # waiting row into view, so the view is looked at again until every
+        # row on screen shows its CI.
+        await wait_until(
+            pilot, lambda: all(ci_cells(table)[n] != LOADING for n in in_view())
+        )
+        await wait_until(pilot, lambda: not app.screen._ci["all-open"].workers)
+        await settle(app)
+        assert all(ci_cells(table)[n] == "●" for n in in_view())
+        assert int(table.scroll_y) == top
+        # Only rows that sat in the window were looked up, each once.
+        assert len(client.ci_calls) <= top + 2 * view
+        assert Counter(looked_up(client)).most_common(1)[0][1] == 1
+        assert ci_cells(table)[numbers(table)[-1]] == LOADING
+
+
+@pytest.mark.asyncio
 async def test_github_all_open_cost_is_one_query_per_fifty_rows_in_view(
     tmp_path: Path,
 ) -> None:

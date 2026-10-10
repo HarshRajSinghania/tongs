@@ -743,6 +743,11 @@ class InboxScreen(Screen):
                 lookups.in_flight.discard(key)
                 if table.set_ci_status(summary, status, self.app.config.ascii_mode):
                     lookups.fresh.discard(key)
+                    if table.sort_key == "ci":
+                        # The row moved up into the known rows, so rows that
+                        # still wait may have shifted into view without a
+                        # scroll. Look at the view again once landings settle.
+                        self._schedule_ci_window(tab_id, restart=False)
                 # A newer summary that replaced the row meanwhile is looked
                 # up next.
                 current = table.get_mr(key)
