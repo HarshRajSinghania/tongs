@@ -442,11 +442,13 @@ RULES: tuple[Rule, ...] = (
         patterns=("scripts/release-evidence/**",),
         lanes=frozenset({"lint", "core"}),
     ),
+    # The Dependabot configuration is read by tests/ci/test_workflow_hygiene.py.
     Rule(
         name="ci-infrastructure",
         patterns=(
             ".github/workflows/**",
             ".github/scripts/**",
+            ".github/dependabot.yml",
             "tests/ci/**",
             "tests/containers/**",
         ),

@@ -41,10 +41,10 @@ This file is the shared repository guide for coding agents; every agent that wor
 # Create the environment only if .venv is missing
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e ".[dev]" ruff
+python -m pip install -e ".[dev,lint]"
 
 # For MCP development, also install the optional server dependency
-python -m pip install -e ".[dev,mcp]"
+python -m pip install -e ".[dev,lint,mcp]"
 
 # In later shell invocations, activate the existing environment first
 source .venv/bin/activate
@@ -69,7 +69,7 @@ npm ci --prefix site
 npm run build --prefix site
 ```
 
-If using `uv`, create the environment with `uv venv --python 3.12`, activate it, and use `uv pip install` in place of `python -m pip install`. Dependency installation may need network access; the mocked tests do not. Ruff is installed explicitly because it is not currently included in the `dev` extra. The `mcp` extra is needed to run MCP tests instead of skipping them.
+If using `uv`, create the environment with `uv venv --python 3.12`, activate it, and use `uv pip install` in place of `python -m pip install`. Dependency installation may need network access; the mocked tests do not. Ruff comes from the `lint` extra, which pins the exact version the CI lint job uses. The `mcp` extra is needed to run MCP tests instead of skipping them.
 
 The desktop test command builds and type-checks the production shell before
 running its Electron and renderer tests. Node checks need whole-process memory,

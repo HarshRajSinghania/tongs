@@ -415,7 +415,12 @@ def test_the_lint_job_runs_the_harness_suites_without_skips(
         "--prefix tests.ci. --prefix tests.containers."
     )
     assert runs.index(check) > runs.index(suite)
-    assert 'python -m pip install -e ".[dev]"' in runs
+    # The lint extra pins Ruff, so the job lints with the declared version.
+    install = 'python -m pip install -e ".[dev,lint]"'
+    assert install in runs
+    assert runs.index(install) < min(
+        index for index, run in enumerate(runs) if run.startswith("ruff ")
+    )
 
 
 #: The one site build, run by the ci.yml docs lane on every pull request that
