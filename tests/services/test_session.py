@@ -12,12 +12,14 @@ from typing import cast
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
+import httpx
 import pytest
 
 from tongs.cache.cached_client import CachedForgeClient
 from tongs.config import Config
-from tongs.errors import AuthError
+from tongs.errors import AuthError, ForgeError, NotFoundError, PartialResultsError
 from tongs.forges.base import ForgeClient
+from tongs.forges.github import GitHubClient
 from tongs.forges.models import (
     CIStatus,
     Commit,
@@ -405,6 +407,29 @@ class BlockingReviewClient(FakeClient):
         self.started.set()
         await self.release.wait()
         return self.my_reviews
+
+
+class _PartialClient(FakeClient):
+    """A client whose searches read only some of their results."""
+
+    def __init__(self, cause: ForgeError) -> None:
+        super().__init__()
+        self.cause = cause
+
+    def _partial(self) -> PartialResultsError:
+        return PartialResultsError(
+            [
+                make_summary(number=7),
+                make_summary(number=9, updated_at=NOW + timedelta(minutes=1)),
+            ],
+            self.cause,
+        )
+
+    async def list_my_reviews(self) -> list[MRSummary]:
+        raise self._partial()
+
+    async def list_my_mrs(self) -> list[MRSummary]:
+        raise self._partial()
 
 
 class FakeRegistry:
@@ -1557,6 +1582,91 @@ class TestReviewReads:
         assert page.failures[0].code == ServiceErrorCode.AUTHENTICATION_FAILED
         assert "secret" not in page.failures[0].message
         await session.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("scope", [ReviewScope.MY_REVIEWS, ReviewScope.MY_MRS])
+    async def test_partial_search_keeps_items_and_reports_failure(
+        self, scope: ReviewScope
+    ) -> None:
+        client = _PartialClient(
+            NotFoundError("Not found: github_pat_secret should not escape")
+        )
+        session = await start_session(FakeRegistry({"github.com": client}))
+
+        page = await session.list_reviews(ReviewQuery(scope))
+
+        assert [item.ref.number for item in page.items] == [9, 7]
+        assert len(page.failures) == 1
+        failure = page.failures[0]
+        assert failure.hostname == "github.com"
+        assert failure.code == ServiceErrorCode.NOT_FOUND
+        assert failure.message.startswith("Some reviews could not be listed.")
+        assert "secret" not in failure.message
+        assert failure.repository is None
+        await session.close()
+
+    @pytest.mark.asyncio
+    async def test_truncated_search_reports_an_incomplete_list(self) -> None:
+        client = _PartialClient(ForgeError("GitHub search matched 1500 results"))
+        session = await start_session(FakeRegistry({"github.com": client}))
+
+        page = await session.list_reviews(ReviewQuery(ReviewScope.MY_REVIEWS))
+
+        assert len(page.items) == 2
+        assert [failure.message for failure in page.failures] == [
+            "Some reviews could not be listed, so this list is incomplete."
+        ]
+        await session.close()
+
+    @pytest.mark.asyncio
+    async def test_failed_github_search_fetch_lists_the_other_reviews(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/search/issues":
+                return httpx.Response(
+                    200,
+                    json={
+                        "total_count": 3,
+                        "incomplete_results": False,
+                        "items": [
+                            {
+                                "number": number,
+                                "repository_url": (
+                                    "https://api.github.com/repos/acme/widgets"
+                                ),
+                            }
+                            for number in (1, 2, 3)
+                        ],
+                    },
+                )
+            number = int(request.url.path.rsplit("/", 1)[1])
+            if number == 2:
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(
+                200,
+                json={
+                    "number": number,
+                    "title": f"PR {number}",
+                    "state": "open",
+                    "created_at": "2026-09-01T00:00:00Z",
+                    "updated_at": f"2026-09-0{number}T00:00:00Z",
+                    "user": {"login": "alice"},
+                    "head": {"ref": "feature", "sha": "abc"},
+                    "base": {"ref": "main", "sha": "def"},
+                },
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url=GITHUB_HOST.api_base
+        ) as http:
+            client = GitHubClient(GITHUB_HOST, http)
+            session = await start_session(FakeRegistry({"github.com": client}))
+            page = await session.list_reviews(ReviewQuery(ReviewScope.MY_REVIEWS))
+            await session.close()
+
+        assert [item.ref.number for item in page.items] == [3, 1]
+        assert [(f.hostname, f.code) for f in page.failures] == [
+            ("github.com", ServiceErrorCode.NOT_FOUND)
+        ]
 
     @pytest.mark.asyncio
     async def test_review_models_hide_process_local_routing_data(self) -> None:
