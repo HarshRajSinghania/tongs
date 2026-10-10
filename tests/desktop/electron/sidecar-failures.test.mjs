@@ -629,6 +629,52 @@ test("a read during shutdown or a deliberate stop does not ask for a restart", a
   assert.deepEqual(lost, []);
 });
 
+test("a read while a restart stops the old service does not ask for a restart", async () => {
+  const fake = harness({ delayedShutdown: true });
+  const transport = transportFor(fake, 1_000);
+  const lost = [];
+  transport.on("not_running", () => lost.push("not_running"));
+  await transport.start();
+  const old = fake.children[0];
+  const restarting = transport.restart();
+  await until(() => old.frames.some((frame) => frame.method === "shutdown"), "shutdown request");
+  const shutdown = old.frames.find((frame) => frame.method === "shutdown");
+  // The old service accepts the shutdown but has not exited yet.
+  respondTo(old, shutdown.id, { result: {} });
+  await until(() => old.stdin.writableEnded, "the old service's input to close");
+  assert.equal(fake.children.length, 1);
+  assert.throws(() => transport.requestRead("repositories.discover", {}), {
+    code: "not_running",
+  });
+  old.finish(0, null);
+  await restarting;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(lost, []);
+  assert.equal(transport.serviceState, "connected");
+  const current = fake.children[1];
+  const stopping = transport.stop();
+  await until(() => current.frames.some((frame) => frame.method === "shutdown"), "final shutdown");
+  const last = current.frames.find((frame) => frame.method === "shutdown");
+  respondTo(current, last.id, { result: {} });
+  current.finish(0, null);
+  await stopping;
+});
+
+test("a read after a failed handshake does not ask for a restart", async () => {
+  const fake = harness({ autoHandshake: false });
+  const transport = new SidecarTransport(launch, 60_000, 20, 1_000, fake.spawn);
+  const lost = [];
+  transport.on("not_running", () => lost.push("not_running"));
+  await assert.rejects(transport.start(), { code: "startup_timeout" });
+  assert.throws(() => transport.requestRead("repositories.discover", {}), {
+    code: "not_running",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(lost, []);
+  assert.equal(fake.children.length, 1);
+  await transport.stop();
+});
+
 test("an invalid frame while a restart stops the old service does not spend a restart", async () => {
   const fake = harness({ delayedShutdown: true });
   const transport = transportFor(fake, 50);
