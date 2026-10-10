@@ -31,6 +31,7 @@ These keys work on the inbox, the repository list and MR detail.
 | ++1++ | Switch to the My Reviews tab |
 | ++2++ | Switch to the My MRs tab |
 | ++3++ | Switch to the All Open tab |
+| ++m++ | In All Open, load the next 100 reviews of each repository that has more (reaching the last row does the same) |
 | ++s++ | Cycle the sort order: updated, title, CI, author |
 | ++r++ | Open the repository list, or go back from a repository's inbox |
 | ++enter++ | Open MR detail for the selected row |

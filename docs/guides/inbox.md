@@ -40,6 +40,17 @@ first time you open it, and tongs queries repositories and hosts in parallel.
 If one host fails, the others still load and tongs names the host that was
 skipped.
 
+### Loading more in All Open
+
+All Open first loads the newest 100 open reviews of each repository, so a
+large set of repositories shows up quickly. The status line above the table
+counts what is loaded and ends with "more to load (m)" while a repository has
+older reviews. Press ++m++, or move the cursor to the last row, to load the
+next 100 of each repository that has more. When the load finishes, tongs says
+how many reviews it added and how many repositories still have more, or that
+every open review is loaded. If the cursor was on the last row, it moves to
+the first review that arrived.
+
 ## The review list
 
 Each row shows these columns:
@@ -55,6 +66,22 @@ Each row shows these columns:
 
 With `ascii_mode` on, the CI column shows `OK`, `FAIL`, `RUN`, `PEND`, `CANC`
 and `SKIP` instead of symbols.
+
+### CI status fills in as you scroll
+
+The lists load without CI status, so they appear quickly. Each row shows `…`
+in the CI column (`..` with `ascii_mode` on) until its status arrives. tongs
+looks up CI only for the rows on screen and about one screen above and below,
+and looks up more rows as you scroll, so rows you never scroll to cost no
+requests. On GitHub, the rows looked up together share one request for up to
+50 reviews. Sorting by CI puts rows still loading after the rest; they fill in
+once they are on screen.
+
+If a forge's rate limit is reached, tongs says so once, for example "GitHub
+rate limit reached, resets at 19:52" (local time), or "try again in a few
+minutes" when the forge does not say when it resets. All Open shows the same
+message in its status line. tongs stops looking up CI on that host until the
+reset, and the rows keep their loading marker until then.
 
 Press ++s++ to cycle the sort order: updated, title, CI status, author.
 Press ++enter++ on a row to open the review, and ++o++ to open it in your

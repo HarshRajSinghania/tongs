@@ -289,6 +289,7 @@ workspace uses labelled controls and does not change these terminal commands.
 | `1` | My Reviews tab |
 | `2` | My MRs tab |
 | `3` | All Open tab |
+| `m` | All Open: load more (reaching the last row does too) |
 | `s` | Cycle sort order |
 | `r` | Repo list / Back |
 | `Enter` | Open MR detail |
