@@ -66,6 +66,17 @@ test("control characters cannot reach the log as terminal escapes", async () => 
   assert.equal(lines[0].endsWith("[31mred�[0m\tdone"), true);
 });
 
+test("C1 controls, separators and bidi overrides are replaced too", async () => {
+  const unsafe = ["\u009b", "\u0085", " ", " ", "‮", "⁦", "⁩"];
+  const lines = await logged([`a\u009b31mb\u0085c d e‮f⁦g⁩h\n`]);
+  assert.equal(lines.length, 1);
+  assert.equal(
+    unsafe.some((character) => lines[0].includes(character)),
+    false,
+  );
+  assert.equal(lines[0], `${STDERR_LOG_PREFIX}a�31mb�c�d�e�f�g�h`);
+});
+
 test("chatty output stops at the session bound with one dropped-output line", async () => {
   const line = `${"y".repeat(1023)}\n`;
   const chunk = line.repeat(256);

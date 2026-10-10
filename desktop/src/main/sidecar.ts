@@ -103,6 +103,15 @@ type SpawnChild = (
 const spawnSidecar: SpawnChild = (executable, args, options) =>
   spawn(executable, [...args], options) as ChildProcessWithoutNullStreams;
 
+/**
+ * Characters a diagnostic line must not carry into the log: C0 controls other
+ * than tab, DEL and the C1 controls (U+0080 to U+009F, which include the
+ * single-byte CSI), the line and paragraph separators, and the bidirectional
+ * embeddings, overrides and isolates.
+ */
+const UNSAFE_LOG_CHARACTERS =
+  /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
+
 /** Receives one line of the service's diagnostics, already bounded and prefixed. */
 export type DiagnosticSink = (line: string) => void;
 
@@ -111,7 +120,9 @@ const consoleSink: DiagnosticSink = (line) => console.error(line);
 /**
  * Forwards one service session's stderr to the main-process log, a line at a
  * time. The service redacts what it writes, so the text is kept as written,
- * apart from control characters. A line over the line bound is cut with a
+ * apart from characters that could act on a terminal or reorder the line:
+ * C0 and C1 controls except tab, DEL, line and paragraph separators, and
+ * bidirectional overrides and isolates. A line over the line bound is cut with a
  * marker, and once the session's total reaches its bound one last line says
  * further output was dropped and the rest is ignored, so a chatty or stuck
  * service cannot grow the log or this buffer without limit.
@@ -161,7 +172,7 @@ class DiagnosticForwarder {
     const text = this.#decoder
       .decode(raw)
       .replace(/\r$/, "")
-      .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "\ufffd");
+      .replace(UNSAFE_LOG_CHARACTERS, "\ufffd");
     if (text.trim().length === 0 && !cut) return;
     this.#total += raw.length + 1;
     if (this.#total > MAX_STDERR_SESSION_BYTES) {
