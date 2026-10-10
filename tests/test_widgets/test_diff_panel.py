@@ -28,6 +28,7 @@ from tongs.widgets.diff_panel import (
     _match_discussions,
     _reconstruct_new_content,
 )
+from tongs.widgets.split_diff import HighlightMap
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -853,7 +854,7 @@ class TestBuildHighlightMap:
         )
         f = _make_file(hunks=(hunk,), language="text")
         result = _build_highlight_map(f)
-        assert result == {}
+        assert result == HighlightMap()
 
     def test_highlights_each_line_with_its_own_content(self):
         """A Python file maps each DiffLine id to its own highlighted text."""
@@ -872,10 +873,10 @@ class TestBuildHighlightMap:
         )
         f = _make_file(hunks=(hunk,), language="python")
         result = _build_highlight_map(f)
-        assert {key: text.plain for key, text in result.items()} == {
-            id(line): line.content for line in lines
-        }
-        assert any(span.style for text in result.values() for span in text.spans)
+        assert [result.get(line).plain for line in lines] == [
+            line.content for line in lines
+        ]
+        assert any(span.style for text in result.new.values() for span in text.spans)
 
     def test_handles_pygments_failure_gracefully(self):
         """If Pygments/Syntax raises, returns empty dict."""
@@ -891,7 +892,7 @@ class TestBuildHighlightMap:
         f = _make_file(hunks=(hunk,), language="python")
         with patch("tongs.widgets.diff_panel.Syntax", side_effect=Exception("boom")):
             result = _build_highlight_map(f)
-        assert result == {}
+        assert result == HighlightMap()
 
 
 # ===================================================================

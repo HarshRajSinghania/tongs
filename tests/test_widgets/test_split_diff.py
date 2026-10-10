@@ -26,6 +26,7 @@ from tongs.widgets.split_diff import (
     DiffModeState,
     DiffSelection,
     DiffViewMode,
+    HighlightMap,
     SplitDiffColumn,
     SplitDiffView,
     is_actionable,
@@ -413,7 +414,7 @@ async def test_split_file_switch_clears_an_armed_resolve() -> None:
         assert new._resolve_confirm.armed
         assert old._resolve_confirm.armed
 
-        split.show_file(_file(), [discussion], {})
+        split.show_file(_file(), [discussion], HighlightMap())
         await pilot.pause()
         assert not new._resolve_confirm.armed
         assert not old._resolve_confirm.armed

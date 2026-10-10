@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import bisect
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, ClassVar
 
@@ -15,20 +15,18 @@ from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.color import Color as TextualColor
 from textual.containers import Horizontal
 from textual.message import Message
-from textual.strip import Strip
-from textual.style import Style as VisualStyle
 from textual.widget import Widget
 from textual.widgets import OptionList
-from textual.widgets._option_list import Option
+from textual.widgets.option_list import Option
 
 from tongs.diff.alignment import align_hunk
 from tongs.diff.models import DiffFile, DiffLine, LineType, SplitDiffRow
 from tongs.forges.models import Discussion
 from tongs.helpers import relative_time
 from tongs.state.drafts import DiffSide
+from tongs.widgets.tinted_option_list import TintedOptionList
 from tongs.widgets.two_press import TwoPressConfirm
 
 if TYPE_CHECKING:
@@ -52,6 +50,29 @@ class DiffModeState:
     @property
     def narrow_fallback(self) -> bool:
         return self.requested is not self.effective
+
+
+@dataclass(frozen=True)
+class HighlightMap:
+    """Syntax-highlighted line content for one file, lexed per hunk and side.
+
+    The old side is lexed from context plus deleted lines and the new side
+    from context plus added lines, so a string opened on one side never
+    colours the other. Context lines appear in both, keyed by ``id(line)``.
+    """
+
+    old: Mapping[int, Text] = field(default_factory=dict)
+    new: Mapping[int, Text] = field(default_factory=dict)
+
+    def get(self, line: DiffLine, side: DiffSide | None = None) -> Text | None:
+        """Return a line's highlighted text on one side, or None if unknown.
+
+        Without a side, a deleted line reads the old side and every other
+        line the new side, which is what the unified layout shows.
+        """
+        if side is None:
+            side = DiffSide.OLD if line.line_type is LineType.DELETION else DiffSide.NEW
+        return (self.old if side is DiffSide.OLD else self.new).get(id(line))
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,7 +169,7 @@ def is_actionable(line: DiffLine | None, side: DiffSide) -> bool:
     }
 
 
-class SplitDiffColumn(OptionList):
+class SplitDiffColumn(TintedOptionList):
     """One synchronized, source-side column of a split diff."""
 
     DEFAULT_CSS = """
@@ -209,16 +230,11 @@ class SplitDiffColumn(OptionList):
         Binding("f3", "suggest", "Suggest", show=False),
     ]
 
-    _ADDITION_BG = VisualStyle(background=TextualColor(0, 40, 0))
-    _DELETION_BG = VisualStyle(background=TextualColor(40, 0, 0))
-    _SELECTION_BG = VisualStyle(background=TextualColor(0, 50, 100))
-
     def __init__(self, side: DiffSide, **kwargs: object) -> None:
         self.side = side
         self._syncing = False
         super().__init__(compact=True, markup=False, **kwargs)
         self._line_map: dict[int, DiffLine] = {}
-        self._line_types: dict[int, LineType] = {}
         self._comment_map: dict[int, list[Discussion]] = {}
         self._comment_indices: list[int] = []
         self._selection_anchor: int | None = None
@@ -258,48 +274,6 @@ class SplitDiffColumn(OptionList):
         if discussions:
             self._comment_map[option_index] = discussions
             self._comment_indices.append(option_index)
-
-    def render_line(self, y: int) -> Strip:
-        line_number = self.scroll_offset.y + y
-        try:
-            option_index, line_offset = self._lines[line_number]
-            option = self.options[option_index]
-        except IndexError:
-            return Strip.blank(
-                self.scrollable_content_region.width,
-                self.get_visual_style("option-list--option").rich_style,
-            )
-
-        mouse_over = self._mouse_hovering_over == option_index
-        component_class = ""
-        if option.disabled:
-            component_class = "option-list--option-disabled"
-        elif self.highlighted == option_index:
-            component_class = "option-list--option-highlighted"
-        elif mouse_over:
-            component_class = "option-list--option-hover"
-        style = (
-            self.get_visual_style("option-list--option", component_class)
-            if component_class
-            else self.get_visual_style("option-list--option")
-        )
-        if component_class != "option-list--option-highlighted":
-            if self._in_selection_range(option_index):
-                style += self._SELECTION_BG
-            elif not option.disabled:
-                line_type = self._line_types.get(option_index)
-                if line_type == LineType.ADDITION:
-                    style += self._ADDITION_BG
-                elif line_type == LineType.DELETION:
-                    style += self._DELETION_BG
-        strips = self._get_option_render(option, style)
-        try:
-            return strips[line_offset]
-        except IndexError:
-            return Strip.blank(
-                self.scrollable_content_region.width,
-                self.get_visual_style("option-list--option").rich_style,
-            )
 
     def watch_highlighted(self, highlighted: int | None) -> None:
         super().watch_highlighted(highlighted)
@@ -501,7 +475,7 @@ class SplitDiffView(Widget):
         self._discussion_index: dict[
             tuple[int | None, int | None], list[Discussion]
         ] = {}
-        self._highlight_map: dict[int, Text] = {}
+        self._highlight_map = HighlightMap()
         self._expanded_threads: set[str] = set()
         self._active_side = DiffSide.NEW
         self._draft_markers: tuple[DraftMarker, ...] = ()
@@ -523,7 +497,7 @@ class SplitDiffView(Widget):
         self,
         file: DiffFile,
         discussions: list[Discussion],
-        highlight_map: dict[int, Text],
+        highlight_map: HighlightMap,
         selection: DiffSelection | None = None,
         draft_markers: tuple[DraftMarker, ...] = (),
     ) -> None:
@@ -543,7 +517,7 @@ class SplitDiffView(Widget):
         self._file = None
         self._discussions = []
         self._discussion_index.clear()
-        self._highlight_map.clear()
+        self._highlight_map = HighlightMap()
         self._expanded_threads.clear()
         self._active_side = DiffSide.NEW
         self._draft_markers = ()
@@ -847,7 +821,7 @@ class SplitDiffView(Widget):
             else Style()
         )
         text.append(prefix, prefix_style)
-        highlighted = self._highlight_map.get(id(line))
+        highlighted = self._highlight_map.get(line, side)
         text.append_text(
             highlighted.copy() if highlighted is not None else Text(line.content)
         )
