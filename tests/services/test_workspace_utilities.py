@@ -235,6 +235,9 @@ async def test_editor_capacity_is_reserved_before_log_fetch() -> None:
     result = await _service(calls).prepare_editor_log(JOB)
 
     assert result.status is EditorPlanStatus.CAPACITY_EXCEEDED
+    assert "return at once" in result.message
+    assert "expire after 24 hours" in result.message
+    assert "wait flag" in result.message
     assert calls.reservations == [(JOB.job_id, "1" * 32)]
     assert calls.jobs == []
 

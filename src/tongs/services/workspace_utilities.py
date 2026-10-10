@@ -51,6 +51,14 @@ _VIM_REMOTE_WAIT: Mapping[str, str] = {
 _VIM_REMOTE_FLAGS = frozenset(_VIM_REMOTE_WAIT) | frozenset(_VIM_REMOTE_WAIT.values())
 _VIM_LAUNCHERS = frozenset({"gvim", "vim"})
 
+# Most often the slots are held by exports an editor that returned at once left
+# behind, so the message names the fix as well as the wait.
+_CAPACITY_EXCEEDED_MESSAGE = (
+    "The private editor export limit was reached. Editors that return at once "
+    "keep their exports until they expire after 24 hours. Add the editor's wait "
+    "flag, such as code --wait."
+)
+
 # emacsclient waits for the running Emacs by default; these flags make it
 # return at once, so they are dropped.
 _EMACSCLIENT_NO_WAIT = frozenset({"-n", "--no-wait"})
@@ -186,7 +194,7 @@ class WorkspaceUtilityService:
         if reservation is None:
             return EditorLogPlan(
                 EditorPlanStatus.CAPACITY_EXCEEDED,
-                "The private editor export limit was reached. Retry after older exports expire.",
+                _CAPACITY_EXCEEDED_MESSAGE,
                 job,
             )
         try:
