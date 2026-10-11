@@ -29,6 +29,7 @@ from tongs.forges.http import (
     map_http_error,
     paginate,
     request,
+    request_bytes,
     request_page,
 )
 from tongs.forges.models import (
@@ -789,6 +790,19 @@ class GitHubClient(ForgeClient):
             f"/repos/{owner}/{repo}/pulls/{number}/files",
         )
         return data
+
+    async def get_file_at_ref(
+        self, repo_path: str, path: str, ref: str, *, max_bytes: int
+    ) -> bytes:
+        """Read one file's raw bytes at a commit through the contents API."""
+        owner, repo = _split_repo_path(repo_path)
+        return await request_bytes(
+            self._http,
+            f"/repos/{owner}/{repo}/contents/{urlquote(path, safe='/')}",
+            max_bytes=max_bytes,
+            params={"ref": ref},
+            headers={"Accept": "application/vnd.github.raw"},
+        )
 
     async def list_mr_commits(self, repo_path: str, number: int) -> list[Commit]:
         owner, repo = _split_repo_path(repo_path)

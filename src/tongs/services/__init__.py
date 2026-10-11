@@ -51,6 +51,15 @@ from tongs.services.mr_actions import (
     SourceBranchTarget,
     UnapproveReviewCommand,
 )
+from tongs.services.review_files import (
+    EXPAND_LIMITS,
+    GENERATE_LIMITS,
+    FileRead,
+    FileReadLimits,
+    FileReadStatus,
+    FileText,
+    ReviewFileService,
+)
 from tongs.services.review_mutations import (
     DiffAnchor,
     DiffSide,
@@ -125,6 +134,8 @@ def __getattr__(name: str) -> object:
 
 
 __all__ = [
+    "EXPAND_LIMITS",
+    "GENERATE_LIMITS",
     "ApplicationSession",
     "CIMutationAction",
     "CIMutationCapabilities",
@@ -140,6 +151,10 @@ __all__ = [
     "EditorLogPlan",
     "EditorPlanStatus",
     "EditorReservation",
+    "FileRead",
+    "FileReadLimits",
+    "FileReadStatus",
+    "FileText",
     "ForgeCapabilities",
     "GeneralComment",
     "HostFailure",
@@ -168,6 +183,7 @@ __all__ = [
     "RetryJobCommand",
     "RetryPipelineCommand",
     "ReviewActionTarget",
+    "ReviewFileService",
     "ReviewListItem",
     "ReviewMutationCapabilities",
     "ReviewMutationCommand",

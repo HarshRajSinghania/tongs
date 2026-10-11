@@ -15,7 +15,13 @@ from types import MappingProxyType, TracebackType
 from typing import Protocol, Self, TypeVar, cast
 
 from tongs.cache.store import CacheStore
-from tongs.config import Config, load_config
+from tongs.config import (
+    DEFAULT_FILE_CONTENT_TTL,
+    MAX_SUBMITTED_RETENTION,
+    MIN_SUBMITTED_RETENTION,
+    Config,
+    load_config,
+)
 from tongs.errors import PartialResultsError, RateLimitError
 from tongs.forges.base import (
     ForgeClient,
@@ -61,6 +67,7 @@ from tongs.services.models import (
     validate_hostname,
 )
 from tongs.services.mr_actions import MRActionService
+from tongs.services.review_files import ReviewFileService
 from tongs.services.review_mutations import ReviewMutationService
 from tongs.services.review_submission import ReviewSubmissionService
 from tongs.state.drafts.models import RecoveryWarning
@@ -223,6 +230,10 @@ class ApplicationSession:
             get_review=self._get_review_revision,
             emit_change=self.emit_change,
         )
+        self._review_files = ReviewFileService(
+            get_client=self._client_for_review,
+            call=self._call,
+        )
 
     async def __aenter__(self) -> Self:
         return await self.start()
@@ -305,6 +316,11 @@ class ApplicationSession:
         return self._ci_mutations
 
     @property
+    def review_files(self) -> ReviewFileService:
+        """Bounded, validated reads of review files at a commit."""
+        return self._review_files
+
+    @property
     def mr_actions(self) -> MRActionService:
         """Return revision-bound merge request lifecycle actions."""
         return self._mr_actions
@@ -370,6 +386,7 @@ class ApplicationSession:
                         cache=self._cache,
                         mr_list_ttl=self._config.mr_list_ttl,
                         diff_ttl=self._config.diff_ttl,
+                        file_content_ttl=_file_content_ttl_seconds(self._config),
                         max_parallel=self._config.max_parallel,
                     )
                     self._registry_owned = True
@@ -531,6 +548,7 @@ class ApplicationSession:
                     failures.append(error)
         finally:
             if terminal_close:
+                self._review_files.close()
                 self._close_event_streams()
                 self._issued_repositories.clear()
                 self._repositories.clear()
@@ -1074,6 +1092,7 @@ class ApplicationSession:
         """Clear the session-owned API cache without touching durable drafts."""
         self._require_started()
         cache = cast(CacheResource, self._cache)
+        self._review_files.clear()
         await cache.clear()
 
     async def events(self) -> AsyncIterator[ServiceEvent]:
@@ -1450,6 +1469,22 @@ __all__ = [
     "ForgeRegistryResource",
     "HostRateLimit",
 ]
+
+
+def _file_content_ttl_seconds(config: Config) -> int:
+    """Return the configured file cache lifetime in whole seconds.
+
+    ``load_config`` only produces 1h to 365d; a Config built in code with a
+    value outside that range falls back to the default.
+    """
+    ttl = config.file_content_ttl
+    if (
+        not isinstance(ttl, timedelta)
+        or not MIN_SUBMITTED_RETENTION <= ttl <= MAX_SUBMITTED_RETENTION
+    ):
+        log.warning("Ignoring an invalid file content cache lifetime")
+        ttl = DEFAULT_FILE_CONTENT_TTL
+    return int(ttl.total_seconds())
 
 
 def _page_items(page: object) -> tuple[MRSummary, ...]:
