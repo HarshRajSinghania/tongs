@@ -1339,6 +1339,49 @@ button {
 .file-pending + .file-threads {
   margin-left: 0.75rem;
 }
+/*
+ * The Viewed checkbox (#195) closes the file header. It takes the free space
+ * itself when the file has no counts, and sits after them when it does.
+ */
+.file-viewed {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.file-pending ~ .file-viewed,
+.file-threads ~ .file-viewed {
+  margin-left: 0.75rem;
+}
+.file-viewed input {
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.file-viewed input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.diff-viewed-note {
+  margin: 0;
+  padding: 10px 12px;
+  color: var(--muted);
+}
+.file-item-viewed > span:first-child {
+  color: var(--muted);
+}
+.file-viewed-mark {
+  color: var(--accent);
+}
+.review-progress {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
 
 /*
  * A published thread is a row of the diff under the line it is anchored to, on
