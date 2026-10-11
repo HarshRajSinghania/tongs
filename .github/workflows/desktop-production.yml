@@ -725,9 +725,12 @@ jobs:
     needs: [source-identity, archive, archive-evidence]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    # attestations: read is for gh attestation verify on the pinned RPM
+    # builder image before the first build.
     permissions:
       contents: read
       actions: read
+      attestations: read
     env:
       CHECK_ID: desktop-rpm-lifecycle
       GH_TOKEN: ${{ github.token }}
@@ -810,6 +813,16 @@ jobs:
                 "kind": "input",
                 "path": "inputs/prepared-inputs.json",
                 "source": "$output/prepared/prepared-inputs.json"
+              },
+              {
+                "kind": "input",
+                "path": "inputs/builder-pin.json",
+                "source": "$output/builder-pin.json"
+              },
+              {
+                "kind": "input",
+                "path": "inputs/builder-attestation.json",
+                "source": "$output/builder-attestation.json"
               },
               {
                 "kind": "artifact",

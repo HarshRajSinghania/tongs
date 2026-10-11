@@ -3,15 +3,18 @@ set -euo pipefail
 
 usage() {
     printf 'usage: %s --output-dir DIR [--accepted-dir DIR --payload-manifest FILE]\n' "$0" >&2
+    printf '       %s --output-dir DIR --accepted-dir DIR --payload-manifest FILE --local-builder IMAGE\n' "$0" >&2
 }
 output_dir=""
 accepted_input=""
 payload_manifest=""
+local_builder=""
 while (($#)); do
     case "$1" in
         --output-dir) output_dir=$2; shift 2 ;;
         --accepted-dir) accepted_input=$2; shift 2 ;;
         --payload-manifest) payload_manifest=$2; shift 2 ;;
+        --local-builder) local_builder=$2; shift 2 ;;
         *) usage; exit 2 ;;
     esac
 done
@@ -19,12 +22,29 @@ done
 if [[ -n "$accepted_input" || -n "$payload_manifest" ]]; then
     [[ -d "$accepted_input" && -f "$payload_manifest" ]] || { usage; exit 2; }
 fi
-[[ ${GITHUB_ACTIONS:-false} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]] || {
-    printf 'this RPM harness may run only on a GitHub-hosted disposable runner\n' >&2
-    exit 2
-}
+if [[ -n "$local_builder" ]]; then
+    # Local mode: a developer's own Podman loop with a builder image built
+    # from packaging/rpm/builder/Containerfile.  It never runs in a workflow.
+    [[ -z ${GITHUB_ACTIONS+set} && -z ${RUNNER_ENVIRONMENT+set} ]] || {
+        printf 'the local builder mode is refused when GITHUB_ACTIONS or RUNNER_ENVIRONMENT is set\n' >&2
+        exit 2
+    }
+    [[ "$local_builder" =~ ^localhost/[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9_.-]+)?$ ]] || {
+        printf 'the local builder must be a localhost/ image reference: %s\n' "$local_builder" >&2
+        exit 2
+    }
+    [[ -n "$accepted_input" ]] || {
+        printf 'the local builder mode needs --accepted-dir and --payload-manifest\n' >&2
+        exit 2
+    }
+else
+    [[ ${GITHUB_ACTIONS:-false} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]] || {
+        printf 'this RPM harness may run only on a GitHub-hosted disposable runner\n' >&2
+        exit 2
+    }
+    command -v gh >/dev/null || { printf 'gh is required\n' >&2; exit 2; }
+fi
 command -v podman >/dev/null || { printf 'podman is required\n' >&2; exit 2; }
-command -v gh >/dev/null || { printf 'gh is required\n' >&2; exit 2; }
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(git -C "$script_dir" rev-parse --show-toplevel)
@@ -44,7 +64,13 @@ case "$output_dir/" in
     "$repo_root/"*) printf 'output directory must be outside the checkout\n' >&2; exit 2 ;;
 esac
 
-base_image=registry.fedoraproject.org/fedora:44
+# The builder image and the Fedora base it was built from come from the pin;
+# no image is ever resolved from a moving tag.
+pin_file="$repo_root/packaging/rpm/builder/image.json"
+fedora_repository=registry.fedoraproject.org/fedora
+builder_repository=ghcr.io/andre-motta/tongs-rpm-builder
+builder_workflow=andre-motta/tongs/.github/workflows/rpm-builder-image.yml
+digest_pattern='^sha256:[0-9a-f]{64}$'
 source_builder=localhost/tongs-desktop-rpm-source:issue-52
 dependency_builder=localhost/tongs-python-rpms:issue-85
 accepted="$output_dir/accepted-download"
@@ -69,9 +95,68 @@ mkdir -p -- "$accepted" "$dependency_prepared" "$dependency_srpms" \
     printf 'RUNNER_ARCH=%s\n' "${RUNNER_ARCH:-unknown}"
     printf 'RUNNER_ENVIRONMENT=%s\n' "${RUNNER_ENVIRONMENT:-unknown}"
     printf 'source_sha=%s\n' "$source_sha"
+    printf 'builder_mode=%s\n' "$([[ -n "$local_builder" ]] && printf local || printf pinned)"
 } >"$output_dir/runner.env"
 podman version --format json >"$output_dir/podman-version.json"
 podman info --format json >"$output_dir/podman-info.json"
+
+pin_field() {
+    python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' \
+        "$pin_file" "$1"
+}
+builder_label() {
+    podman image inspect --format "{{index .Labels \"$1\"}}" "$builder_image"
+}
+if [[ -n "$local_builder" ]]; then
+    builder_image=$local_builder
+    podman image exists "$builder_image" || {
+        printf 'local builder image not found: %s\n' "$builder_image" >&2
+        exit 2
+    }
+    base_digest=$(builder_label org.opencontainers.image.base.digest)
+    printf 'local builder %s; no pull and no attestation check\n' "$builder_image" \
+        >"$output_dir/builder-local.txt"
+else
+    # Refuse an unpublished or malformed pin before anything is pulled.
+    python3 -I "$repo_root/scripts/pin_rpm_builder.py" --pin "$pin_file" \
+        --check --require-published
+    cp -- "$pin_file" "$output_dir/builder-pin.json"
+    [[ "$(pin_field image)" == "$builder_repository" ]] || {
+        printf 'the pin names another builder image\n' >&2
+        exit 1
+    }
+    builder_digest=$(pin_field digest)
+    pinned_commit=$(pin_field source_commit)
+    base_digest=$(pin_field base_digest)
+    [[ "$builder_digest" =~ $digest_pattern ]] || { printf 'invalid builder digest\n' >&2; exit 1; }
+    builder_image="$builder_repository@$builder_digest"
+    # Only an image this repository's builder workflow built and attested on
+    # main, from the commit the pin records, may build the RPMs.  The image
+    # is pulled by digest alone, after its attestation verifies.
+    gh attestation verify "oci://$builder_image" \
+        --repo andre-motta/tongs \
+        --signer-workflow "$builder_workflow" \
+        --source-ref refs/heads/main \
+        --source-digest "$pinned_commit" \
+        --deny-self-hosted-runners \
+        --format json >"$output_dir/builder-attestation.json"
+    podman pull --quiet "$builder_image" >"$output_dir/builder-image.pull.txt"
+    [[ "$(builder_label org.opencontainers.image.revision)" == "$pinned_commit" ]] || {
+        printf 'the builder image revision label differs from the pin\n' >&2
+        exit 1
+    }
+fi
+podman image inspect "$builder_image" >"$output_dir/builder-image.inspect.json"
+[[ "$base_digest" =~ $digest_pattern ]] || {
+    printf 'invalid Fedora base digest: %s\n' "$base_digest" >&2
+    exit 1
+}
+[[ "$(builder_label org.opencontainers.image.base.digest)" == "$base_digest" ]] || {
+    printf 'the builder image was not built from the pinned Fedora base\n' >&2
+    exit 1
+}
+# The clean install container stays plain Fedora, pinned to the builder's base.
+base_image="$fedora_repository@$base_digest"
 podman pull --quiet "$base_image" >"$output_dir/base-image.pull.txt"
 podman image inspect "$base_image" >"$output_dir/base-image.inspect.json"
 podman run --rm --network=none --cap-drop=all --security-opt=no-new-privileges \
@@ -98,7 +183,8 @@ else
 fi
 cp -- "$payload_manifest" "$output_dir/payload-input-contract.json"
 
-podman build --pull=never --tag "$source_builder" --file "$script_dir/Containerfile" "$script_dir" \
+podman build --pull=never --build-arg "BASE_IMAGE=$builder_image" \
+    --tag "$source_builder" --file "$script_dir/Containerfile" "$script_dir" \
     2>&1 | tee "$output_dir/source-builder.log"
 podman image inspect "$source_builder" >"$output_dir/source-builder.inspect.json"
 
@@ -127,8 +213,8 @@ podman run --rm --network=none --cap-drop=all --security-opt=no-new-privileges \
         --prepared-dir /prepared --expected-version "$core_version" \
         --output /evidence/core-version-preflight.log
 
-podman build --pull=never --tag "$dependency_builder" \
-    --file "$repo_root/packaging/rpm/python-dependencies/Containerfile" \
+podman build --pull=never --build-arg "BASE_IMAGE=$builder_image" \
+    --tag "$dependency_builder" --file "$repo_root/packaging/rpm/python-dependencies/Containerfile" \
     "$repo_root/packaging/rpm/python-dependencies" 2>&1 | tee "$output_dir/dependency-builder.log"
 podman image inspect "$dependency_builder" >"$output_dir/dependency-builder.inspect.json"
 
@@ -143,7 +229,7 @@ podman run --rm --network=none --cap-drop=all --security-opt=no-new-privileges \
     /checkout/packaging/rpm/python-dependencies/build_rpms.sh \
         --source-dir /prepared --output-dir /srpms
 "$repo_root/packaging/rpm/python-dependencies/rebuild_srpms.sh" \
-    --base-image "$base_image" --checkout "$repo_root" --source-sha "$source_sha" \
+    --base-image "$builder_image" --checkout "$repo_root" --source-sha "$source_sha" \
     --srpm-dir "$dependency_srpms" --output-dir "$dependency_rpms"
 podman run --rm --network=none --cap-drop=all --security-opt=no-new-privileges \
     --volume "$repo_root:/checkout:ro,z" --volume "$dependency_rpms:/rpms:ro,z" \
@@ -160,7 +246,7 @@ podman run --rm --network=none --cap-drop=all --security-opt=no-new-privileges \
     /checkout/packaging/rpm/desktop/build_srpms.sh \
         --prepared-dir /prepared --output-dir /srpms
 "$script_dir/rebuild_srpms.sh" \
-    --base-image "$base_image" --checkout "$repo_root" --source-sha "$source_sha" \
+    --base-image "$builder_image" --checkout "$repo_root" --source-sha "$source_sha" \
     --srpm-dir "$srpms" --companion-rpm-dir "$companion_consumer_rpms" \
     --output-dir "$rpms"
 

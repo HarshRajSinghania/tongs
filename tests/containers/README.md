@@ -14,8 +14,11 @@ tests/containers/run-fedora-44.sh --output-dir /tmp/tongs-fedora-44
 The output directory must be empty so evidence from separate revisions cannot be
 mixed accidentally.
 
-The script pulls the Fedora image, builds a harness image, mounts the checkout
-read-only, and runs the container without network access. The container root is
+The script pulls the Fedora 44 image by the base digest that
+`packaging/rpm/builder/image.json` records (the base of the RPM builder image,
+refreshed by the weekly builder pin pull request), builds a harness image on it,
+mounts the checkout read-only, and runs the container without network access.
+It refuses a pin that has no published digest yet. The container root is
 read-only, all capabilities are dropped, and `no-new-privileges` is enabled. No
 credentials are mounted. Build and test scratch data stays in a temporary
 filesystem, while reports and wheels go to the requested output directory.

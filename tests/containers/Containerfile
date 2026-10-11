@@ -1,4 +1,7 @@
-FROM registry.fedoraproject.org/fedora:44
+# BASE_IMAGE is required: run-fedora-44.sh passes the Fedora 44 base digest
+# that packaging/rpm/builder/image.json records, never a moving tag.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
 
 LABEL org.opencontainers.image.title="Tongs Fedora 44 validation harness"
 LABEL org.opencontainers.image.description="Disposable headless test environment for issue 27"

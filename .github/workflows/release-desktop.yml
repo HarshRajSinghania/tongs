@@ -556,9 +556,12 @@ jobs:
        (github.event_name == 'workflow_dispatch' && inputs.dry_run == true))
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    # attestations: read is for gh attestation verify on the RPM builder image
+    # that the tagged commit pins, before the first build.
     permissions:
       contents: read
       actions: read
+      attestations: read
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_VERSION: ${{ needs.candidate-archive.outputs.release-version }}
@@ -648,7 +651,7 @@ jobs:
           output="$RUNNER_TEMP/tongs-desktop-rpm"
           staged="$RUNNER_TEMP/tongs-desktop-release-rpms"
           mkdir -p "$staged/rpms/final" "$staged/companion-consumer-rpms" \
-            "$staged/prepared"
+            "$staged/prepared" "$staged/builder"
           cp -- "$output"/rpms/final/*.rpm "$staged/rpms/final/"
           cp -- "$output"/companion-consumer-rpms/*.rpm "$staged/companion-consumer-rpms/"
           cp -- "$output/rpms/final/SHA256SUMS" "$staged/rpms/final/SHA256SUMS"
@@ -656,6 +659,8 @@ jobs:
           cp -- "$output/payload-input-contract.json" "$staged/"
           cp -- "$output/prepared/prepared-inputs.json" "$staged/prepared/"
           cp -- "$output/ALL-SHA256SUMS" "$staged/"
+          cp -- "$output/builder-pin.json" "$output/builder-attestation.json" \
+            "$staged/builder/"
           cp -a -- "$output/install" "$staged/install"
       - name: Upload the release RPMs for this run and attempt
         id: upload

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).parents[4]
@@ -57,3 +58,34 @@ def test_hosted_containers_build_offline_without_new_privileges() -> None:
         assert "--network=none" in run, " ".join(run)
     # The clean install takes packages from RPMs only, never from PyPI.
     assert "pip install" not in installer
+
+
+def test_the_manual_harness_builds_on_the_pinned_plain_fedora_base() -> None:
+    """The manual workflow never uses the builder image.
+
+    It builds on plain Fedora, so a companion spec that forgets a
+    ``BuildRequires`` still fails here, at the base digest the builder pin
+    records rather than the moving ``fedora:44`` tag.
+    """
+
+    harness = (PACKAGING / "run_hosted.sh").read_text()
+    containerfile = (PACKAGING / "Containerfile").read_text()
+    rebuilder = (PACKAGING / "rebuild_srpms.sh").read_text()
+    for name, text in (
+        ("run_hosted.sh", harness),
+        ("Containerfile", containerfile),
+        ("rebuild_srpms.sh", rebuilder),
+    ):
+        assert "fedora:44" not in text, name
+    assert "--check --require-published" in harness
+    assert 'base_image="registry.fedoraproject.org/fedora@$base_digest"' in harness
+    assert "tongs-rpm-builder" not in harness
+    assert "gh attestation" not in harness
+    assert '--build-arg "BASE_IMAGE=$base_image"' in harness
+    assert re.findall(r"^FROM\s+(\S+)", containerfile, re.MULTILINE) == [
+        "${BASE_IMAGE}"
+    ]
+    assert re.findall(r"^ARG BASE_IMAGE.*$", containerfile, re.MULTILINE) == [
+        "ARG BASE_IMAGE"
+    ]
+    assert "FROM $base_image\n" in rebuilder

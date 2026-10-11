@@ -180,9 +180,11 @@ def test_a_dry_run_rebuilds_rpms_but_never_publishes(
     rpm = " ".join(jobs["release-rpm"]["if"].split())
     assert "github.event_name == 'workflow_dispatch' && inputs.dry_run == true" in rpm
     assert "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')" in rpm
+    # attestations: read lets the harness verify the pinned RPM builder image.
     assert jobs["release-rpm"]["permissions"] == {
         "contents": "read",
         "actions": "read",
+        "attestations": "read",
     }
 
 

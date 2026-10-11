@@ -77,6 +77,92 @@ def test_hosted_harness_is_disposable_and_rebuilds_offline() -> None:
         assert "--network=none" in run, " ".join(run)
 
 
+def test_the_harness_names_no_moving_fedora_tag() -> None:
+    """Every image comes from the builder pin by digest, never from fedora:44."""
+
+    for name in ("run_hosted.sh", "rebuild_srpms.sh", "Containerfile"):
+        assert "fedora:44" not in (PACKAGING / name).read_text(), name
+    harness = (PACKAGING / "run_hosted.sh").read_text()
+    assert 'pin_file="$repo_root/packaging/rpm/builder/image.json"' in harness
+    assert "--check --require-published" in harness
+    # The builder and the clean install base are digest references only.
+    assignments = re.findall(
+        r"^\s*(builder_image|base_image)=(.*)$", harness, re.MULTILINE
+    )
+    assert sorted(assignments) == [
+        ("base_image", '"$fedora_repository@$base_digest"'),
+        ("builder_image", '"$builder_repository@$builder_digest"'),
+        ("builder_image", "$local_builder"),
+    ]
+    assert "fedora_repository=registry.fedoraproject.org/fedora\n" in harness
+    assert "builder_repository=ghcr.io/andre-motta/tongs-rpm-builder\n" in harness
+
+
+def test_the_source_builder_takes_a_required_base_image() -> None:
+    containerfile = (PACKAGING / "Containerfile").read_text()
+    assert re.findall(r"^FROM\s+(\S+)", containerfile, re.MULTILINE) == [
+        "${BASE_IMAGE}"
+    ]
+    # No default: a build without the pinned reference fails at FROM.
+    assert re.findall(r"^ARG BASE_IMAGE.*$", containerfile, re.MULTILINE) == [
+        "ARG BASE_IMAGE"
+    ]
+    assert containerfile.index("ARG BASE_IMAGE") < containerfile.index("FROM ")
+
+
+def test_builds_layer_on_the_builder_and_the_clean_install_stays_plain() -> None:
+    harness = (PACKAGING / "run_hosted.sh").read_text()
+    rebuilder = (PACKAGING / "rebuild_srpms.sh").read_text()
+    joined = harness.replace("\\\n", " ")
+
+    builds = [line for line in joined.splitlines() if "podman build" in line]
+    assert len(builds) == 2
+    for build in builds:
+        assert '--pull=never --build-arg "BASE_IMAGE=$builder_image"' in build
+    rebuilds = [line for line in joined.splitlines() if 'rebuild_srpms.sh"' in line]
+    assert len(rebuilds) == 2
+    for rebuild in rebuilds:
+        assert '--base-image "$builder_image"' in rebuild
+    # The clean install, upgrade and removal cycles run in plain Fedora at
+    # the pinned base digest, never in the builder image.
+    (install,) = [
+        line for line in joined.splitlines() if "install_and_verify.sh" in line
+    ]
+    assert '"$base_image" /checkout/packaging/rpm/desktop/install_and_verify.sh' in (
+        install
+    )
+    assert "builder_image" not in install
+    (probe,) = [
+        line for line in joined.splitlines() if "--entrypoint /bin/bash" in line
+    ]
+    assert '"$base_image"' in probe
+    # Each rebuild layer starts from the builder and still resolves its own
+    # source RPM's BuildRequires.
+    assert "FROM $base_image\n" in rebuilder
+    assert "dnf builddep --assumeyes" in rebuilder
+    assert "podman build --pull=never" in rebuilder
+
+
+def test_the_attestation_check_precedes_every_pull_and_build() -> None:
+    harness = (PACKAGING / "run_hosted.sh").read_text()
+    verify = harness.index("gh attestation verify")
+    for command in ("podman pull", "podman build", "podman run"):
+        assert verify < harness.index(command), command
+    assert harness.index("--require-published") < verify
+    for option in (
+        '"oci://$builder_image"',
+        "--repo andre-motta/tongs",
+        '--signer-workflow "$builder_workflow"',
+        "--source-ref refs/heads/main",
+        '--source-digest "$pinned_commit"',
+        "--deny-self-hosted-runners",
+    ):
+        assert option in harness[verify : harness.index("--format json", verify)]
+    assert (
+        "builder_workflow=andre-motta/tongs/.github/workflows/rpm-builder-image.yml\n"
+    ) in harness
+
+
 def test_verifier_python_reason_stage_replays_retained_dnf5_output(
     tmp_path: Path,
 ) -> None:

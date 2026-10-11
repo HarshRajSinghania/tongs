@@ -309,9 +309,12 @@ jobs:
     needs: [changes]
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.desktop == 'true') }}
     uses: ./.github/workflows/desktop-production.yml
+    # attestations: read lets the called rpm-lifecycle job verify the pinned
+    # RPM builder image's attestation; a called job gets no more than this.
     permissions:
       contents: read
       actions: read
+      attestations: read
     with:
       checked_out_sha: ${{ github.sha }}
       run_archive: ${{ needs.changes.result != 'success' || needs.changes.outputs.archive == 'true' }}

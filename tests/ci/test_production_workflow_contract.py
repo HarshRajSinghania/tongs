@@ -315,6 +315,29 @@ def test_the_production_call_receives_the_archive_and_packaging_lanes(
         )
 
 
+def test_the_rpm_lifecycle_may_read_the_builder_attestation_and_nothing_more(
+    ci: dict[str, Any], production: dict[str, Any]
+) -> None:
+    """The RPM harness verifies the pinned builder image's attestation.
+
+    ``gh attestation verify`` reads it through the API, which needs
+    ``attestations: read``; a called workflow's job gets no scope its caller
+    does not grant, so the ``ci.yml`` call grants the same read.
+    """
+
+    rpm = production["jobs"]["rpm-lifecycle"]
+    assert rpm["permissions"] == {
+        "contents": "read",
+        "actions": "read",
+        "attestations": "read",
+    }
+    assert rpm["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert ci["jobs"]["desktop-production"]["permissions"] == rpm["permissions"]
+    for job_id, job in production["jobs"].items():
+        if job_id != "rpm-lifecycle":
+            assert "attestations" not in (job.get("permissions") or {}), job_id
+
+
 def test_the_core_matrix_runs_every_interpreter_on_every_plan(
     ci: dict[str, Any],
 ) -> None:

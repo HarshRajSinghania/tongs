@@ -1,4 +1,7 @@
-FROM registry.fedoraproject.org/fedora:44
+# BASE_IMAGE is required and always digest-pinned: run_hosted.sh passes the
+# builder image from packaging/rpm/builder/image.json.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
 
 LABEL org.opencontainers.image.title="Tongs desktop RPM source builder"
 LABEL org.opencontainers.image.description="Disposable Fedora 44 source preparation environment for issue 52"
