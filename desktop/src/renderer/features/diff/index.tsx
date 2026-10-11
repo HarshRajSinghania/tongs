@@ -86,6 +86,7 @@ import {
   setFileViewed,
   useViewedFiles,
   viewedFileKey,
+  viewedFilesFor,
   viewedProgressText,
   type ViewedFiles,
 } from "./viewed.js";
@@ -320,6 +321,15 @@ function DiffView({
     );
     if (target) {
       setJumpError(null);
+      // The route keeps its jump across a Refresh, a layout switch and a tab
+      // switch. Once the jump has opened its file, a reader who marked that
+      // file viewed again has moved on, so a later read leaves the line alone
+      // rather than selecting a row the collapsed file does not draw.
+      if (
+        revealedJumps.has(route.diffTarget) &&
+        fileIsViewed(route.item.handle, loaded, target.fileIndex)
+      )
+        return;
       revealJumpTarget(route.item.handle, loaded, route.diffTarget, target);
       anchors.select(target);
     } else if (!loaded.loadingMore) {
@@ -451,12 +461,29 @@ function revealJumpTarget(
   revealFile(review, loaded, target.fileIndex);
 }
 
-/** Clears the viewed mark of the file at `fileIndex`, if it has one. */
-function revealFile(review: string, loaded: LoadedDiff, fileIndex: number): void {
-  const file = loaded.rows.find(
+function fileAt(loaded: LoadedDiff, fileIndex: number): DiffFileRow | undefined {
+  return loaded.rows.find(
     (row): row is DiffFileRow =>
       row.kind === "file" && row.file_index === fileIndex,
   );
+}
+
+/** True when the file at `fileIndex` is marked as viewed at this revision. */
+function fileIsViewed(
+  review: string,
+  loaded: LoadedDiff,
+  fileIndex: number,
+): boolean {
+  const file = fileAt(loaded, fileIndex);
+  return (
+    file !== undefined &&
+    viewedFilesFor(review, loaded.revision.head_sha).has(viewedFileKey(file))
+  );
+}
+
+/** Clears the viewed mark of the file at `fileIndex`, if it has one. */
+function revealFile(review: string, loaded: LoadedDiff, fileIndex: number): void {
+  const file = fileAt(loaded, fileIndex);
   if (file)
     setFileViewed(review, loaded.revision.head_sha, viewedFileKey(file), false);
 }
@@ -684,6 +711,12 @@ function DiffWorkspace({
       (file) => file.file_index === selection.fileIndex,
     );
     if (!matchingFile) return;
+    // A viewed file draws its header alone, so a selection inside it would
+    // let `c` open a composer on a row that is not drawn.
+    if (viewed.files.has(viewedFileKey(matchingFile))) {
+      selectAnchor(null);
+      return;
+    }
     const fileRows = sliceOf(slices, matchingFile.file_index).rows;
     const rowIndex = fileRows.findIndex((row) =>
       loaded.layout === "split"
@@ -695,7 +728,7 @@ function DiffWorkspace({
     );
     setSelected(matchingFile.file_index);
     if (rowIndex >= 0) setTarget(rowIndex);
-  }, [files, loaded, review, selection, slices]);
+  }, [files, loaded, review, selectAnchor, selection, slices, viewed.files]);
   const selectedFile =
     files.find((file) => file.file_index === selected) ?? null;
   const selectedViewed =

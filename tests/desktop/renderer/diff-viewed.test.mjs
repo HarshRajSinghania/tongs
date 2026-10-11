@@ -31,7 +31,9 @@ Object.assign(globalThis, {
   HTMLElement: dom.window.HTMLElement,
   Node: dom.window.Node,
 });
-const { cleanup, fireEvent, render, waitFor } = desktopRequire("@testing-library/react");
+const { act, cleanup, fireEvent, render, waitFor } = desktopRequire(
+  "@testing-library/react",
+);
 const React = desktopRequire("react");
 afterEach(() => {
   cleanup();
@@ -262,6 +264,36 @@ function navEntries(view) {
   return texts(view, ".file-list .file-item:not(.hunk-item)");
 }
 
+function navButton(view, index) {
+  const button = view.container.querySelectorAll(
+    ".file-list .file-item:not(.hunk-item)",
+  )[index];
+  if (!button) throw new Error(`no file button ${index}`);
+  return button;
+}
+
+function lineAnchor(view) {
+  const anchor = view.container.querySelector(
+    '.line-anchor[aria-label="Select new line 1"]',
+  );
+  if (!anchor) throw new Error("no new line 1 anchor");
+  return anchor;
+}
+
+function selectedLineCount(view) {
+  return view.container.querySelectorAll(".line-selected").length;
+}
+
+function composerCount(view) {
+  return view.container.querySelectorAll(".inline-composer").length;
+}
+
+async function settle() {
+  for (let turn = 0; turn < 5; turn += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+
 async function loaded(view, expected = ["+value_0 = 0"]) {
   await waitFor(() => assert.deepEqual(lines(view), expected));
 }
@@ -466,12 +498,72 @@ test("a discussion jump into a viewed file shows the line and clears the mark on
   assert.deepEqual(progress(view), ["2 of 2 files viewed"]);
   cleanup();
   const again = renderDiff(review, viewedBridge(review), { diffTarget: jump });
+  // The jump selects nothing in the collapsed file, so the diff opens at its
+  // first file, which is viewed too.
   await waitFor(() =>
-    assert.deepEqual(texts(again, ".diff-view .file-path"), ["src/file_1.py"]),
+    assert.deepEqual(texts(again, ".diff-view .file-path"), ["src/file_0.py"]),
   );
   assert.equal(viewedBox(again).checked, true);
   assert.deepEqual(lines(again), []);
   assert.deepEqual(progress(again), ["2 of 2 files viewed"]);
+  assert.equal(selectedLineCount(again), 0);
+});
+
+test("a Refresh after a jumped-to file is marked viewed again selects nothing in it", async () => {
+  const review = "review-viewed-jump-refresh";
+  setFileViewed(review, "head-1", viewedFileKey(fileRow(1, "src/file_1.py")), true);
+  const jump = {
+    discussionId: "discussion-1",
+    path: "src/file_1.py",
+    side: "new",
+    line: 1,
+  };
+  const bridge = viewedBridge(review);
+  const view = renderDiff(review, bridge, { diffTarget: jump });
+  await loaded(view, ["+value_1 = 1"]);
+  await waitFor(() => assert.equal(selectedLineCount(view), 1));
+
+  fireEvent.click(viewedBox(view));
+  assert.equal(selectedLineCount(view), 0);
+  fireEvent.click(view.getByText("Refresh"));
+  await waitFor(() => assert.equal(bridge.opens.length, 2));
+  await loaded(view);
+  await settle();
+  assert.deepEqual(progress(view), ["1 of 2 files viewed"]);
+
+  // `c` finds no selection, so no composer waits on a row nobody can see.
+  document.body.focus();
+  fireEvent.keyDown(document.body, { key: "c" });
+  fireEvent.click(navButton(view, 1));
+  fireEvent.click(viewedBox(view));
+  await loaded(view, ["+value_1 = 1"]);
+  await settle();
+  assert.equal(composerCount(view), 0);
+  assert.equal(selectedLineCount(view), 0);
+});
+
+test("a selection in a file that becomes viewed is dropped", async () => {
+  const review = "review-viewed-drop";
+  const view = renderDiff(review, viewedBridge(review));
+  await loaded(view);
+  fireEvent.click(lineAnchor(view));
+  assert.equal(selectedLineCount(view), 1);
+
+  // Marked from outside this file's checkbox, which clears it itself.
+  act(() =>
+    setFileViewed(review, "head-1", viewedFileKey(fileRow(0, "src/file_0.py")), true),
+  );
+  await waitFor(() => assert.deepEqual(lines(view), []));
+  document.body.focus();
+  fireEvent.keyDown(document.body, { key: "c" });
+  await settle();
+
+  // Clearing the mark draws the rows again, with no selection and no composer.
+  fireEvent.click(viewedBox(view));
+  await loaded(view);
+  await settle();
+  assert.equal(selectedLineCount(view), 0);
+  assert.equal(composerCount(view), 0);
 });
 
 test("the viewed store keeps one revision per review and a bounded number of reviews", () => {
