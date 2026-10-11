@@ -443,12 +443,14 @@ RULES: tuple[Rule, ...] = (
         lanes=frozenset({"lint", "core"}),
     ),
     # The Dependabot configuration is read by tests/ci/test_workflow_hygiene.py.
+    # The RPM builder workflow's pin job runs scripts/pin_rpm_builder.py.
     Rule(
         name="ci-infrastructure",
         patterns=(
             ".github/workflows/**",
             ".github/scripts/**",
             ".github/dependabot.yml",
+            "scripts/pin_rpm_builder.py",
             "tests/ci/**",
             "tests/containers/**",
         ),

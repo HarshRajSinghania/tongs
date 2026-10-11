@@ -72,6 +72,8 @@ Cargo, or network operation:
 .venv/bin/pytest tests/packaging/rpm/desktop tests/test_plugins/test_plugin_system.py -q
 .venv/bin/ruff check packaging/rpm/desktop tests/packaging/rpm/desktop src/tongs/mcp/plugin.py
 .venv/bin/pytest tests/packaging/rpm/python-dependencies -v
+.venv/bin/pytest tests/packaging/rpm/builder tests/ci/test_pin_rpm_builder.py -q
+python3 packaging/rpm/builder/build_requires.py --check
 ```
 
 Documentation changes build the Astro + Starlight site in `site/`, which reads
@@ -195,6 +197,65 @@ so a documentation-only change runs that lane alone.
 `tests/ci/test_production_workflow_contract.py` keeps the lane's commands and
 Node setup identical to the deploy's.
 
+### RPM builder image
+
+`rpm-builder-image.yml` (RPM builder image) builds
+`packaging/rpm/builder/Containerfile` and publishes it as the public package
+`ghcr.io/andre-motta/tongs-rpm-builder`. It runs weekly on a schedule (Sunday
+04:37 UTC), on `workflow_dispatch`, and on pushes to `main` that change
+`packaging/rpm/builder/**` or the workflow itself. The push filter excludes
+the pin, `packaging/rpm/builder/image.json`, so merging a pin pull request
+does not rebuild the image and open another pin. It never runs on pull
+requests, and every job requires `refs/heads/main`, so a dispatch from another
+branch does nothing.
+
+- `build` (`contents: read`, `packages: write`, `id-token: write`,
+  `attestations: write`) checks `packaging/rpm/builder/packages.txt` against
+  the RPM sources, resolves the current `registry.fedoraproject.org/fedora:44`
+  digest, builds from that digest, logs in with `podman login ghcr.io`
+  reading the workflow token on stdin, pushes the tag
+  `fedora44-<YYYYMMDD>-<12-character sha>` with `podman push --digestfile`,
+  and attests the pushed digest with the same `actions/attest` pin as the
+  release (`push-to-registry: true`). It is the only job in the repository
+  holding `packages: write`.
+- `pin` (`contents: write`, `pull-requests: write`) rewrites
+  `packaging/rpm/builder/image.json` with `scripts/pin_rpm_builder.py` and
+  opens or updates one pull request from the `automation/rpm-builder-pin`
+  branch, force-pushing that branch each time. When the pin already holds the
+  new digest it does nothing.
+
+The image carries the source builder and companion builder tool sets, the
+tools of each rebuild layer and every declared `BuildRequires` of the
+companion specs and the Tongs spec templates, except those only a source-built
+companion provides. `packaging/rpm/builder/build_requires.py` derives that
+list; after changing a spec, a Containerfile or a rebuild script, run
+`python3 packaging/rpm/builder/build_requires.py --write` and commit
+`packages.txt`. `tests/packaging/rpm/builder/test_builder_image.py` fails when
+the list drifts, and `python3 scripts/pin_rpm_builder.py --check` validates
+the pin (`tests/ci/test_pin_rpm_builder.py`). Until the first image is
+published, `image.json` holds `null` for every field but `image`, and nothing
+uses the builder yet.
+
+Run it by hand from `main`:
+`gh workflow run rpm-builder-image.yml --ref main`. Scheduled workflows pause
+after 60 days without repository activity; a dispatch covers that gap.
+
+One-time setup, in this order:
+
+1. In the repository settings, under Actions, General, enable "Allow GitHub
+   Actions to create and approve pull requests", or the `pin` job cannot open
+   its pull request.
+2. Run the workflow once from `main`. A new package starts private.
+3. In the package settings, make `tongs-rpm-builder` public (this cannot be
+   undone) and keep "Inherit access from repository", so fork pull requests
+   and local Podman runs pull it without credentials.
+4. Approve the CI run of each pin pull request, which GitHub requires for
+   pull requests opened with the workflow token, then review and merge it like
+   any other. A pin change under `packaging/` runs the full graph.
+
+Keep every published version: a release tag must stay rebuildable from the
+digest it pins.
+
 ## Releases
 
 Two workflows run on a stable `vX.Y.Z` tag. `publish.yml` builds the core
@@ -203,8 +264,9 @@ that version, attests it with GitHub-managed Sigstore, verifies the attestation
 with the installer's own code path, rebuilds the Fedora RPMs from the signed
 archive, and publishes everything to the GitHub Release of the same tag,
 created as a draft and published only after every asset is confirmed. Its
-`release-publish` job is the only job in the repository holding
-`contents: write`. The two workflows do not wait for each other, so a core
+`release-publish` job is the only release job holding `contents: write`; the
+only other job holding it is the RPM builder image's `pin` job, which pushes
+its pin branch. The two workflows do not wait for each other, so a core
 version can be on PyPI before its desktop release exists; the installer reports
 that state and asks for a retry.
 

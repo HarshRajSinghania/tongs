@@ -23,12 +23,19 @@ that apply to every file, not only to the release workflows:
   fetches a tool through ``npx``, ``npm install``, ``pipx``, ``uvx`` or
   ``uv tool``, so ``npm ci`` from a lockfile is the only Node install.
 
+* the RPM builder image workflow is the only one holding ``packages: write``,
+  in its publish job alone; it runs only weekly, on dispatch and on pushes to
+  ``main`` that change the builder, every job requires ``main``, the publish
+  job attests the pushed digest with the release's ``actions/attest`` pin, and
+  the pin job holds only ``contents: write`` and ``pull-requests: write``.
+
 ``test_release_lock.py`` holds every install under a write token to the
 hash-locked release lock.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import re
 import tomllib
 from pathlib import Path
@@ -558,3 +565,177 @@ def test_dependabot_proposes_grouped_monthly_updates() -> None:
     assert npm["versioning-strategy"] == "increase"
     # Electron is bumped by hand together with the desktop archive pins.
     assert npm["ignore"] == [{"dependency-name": "electron"}]
+
+
+#: The workflow that builds, publishes and pins the RPM builder image.
+BUILDER_WORKFLOW = "rpm-builder-image.yml"
+BUILDER_IMAGE = "ghcr.io/andre-motta/tongs-rpm-builder"
+BUILDER_PIN = "packaging/rpm/builder/image.json"
+BUILDER_PATHS = [
+    "packaging/rpm/builder/**",
+    f"!{BUILDER_PIN}",
+    ".github/workflows/rpm-builder-image.yml",
+]
+MAIN_GUARD = "github.ref == 'refs/heads/main'"
+
+
+def _builder(workflows: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    return workflows[BUILDER_WORKFLOW]
+
+
+def _steps_using(job: dict[str, Any], action: str) -> list[dict[str, Any]]:
+    return [
+        step
+        for step in job.get("steps", [])
+        if str(step.get("uses", "")).startswith(f"{action}@")
+    ]
+
+
+def _step_named(job: dict[str, Any], fragment: str) -> dict[str, Any]:
+    (step,) = [step for step in job["steps"] if fragment in step.get("name", "")]
+    return step
+
+
+def test_only_the_builder_publish_job_can_write_packages(
+    workflows: dict[str, dict[str, Any]],
+) -> None:
+    writers = set()
+    for name, document in workflows.items():
+        default = document.get("permissions")
+        assert default != "write-all", name
+        if isinstance(default, dict) and default.get("packages") == "write":
+            writers.add(f"{name}:*")
+        for job_id, job in document["jobs"].items():
+            permissions = job.get("permissions", default)
+            assert permissions != "write-all", f"{name}:{job_id}"
+            if isinstance(permissions, dict) and permissions.get("packages") == "write":
+                writers.add(f"{name}:{job_id}")
+    assert writers == {f"{BUILDER_WORKFLOW}:build"}
+
+
+def test_the_builder_runs_weekly_on_dispatch_and_on_builder_pushes_to_main(
+    workflows: dict[str, dict[str, Any]],
+) -> None:
+    triggers = _triggers(_builder(workflows))
+    assert set(triggers) == {"schedule", "workflow_dispatch", "push"}
+    (schedule,) = triggers["schedule"]
+    minute, hour, day_of_month, month, day_of_week = schedule["cron"].split()
+    # Weekly: one fixed weekday, any day of the month, off the top of the hour.
+    assert (day_of_month, month) == ("*", "*")
+    assert day_of_week.isdigit() and 0 <= int(day_of_week) <= 6
+    assert minute.isdigit() and int(minute) != 0
+    assert hour.isdigit()
+    assert triggers["workflow_dispatch"] is None
+    assert triggers["push"] == {"branches": ["main"], "paths": BUILDER_PATHS}
+
+
+def _push_paths_match(patterns: list[str], path: str) -> bool:
+    """Evaluate GitHub push path filters in order: the last match decides."""
+    matched = False
+    for pattern in patterns:
+        negated = pattern.startswith("!")
+        glob = pattern[1:] if negated else pattern
+        if fnmatch.fnmatchcase(path, glob):
+            matched = not negated
+    return matched
+
+
+def test_merging_a_pin_pull_request_cannot_rebuild_the_image(
+    workflows: dict[str, dict[str, Any]],
+) -> None:
+    paths = _triggers(_builder(workflows))["push"]["paths"]
+    # The pin job's pull request only changes the pin file; a rebuild on its
+    # merge would publish a new digest and open another pin pull request.
+    assert not _push_paths_match(paths, BUILDER_PIN)
+    # The exclusion must follow the directory glob, or the glob re-includes it.
+    assert paths.index(f"!{BUILDER_PIN}") > paths.index("packaging/rpm/builder/**")
+    assert _push_paths_match(paths, "packaging/rpm/builder/Containerfile")
+    assert _push_paths_match(paths, "packaging/rpm/builder/packages.txt")
+    assert _push_paths_match(paths, ".github/workflows/rpm-builder-image.yml")
+    assert not _push_paths_match(paths, "packaging/rpm/desktop/tongs-desktop.spec")
+
+
+def test_the_builder_holds_no_token_by_default_and_every_job_needs_main(
+    workflows: dict[str, dict[str, Any]],
+) -> None:
+    document = _builder(workflows)
+    assert document["permissions"] == {}
+    assert document["env"]["BUILDER_IMAGE"] == BUILDER_IMAGE
+    assert document["concurrency"]["cancel-in-progress"] is False
+    assert set(document["jobs"]) == {"build", "pin"}
+    for job_id, job in document["jobs"].items():
+        condition = " ".join(str(job.get("if", "")).split())
+        assert MAIN_GUARD in condition, job_id
+        assert "||" not in condition, job_id
+        assert "github.repository == 'andre-motta/tongs'" in condition, job_id
+
+
+def test_the_builder_publish_job_pushes_by_digest_and_attests_it(
+    workflows: dict[str, dict[str, Any]],
+) -> None:
+    job = _builder(workflows)["jobs"]["build"]
+    assert job["permissions"] == {
+        "contents": "read",
+        "packages": "write",
+        "id-token": "write",
+        "attestations": "write",
+    }
+    release = workflows["release-desktop.yml"]["jobs"]["candidate-attestation"]
+    release_pin = {step["uses"] for step in _steps_using(release, "actions/attest")}
+    (attest,) = _steps_using(job, "actions/attest")
+    # The same reviewed pin the release signing job uses.
+    assert {attest["uses"]} == release_pin
+    assert attest["with"] == {
+        "subject-name": "${{ env.BUILDER_IMAGE }}",
+        "subject-digest": "${{ steps.push.outputs.digest }}",
+        "push-to-registry": True,
+        "create-storage-record": False,
+        "show-summary": True,
+    }
+    names = [step.get("name", "") for step in job["steps"]]
+    push = _step_named(job, "Push the image")
+    assert push["id"] == "push"
+    assert "podman push --digestfile" in push["run"]
+    assert names.index(push["name"]) < names.index(attest["name"])
+    build = _step_named(job, "Build the image")
+    assert "FEDORA_DIGEST=$BASE_DIGEST" in build["run"]
+    assert "SOURCE_COMMIT=$GITHUB_SHA" in build["run"]
+    assert 'tag="fedora44-$(date -u +%Y%m%d)-${GITHUB_SHA::12}"' in build["run"]
+    base = _step_named(job, "Resolve the current Fedora 44 base digest")
+    assert "skopeo inspect" in base["run"]
+    check = _step_named(job, "Require the package list")
+    assert names.index(check["name"]) < names.index(build["name"])
+    assert "build_requires.py --check" in check["run"]
+    # The registry token reaches only the login, and only through stdin.
+    login = _step_named(job, "Log in to the GitHub Container Registry")
+    assert login["env"] == {"REGISTRY_TOKEN": "${{ github.token }}"}
+    assert "--password-stdin" in login["run"]
+    assert "--password " not in login["run"]
+    for step in job["steps"]:
+        if step is not login:
+            assert "github.token" not in str(step), step.get("name")
+    cleanup = job["steps"][-1]
+    assert cleanup["if"] == "${{ always() }}"
+    assert "registry-auth" in cleanup["run"]
+
+
+def test_the_builder_pin_job_only_proposes_a_pull_request(
+    workflows: dict[str, dict[str, Any]],
+) -> None:
+    document = _builder(workflows)
+    job = document["jobs"]["pin"]
+    assert job["needs"] == "build"
+    assert job["permissions"] == {"contents": "write", "pull-requests": "write"}
+    assert not _steps_using(job, "actions/attest")
+    rewrite = _step_named(job, "Rewrite the pin")
+    assert "scripts/pin_rpm_builder.py" in rewrite["run"]
+    assert "--check" in rewrite["run"]
+    propose = _step_named(job, "Open or update the pin pull request")
+    assert propose["if"] == "steps.pin.outputs.changed == 'true'"
+    assert propose["env"]["GH_TOKEN"] == "${{ github.token }}"
+    script = propose["run"]
+    assert document["env"]["PIN_BRANCH"] == "automation/rpm-builder-pin"
+    assert 'push --force origin "HEAD:refs/heads/$PIN_BRANCH"' in script
+    assert "-- packaging/rpm/builder/image.json" in script
+    assert "gh pr edit" in script and "gh pr create" in script
+    assert "--base main" in script

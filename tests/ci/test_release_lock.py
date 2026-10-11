@@ -267,8 +267,9 @@ def test_gh_token_reaches_only_the_steps_that_call_gh(
             if has_token:
                 assert step["env"]["GH_TOKEN"] == "${{ github.token }}"
                 calling += 1
-    # require-absent, create, draft check, edit and the final check.
-    assert calling == 5
+    # require-absent, create, draft check, edit and the final check of the
+    # release, and the builder workflow's pin pull request.
+    assert calling == 6
 
 
 def _lock_entries(lock: str = RELEASE_LOCK) -> dict[str, tuple[Version, int]]:
