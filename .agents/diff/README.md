@@ -275,7 +275,7 @@ validator, the bridge type, the badge map and this widget together.
 
 ## Expand in Place
 
-`src/tongs/diff/context.py` is the pure gap model behind `e` in the unified
+`src/tongs/diff/context.py` is the pure gap model behind `e` and `F` in the
 terminal diff. It takes the new file as a plain sequence of lines and never
 imports services, Textual or Rich.
 
@@ -318,7 +318,8 @@ review.") instead of showing wrong numbers.
 `FileContextModel(file, lines, ends_with_newline)` builds each gap's EXPANDED
 lines once (`old_lineno = gap.old_start + k`, `new_lineno = gap.new_start + k`)
 and keeps them, so their identity is stable for `id()`-keyed highlight maps and
-cursor restoration. `FileExpansion(shown, full)` records which gaps are open.
+cursor restoration. `FileExpansion(shown, full, folds)` records which gaps and
+in-hunk folds are open, and whether the whole-file view is on.
 `segments(file, model, expansion)` interleaves `HunkBlock`, `GapRow` and
 `ExpandedBlock` in file order; with no model every gap is a `GapRow`.
 
@@ -348,7 +349,23 @@ cursor restoration. `FileExpansion(shown, full)` records which gaps are open.
   are read-only. Comment on a line inside a hunk." A `J`/`K` range that
   includes one says "A comment range must stay inside one hunk."
   `_validate_anchor` in `review_mutations.py` still refuses them server-side.
-- The split view (`v`) renders exactly as before; it has no gap rows yet.
+- The split view (`v`) renders the same segments through a `FileLayout`
+  (segments, gaps shown as loading, and the `FileExpansion`). Gap rows read the
+  same in both columns and sit in both columns' `_gap_rows`; expanded lines are
+  `SplitDiffRow(old=line, new=line)` cells in both columns' `_readonly_rows`.
+  The state lives in `DiffContent`, so `v` keeps it.
+- Long context runs inside a hunk fold into `FoldMarker` rows that carry a
+  `GapPosition.INSIDE` gap (index `INSIDE_GAP_INDEX`, told apart by
+  `DiffGap.key`). `e` on one adds it to `FileExpansion.folds` with no read; a
+  `J`/`K` range may still span one, because its lines belong to the hunk.
+- `F` (`DiffPanel.action_toggle_full_file`) sets `FileExpansion.full`, which
+  opens every gap and fold. It reads the file through
+  `ContextRequested(file, None)` unless the hunks already cover it, refuses
+  past `FULL_FILE_MAX_ROWS` rows, and resets when another file is shown.
+- Once a file is read, a `diff-context-highlight` worker lexes the whole new
+  file in a thread as one stream and merges the expanded lines' colours into
+  the file's `HighlightMap`, so a string opened in a hunk colours the lines
+  after it. Until then, or on a lexer error, the per-line fallback applies.
 
 ## Bulk Pygments Highlighting
 

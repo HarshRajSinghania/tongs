@@ -56,14 +56,50 @@ replacement.
   Pygments.
 - **Word-level changes.** In the unified view, the words that changed inside a
   changed line are bold and underlined, so a small edit in a long line stands out.
-- **Folded context.** Long unchanged stretches between changes collapse into a
-  marker such as `... 42 unchanged lines ...`.
+- **Unchanged lines.** The forge sends only the changed parts of a file, so
+  the lines around them start out hidden behind a row such as
+  `... 42 unchanged lines (e to expand) ...`. See
+  [Expanding context](#expanding-context).
 - **Markdown preview.** On a Markdown file, press ++m++ to switch between the
   diff and the rendered file.
 - **Files without a diff.** When the forge truncates a large diff or does not
   expose it, the file stays in the tree with its line counts and the pane says
   why. Binary files, empty files, mode changes and pure renames get a short
   label instead of a diff. Press ++o++ to open the review in your browser.
+
+## Expanding context
+
+A diff shows each change with a few lines around it. The rest of the file
+hides behind gap rows: one above the first change, one between each pair of
+changes and one below the last. Each row says how many lines it hides, for
+example `... 120 unchanged lines (e to expand) ...`. The row below the last
+change reads `... more lines below (e to expand) ...` until tongs knows how
+long the file is. Long unchanged stretches inside a change fold the same way.
+
+| Key | Action |
+|-----|--------|
+| ++e++ | Expand the gap row under the cursor |
+| ++shift+f++ | Show the whole file, or go back to what you had expanded |
+
+- **One request per file.** The first ++e++ or ++shift+f++ on a file reads it
+  from the forge at the review's latest commit, once. Later expands and the
+  whole-file view use that copy. Opening a diff never reads a file, and a fold
+  inside a change opens without any request.
+- **Both views.** Expanding works the same in unified and split view, and
+  ++v++ keeps what you expanded. Expanded lines show both line numbers and the
+  same syntax highlighting as the rest of the file.
+- **Whole file.** ++shift+f++ works per file. The file header shows
+  **Full file** while it is on, and moving to another file turns it off.
+- **Read-only lines.** You can't comment on an expanded line. GitHub accepts
+  comments only on lines inside the changed parts, and tongs checks the same
+  rule for every forge. ++c++, ++f3++, ++d++, ++r++ and ++shift+r++ on an
+  expanded line say so, and a selection can't stretch across a gap row.
+- **Limits.** tongs expands files up to 2 MiB and 20,000 lines. Past that,
+  pressing ++e++ says the file is too large. ++shift+f++ also stops at 20,000
+  lines on screen and asks you to expand single gaps instead.
+- **Files that can't expand.** An added or deleted file already shows every
+  line. Binary files, symlinks, submodules and files the forge did not send
+  have no lines to expand, and tongs says why.
 
 ## Comment threads in the diff
 

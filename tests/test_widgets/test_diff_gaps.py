@@ -18,7 +18,6 @@ from tongs.widgets.diff_panel import (
     NO_MORE_LINES_MESSAGE,
     RANGE_CROSSES_GAP_MESSAGE,
     READ_ONLY_LINE_MESSAGE,
-    SPLIT_EXPAND_MESSAGE,
     CommentRequested,
     ContextRequested,
     DiffOptionList,
@@ -399,7 +398,7 @@ async def test_files_that_cannot_expand_render_as_before() -> None:
 
 
 @pytest.mark.asyncio
-async def test_split_view_is_unchanged_and_e_points_to_the_unified_view() -> None:
+async def test_e_away_from_a_gap_row_in_split_view_explains_where_to_go() -> None:
     app = _GapApp()
     async with app.run_test(size=(200, 60), notifications=True) as pilot:
         panel = await _open(app, pilot, _file())
@@ -410,5 +409,5 @@ async def test_split_view_is_unchanged_and_e_points_to_the_unified_view() -> Non
         await pilot.press("e")
         await pilot.pause()
 
-        assert SPLIT_EXPAND_MESSAGE in _messages(app)
+        assert MOVE_TO_GAP_MESSAGE in _messages(app)
         assert app.requests == []
