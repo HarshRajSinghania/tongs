@@ -10,17 +10,24 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from "react";
-import type {
-  DesktopBridge,
-  DiffFileRow,
-  DiffHunkRow,
-  DiffLayout,
-  DiffPage,
-  DiffRow,
-  RepositoryDto,
-  ReviewRevisionDto,
-  SplitDiffCell,
-  SplitDiffRow,
+import { createPortal } from "react-dom";
+import {
+  MAX_DIFF_CONTEXT_LINES,
+  type DesktopBridge,
+  type DiffContextResult,
+  type DiffContextRow,
+  type DiffContextStatus,
+  type DiffFileRow,
+  type DiffGapRow,
+  type DiffHunkRow,
+  type DiffLayout,
+  type DiffPage,
+  type DiffRow,
+  type DiffWireRow,
+  type RepositoryDto,
+  type ReviewRevisionDto,
+  type SplitDiffCell,
+  type SplitDiffRow,
 } from "../../../shared/bridge.js";
 import type {
   AppRoute,
@@ -81,7 +88,15 @@ import {
 } from "../review/thread.js";
 import { ReviewHeaderControls } from "../review/header.js";
 import { ReviewHeader } from "../review-detail/index.js";
-import { SyntaxContent, highlightFile, type FileSyntax } from "./syntax.js";
+import {
+  MAX_HIGHLIGHT_CHARACTERS,
+  MAX_HIGHLIGHT_LINES,
+  SyntaxContent,
+  highlightFile,
+  highlightLines,
+  type FileSyntax,
+  type SyntaxLine,
+} from "./syntax.js";
 import {
   setFileViewed,
   useViewedFiles,
@@ -101,6 +116,121 @@ const MAX_DIFF_ROWS = 100_000;
  */
 export const CHANGES_OVERFLOW_NOTICE =
   "The forge returned only part of the changed files, so this list is incomplete. Use Open on forge to see every file.";
+
+/**
+ * The most rows the whole-file view draws for one file, the terminal's
+ * `FULL_FILE_MAX_ROWS`. A file past it keeps its gaps, which still expand one
+ * at a time.
+ */
+export const FULL_FILE_MAX_ROWS = 20_000;
+
+/** Shown when a comment is attempted on an expanded, unchanged line. */
+export const EXPANDED_READ_ONLY_MESSAGE =
+  "Expanded lines are read-only. Comment on a line inside a hunk.";
+
+/** The terminal's wording for a file read that disagrees with the hunks. */
+export const CONTEXT_MISMATCH_MESSAGE =
+  "The file at this commit does not match the diff. Refresh the review.";
+
+/** Shown when Full file is pressed while a gap of the file is being read. */
+export const CONTEXT_LOADING_MESSAGE = "Still loading this file.";
+
+/** Shown when the gap after the last hunk turns out to be empty. */
+export const NO_MORE_LINES_MESSAGE = "No more lines below.";
+
+/** The terminal's fallback text per read status, when the service sends none. */
+export const CONTEXT_STATUS_MESSAGES: Readonly<
+  Partial<Record<DiffContextStatus, string>>
+> = Object.freeze({
+  too_large: "File too large to expand.",
+  binary: "Binary file, there are no lines to expand.",
+  not_found: "The file was not found at this commit.",
+  mismatch: CONTEXT_MISMATCH_MESSAGE,
+  unsupported: "This forge cannot read files, so lines cannot be expanded.",
+});
+
+/** Shown for a file whose diff the forge withheld in full or in part. */
+export const TRUNCATED_NOTICE =
+  "This file's diff is too large for the forge to send. Use Generate diff locally to build it here (downloads both versions of the file).";
+
+/** The header badge of a diff tongs computed from the file's two versions. */
+export const GENERATED_LABEL = "Generated locally";
+
+/** Shown on a diff generated locally: the forge has no diff to anchor to. */
+export const GENERATED_COMMENT_MESSAGE =
+  "Comments are not available on a diff generated locally.";
+
+/** Shown under the truncation notice after a generation is cancelled. */
+export const GENERATION_CANCELLED_MESSAGE =
+  "Cancelled. Use Generate diff locally to try again.";
+
+/** Shown when a generation fails and the service gives no reason. */
+export const GENERATION_FAILED_MESSAGE = "Could not generate the diff.";
+
+/**
+ * Shown after an expansion or a generation found the open diff gone: the diff
+ * is read again, exactly as Refresh reads it, and the action can be repeated.
+ */
+export const DIFF_RELOADED_MESSAGE =
+  "This diff was no longer open, so it was reloaded. Try again.";
+
+/** The text of a collapsed gap row. */
+export function gapLabel(count: number | null): string {
+  if (count === null) return "More lines below";
+  return `${count.toLocaleString("en-US")} unchanged ${count === 1 ? "line" : "lines"}`;
+}
+
+/** The progress line while a file's diff is generated locally. */
+export function generatingNotice(file: DiffFileRow): string {
+  const oneSide = file.status === "added" || file.status === "deleted";
+  return `Generating diff locally (downloading ${oneSide ? "1 file" : "2 files"}).`;
+}
+
+/** Shown when the whole-file view would draw more than its cap. */
+export function fullFileTooLargeMessage(rows: number): string {
+  return `File too large to show in full (${rows.toLocaleString("en-US")} lines). Expand its gaps one at a time.`;
+}
+
+const LINK_MODES: ReadonlySet<string> = new Set(["120000", "160000"]);
+
+/**
+ * Why Full file cannot show this file, or null when it can. A file the sidecar
+ * sent gap rows for can always be shown; the reasons follow the terminal's.
+ */
+export function fullFileRefusal(
+  file: DiffFileRow,
+  rows: readonly DiffWireRow[],
+  generated: boolean,
+): string | null {
+  if (generated)
+    return "Unchanged lines cannot be shown around a diff generated locally.";
+  if (rows.some((row) => row.kind === "gap")) return null;
+  if (file.status === "added")
+    return "The diff already shows every line of an added file.";
+  if (file.status === "deleted")
+    return "The diff already shows every line of a deleted file.";
+  if (file.is_binary) return "Binary file, there are no lines to show.";
+  if (file.is_truncated)
+    return "The forge did not send this whole diff. Use Generate diff locally to build it.";
+  const hunks = rows.filter((row): row is DiffHunkRow => row.kind === "hunk");
+  if (
+    hunks.length === 0 ||
+    file.is_empty ||
+    file.is_mode_only ||
+    file.is_rename_only ||
+    file.is_unavailable
+  )
+    return "This file has no changed lines to show around.";
+  if (
+    LINK_MODES.has(file.old_mode ?? "") ||
+    LINK_MODES.has(file.new_mode ?? "")
+  )
+    return "Symlinks and submodules have no lines to show.";
+  const first = hunks[0]!;
+  if (first.old_start <= 1 && first.new_start <= 1)
+    return "The diff already shows the lines around this file's changes.";
+  return "The diff hunks do not line up with the file, so it cannot be shown in full.";
+}
 
 /**
  * One in-diff composer is open at a time. It is bound to the anchor it was
@@ -155,7 +285,8 @@ export interface LoadedDiff {
   readonly snapshotId: string;
   readonly resource: string;
   readonly revision: DiffPage["revision"];
-  readonly rows: readonly DiffRow[];
+  /** Every row of the snapshot, the gap rows of a diff opened with gaps included. */
+  readonly rows: readonly DiffWireRow[];
   readonly partialError: RendererReadError | null;
   /**
    * True while the rows are the pages read so far and more are on the way.
@@ -173,6 +304,12 @@ export interface LoadDiffOptions {
   readonly fromSnapshot?: string | undefined;
   /** Called with the rows read so far, after the first page and each later one. */
   readonly onProgress?: (loaded: LoadedDiff) => void;
+  /**
+   * Asks for gap rows around the hunks of every file whose unchanged lines can
+   * be shown. The diff view always asks; a caller that leaves it out gets
+   * exactly the rows a diff had before gap rows existed.
+   */
+  readonly gaps?: boolean;
 }
 
 export function createDiffFeature(): FeatureContribution {
@@ -229,6 +366,16 @@ function DiffView({
   const [jumpError, setJumpError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [reload, setReload] = useState(0);
+  // Set when an expansion or a generation found the open diff gone and the
+  // diff was read again for it; any later Refresh or layout switch clears it.
+  const [reloaded, setReloaded] = useState(false);
+  // The toolbar's slot for the selected file's Full file toggle, which the
+  // workspace below owns because it owns the file selection.
+  const [fileTools, setFileTools] = useState<HTMLElement | null>(null);
+  const reloadExpired = useCallback(() => {
+    setReloaded(true);
+    setReload((value) => value + 1);
+  }, []);
   // The diff on screen and the Refresh it was read for. A layout switch
   // re-projects that same read in the sidecar; a Refresh reads the forge.
   const shown = useRef<{
@@ -268,6 +415,7 @@ function DiffView({
     setError(null);
     void loadAllPages(route.item.handle, layout, bridge, queries, {
       fromSnapshot,
+      gaps: true,
       onProgress: (value) => {
         if (!current) return;
         partial = value;
@@ -376,23 +524,33 @@ function DiffView({
         <strong className="toolbar-title">Layout</strong>
         <button
           className={`button ${layout === "unified" ? "button-active" : "button-secondary"}`}
-          onClick={() => setLayout("unified")}
+          onClick={() => {
+            setReloaded(false);
+            setLayout("unified");
+          }}
         >
           Unified
         </button>
         <button
           className={`button ${layout === "split" ? "button-active" : "button-secondary"}`}
-          onClick={() => setLayout("split")}
+          onClick={() => {
+            setReloaded(false);
+            setLayout("split");
+          }}
         >
           Split
         </button>
         <button
           className="button button-secondary"
           disabled={loading}
-          onClick={() => setReload((value) => value + 1)}
+          onClick={() => {
+            setReloaded(false);
+            setReload((value) => value + 1);
+          }}
         >
           Refresh
         </button>
+        <span className="diff-file-tools" ref={setFileTools} />
         {loaded && (
           <code
             className="revision"
@@ -422,6 +580,7 @@ function DiffView({
         </Notice>
       )}
       {jumpError && <Notice kind="warning">{jumpError}</Notice>}
+      {reloaded && <Notice kind="warning">{DIFF_RELOADED_MESSAGE}</Notice>}
       {loaded && changesOverflow && (
         <Notice kind="warning">{CHANGES_OVERFLOW_NOTICE}</Notice>
       )}
@@ -435,6 +594,8 @@ function DiffView({
           viewed={viewed}
           reloadToken={reload}
           anchors={anchors}
+          reloadExpired={reloadExpired}
+          fileTools={fileTools}
         />
       )}
     </>
@@ -496,13 +657,15 @@ export async function loadAllPages(
   options: LoadDiffOptions = {},
 ): Promise<LoadedDiff> {
   const key = `diff:${review}`;
-  const { fromSnapshot, onProgress } = options;
-  const first = await queries.run(key, () =>
-    bridge.openDiff(
-      fromSnapshot === undefined
-        ? { review, layout, max_items: 1000 }
-        : { review, layout, max_items: 1000, from_snapshot: fromSnapshot },
-    ),
+  const { fromSnapshot, onProgress, gaps = false } = options;
+  const first: DiffPage<DiffWireRow> = await queries.run(key, () =>
+    bridge.openDiff({
+      review,
+      layout,
+      max_items: 1000,
+      ...(fromSnapshot === undefined ? {} : { from_snapshot: fromSnapshot }),
+      ...(gaps ? { gaps: true } : {}),
+    }),
   );
   if (first.cursor !== 0)
     throw invalidPage("The first diff page did not start at cursor zero.");
@@ -529,7 +692,7 @@ export async function loadAllPages(
       );
     const cursor = page.next_cursor;
     page = await queries.run(key, () =>
-      bridge.pageDiff({
+      bridge.pageDiff<DiffWireRow>({
         snapshot: first.snapshot_id,
         resource: first.resource,
         cursor,
@@ -564,8 +727,8 @@ export async function loadAllPages(
 
 function loadedDiff(
   layout: DiffLayout,
-  first: DiffPage,
-  rows: readonly DiffRow[],
+  first: DiffPage<DiffWireRow>,
+  rows: readonly DiffWireRow[],
   partialError: RendererReadError | null,
   loadingMore = false,
 ): LoadedDiff {
@@ -589,7 +752,7 @@ function partialFailure(reason: unknown): RendererReadError {
     : new RendererReadError(failure.code, failure.message, failure.retryable);
 }
 
-function assertNextCursor(page: DiffPage): void {
+function assertNextCursor(page: DiffPage<DiffWireRow>): void {
   if (page.next_cursor !== null && page.next_cursor <= page.cursor)
     throw invalidPage("The diff page cursor did not advance.");
 }
@@ -615,6 +778,618 @@ type FeatureContributionParameters = Parameters<
   FeatureContribution["render"]
 >[0];
 
+/** A row the diff view draws: a snapshot row, or an expanded unchanged line. */
+type DiffViewRow = DiffWireRow | DiffContextRow;
+
+/** One gap's unchanged lines, read once per open diff. */
+type GapLines = readonly DiffContextRow[];
+
+/** Where a truncated file's local generation stands. */
+type Generation =
+  | { readonly state: "running"; readonly notice: string }
+  | { readonly state: "done"; readonly rows: readonly DiffWireRow[] }
+  | { readonly state: "failed"; readonly message: string };
+
+/** What the view draws of one file's unchanged lines and local generation. */
+interface FileContextView {
+  /** The new file's length, once any read of it has said. */
+  readonly lineCount: number | null;
+  /** The gaps read so far, by gap index. */
+  readonly lines: ReadonlyMap<number, GapLines>;
+  /** The gaps shown expanded. */
+  readonly shown: ReadonlySet<number>;
+  readonly loading: ReadonlySet<number>;
+  /** While Full file is on: the gaps that were shown before it. */
+  readonly full: ReadonlySet<number> | null;
+  readonly fullLoading: boolean;
+  /** The last refusal or failure for this file, until dismissed. */
+  readonly message: string | null;
+  readonly generation: Generation | null;
+}
+
+const EMPTY_FILE_CONTEXT: FileContextView = Object.freeze({
+  lineCount: null,
+  lines: new Map<number, GapLines>(),
+  shown: new Set<number>(),
+  loading: new Set<number>(),
+  full: null,
+  fullLoading: false,
+  message: null,
+  generation: null,
+});
+
+type GapRead =
+  | { readonly status: "ok"; readonly rows: GapLines; readonly lineCount: number | null }
+  | { readonly status: "failed"; readonly message: string }
+  | { readonly status: "expired" }
+  | { readonly status: "stale" };
+
+/** The outcome of reading one gap into the cache. */
+type GapLoad = "ok" | "empty" | "failed";
+
+/**
+ * Requests one gap may take. A gap holds at most the 20,000 lines the service
+ * reads for expansion, 1,000 per request, so this only stops a misbehaving
+ * reply from looping.
+ */
+const MAX_CONTEXT_REQUESTS = 200;
+
+function withItem(set: ReadonlySet<number>, item: number): ReadonlySet<number> {
+  return new Set([...set, item]);
+}
+
+function withoutItem(
+  set: ReadonlySet<number>,
+  item: number,
+): ReadonlySet<number> {
+  const next = new Set(set);
+  next.delete(item);
+  return next;
+}
+
+/** A gap's length, filling in the gap after the last hunk once it is known. */
+function gapCount(gap: DiffGapRow, lineCount: number | null): number | null {
+  if (gap.count !== null) return gap.count;
+  if (lineCount === null) return null;
+  return Math.max(0, lineCount - gap.new_start + 1);
+}
+
+function readFailure(reason: unknown, prefix: string): string {
+  const cause = serviceErrorOf(reason)?.message?.trim() ?? "";
+  return cause === "" ? prefix : `${prefix} (${cause})`;
+}
+
+function isExpired(reason: unknown): boolean {
+  return serviceErrorOf(reason)?.code === "snapshot_expired";
+}
+
+/**
+ * The unchanged lines and local generations of one open diff snapshot. The
+ * sidecar is only ever asked by review handle, snapshot and file index, never
+ * by path or commit. Everything here is dropped with the snapshot: a Refresh
+ * or a layout switch starts again with every gap collapsed.
+ */
+class DiffContextStore {
+  private readonly files = new Map<number, FileContextView>();
+  private readonly reads = new Set<string>();
+  private readonly generations = new Map<
+    number,
+    { readonly run: number; readonly tokens: string[] }
+  >();
+  private runs = 0;
+  private closed = false;
+
+  constructor(
+    private readonly bridge: DesktopBridge,
+    private readonly review: string,
+    readonly snapshotId: string,
+    private readonly revision: ReviewRevisionDto,
+    private readonly changed: () => void,
+    private readonly expired: () => void,
+  ) {}
+
+  file(fileIndex: number): FileContextView {
+    return this.files.get(fileIndex) ?? EMPTY_FILE_CONTEXT;
+  }
+
+  open(): void {
+    this.closed = false;
+  }
+
+  /** Stops every read in flight; their replies are dropped. */
+  close(): void {
+    this.closed = true;
+    const tokens = [...this.reads];
+    this.reads.clear();
+    for (const running of this.generations.values()) tokens.push(...running.tokens);
+    this.generations.clear();
+    for (const token of tokens)
+      void this.bridge.cancelRead(token).catch(() => false);
+  }
+
+  notify(fileIndex: number, message: string | null): void {
+    this.update(fileIndex, { message });
+  }
+
+  /** Expands one gap, reading its lines first when this diff has not yet. */
+  async expand(gap: DiffGapRow): Promise<void> {
+    const current = this.file(gap.file_index);
+    if (
+      current.shown.has(gap.gap_index) ||
+      current.loading.has(gap.gap_index) ||
+      current.fullLoading
+    )
+      return;
+    if (!current.lines.has(gap.gap_index)) {
+      if ((await this.load(gap, false)) !== "ok") return;
+    }
+    const now = this.file(gap.file_index);
+    this.update(gap.file_index, {
+      shown: withItem(now.shown, gap.gap_index),
+      message: null,
+    });
+  }
+
+  /**
+   * Shows every gap of one file, or restores the gaps shown before when Full
+   * file is already on. A file past `FULL_FILE_MAX_ROWS` is refused before any
+   * gap opens; the gap after the last hunk is read first when its length is
+   * not known yet, because that read also says how long the file is.
+   */
+  async toggleFull(
+    fileIndex: number,
+    gaps: readonly DiffGapRow[],
+    sourceRows: number,
+  ): Promise<void> {
+    const current = this.file(fileIndex);
+    if (current.fullLoading) return;
+    if (current.loading.size > 0) {
+      this.update(fileIndex, { message: CONTEXT_LOADING_MESSAGE });
+      return;
+    }
+    if (current.full !== null) {
+      this.update(fileIndex, { shown: current.full, full: null, message: null });
+      return;
+    }
+    const previous = current.shown;
+    this.update(fileIndex, { full: previous, fullLoading: true, message: null });
+    const active = (): boolean =>
+      !this.closed && this.file(fileIndex).full === previous;
+    const stop = (message?: string): void => {
+      if (!active()) return;
+      this.update(fileIndex, {
+        shown: previous,
+        full: null,
+        fullLoading: false,
+        ...(message === undefined ? {} : { message }),
+      });
+    };
+    let rows = sourceRows;
+    for (const gap of gaps) rows += gap.count ?? 0;
+    if (rows > FULL_FILE_MAX_ROWS) return stop(fullFileTooLargeMessage(rows));
+    const after = gaps.find((gap) => gap.count === null);
+    if (
+      after !== undefined &&
+      this.file(fileIndex).lineCount === null &&
+      !this.file(fileIndex).lines.has(after.gap_index)
+    ) {
+      // One line is enough: every reply says how long the file is.
+      const learned = await this.learnLineCount(after);
+      if (!active()) return;
+      if (!learned) return stop();
+    }
+    const lineCount = this.file(fileIndex).lineCount;
+    if (after !== undefined) rows += gapCount(after, lineCount) ?? 0;
+    if (rows > FULL_FILE_MAX_ROWS) return stop(fullFileTooLargeMessage(rows));
+    for (const gap of gaps) {
+      if (this.file(fileIndex).lines.has(gap.gap_index)) continue;
+      if (gapCount(gap, lineCount) === 0) continue;
+      const outcome = await this.load(gap, true);
+      if (!active()) return;
+      if (outcome === "failed") return stop();
+    }
+    const now = this.file(fileIndex);
+    this.update(fileIndex, {
+      shown: new Set(
+        gaps.map((gap) => gap.gap_index).filter((index) => now.lines.has(index)),
+      ),
+      fullLoading: false,
+    });
+  }
+
+  /** Turns Full file off for a file the reader has left. */
+  leaveFull(fileIndex: number): void {
+    const current = this.file(fileIndex);
+    if (current.full === null) return;
+    this.update(fileIndex, {
+      shown: current.full,
+      full: null,
+      fullLoading: false,
+    });
+  }
+
+  /** Reads one line after the last hunk to learn the file's length. */
+  private async learnLineCount(gap: DiffGapRow): Promise<boolean> {
+    const fileIndex = gap.file_index;
+    this.update(fileIndex, {
+      loading: withItem(this.file(fileIndex).loading, gap.gap_index),
+    });
+    const reply = await this.request(gap.file_index, gap.new_start, 1);
+    if (reply.status === "stale" || this.closed) return false;
+    const loading = withoutItem(this.file(fileIndex).loading, gap.gap_index);
+    if (reply.status === "expired") {
+      this.update(fileIndex, { loading });
+      this.expired();
+      return false;
+    }
+    if (reply.status === "failed") {
+      this.update(fileIndex, { loading, message: reply.message });
+      return false;
+    }
+    this.update(fileIndex, {
+      loading,
+      lineCount: reply.result.line_count ?? this.file(fileIndex).lineCount,
+    });
+    return true;
+  }
+
+  /** Reads one gap's lines into the cache and reports how that went. */
+  private async load(gap: DiffGapRow, quiet: boolean): Promise<GapLoad> {
+    const fileIndex = gap.file_index;
+    const before = this.file(fileIndex);
+    this.update(fileIndex, {
+      loading: withItem(before.loading, gap.gap_index),
+      message: null,
+    });
+    const read = await this.readGap(gap, before.lineCount);
+    if (read.status === "stale" || this.closed) return "failed";
+    const now = this.file(fileIndex);
+    const loading = withoutItem(now.loading, gap.gap_index);
+    if (read.status === "expired") {
+      this.update(fileIndex, { loading });
+      this.expired();
+      return "failed";
+    }
+    if (read.status === "failed") {
+      this.update(fileIndex, { loading, message: read.message });
+      return "failed";
+    }
+    const lineCount = read.lineCount ?? now.lineCount;
+    if (read.rows.length === 0) {
+      this.update(fileIndex, {
+        loading,
+        lineCount,
+        ...(quiet ? {} : { message: NO_MORE_LINES_MESSAGE }),
+      });
+      return "empty";
+    }
+    const lines = new Map(now.lines);
+    lines.set(gap.gap_index, read.rows);
+    this.update(fileIndex, { loading, lineCount, lines });
+    return "ok";
+  }
+
+  /**
+   * Reads every line of one gap, at most `MAX_DIFF_CONTEXT_LINES` per request.
+   * A reply may stop early at the sidecar's size bound; the next request picks
+   * up from the line after the last one returned.
+   */
+  private async readGap(
+    gap: DiffGapRow,
+    knownLineCount: number | null,
+  ): Promise<GapRead> {
+    let next = gap.new_start;
+    let end: number | null =
+      gap.count !== null
+        ? gap.new_start + gap.count
+        : knownLineCount !== null
+          ? Math.max(next, knownLineCount + 1)
+          : null;
+    let lineCount = knownLineCount;
+    const rows: DiffContextRow[] = [];
+    for (let requests = 0; end === null || next < end; requests += 1) {
+      if (requests >= MAX_CONTEXT_REQUESTS)
+        return { status: "failed", message: CONTEXT_STATUS_MESSAGES.too_large! };
+      const count = Math.min(
+        MAX_DIFF_CONTEXT_LINES,
+        end === null ? MAX_DIFF_CONTEXT_LINES : end - next,
+      );
+      const reply = await this.request(gap.file_index, next, count);
+      if (reply.status !== "ok") return reply;
+      const result = reply.result;
+      lineCount = result.line_count ?? lineCount;
+      if (end === null)
+        end = lineCount === null ? next : Math.max(next, lineCount + 1);
+      const start = next;
+      const fits = result.rows.every(
+        (row, offset) =>
+          row.kind === "context" &&
+          row.file_index === gap.file_index &&
+          row.new_line === start + offset &&
+          row.old_line === gap.old_start + (start + offset - gap.new_start),
+      );
+      if (!fits) return { status: "failed", message: CONTEXT_MISMATCH_MESSAGE };
+      if (result.rows.length === 0) break;
+      const taken = result.rows.slice(0, end - next);
+      for (const row of taken) rows.push(row);
+      next += taken.length;
+    }
+    // A gap of known length that came back short does not match the hunks.
+    if (end !== null && next < end)
+      return { status: "failed", message: CONTEXT_MISMATCH_MESSAGE };
+    return { status: "ok", rows: Object.freeze(rows), lineCount };
+  }
+
+  /** One `diff.context` request, with every refusal worded as the terminal's. */
+  private async request(
+    fileIndex: number,
+    newStart: number,
+    count: number,
+  ): Promise<
+    | { readonly status: "ok"; readonly result: DiffContextResult }
+    | Exclude<GapRead, { readonly status: "ok" }>
+  > {
+    const read = this.bridge.getDiffContext({
+      review: this.review,
+      snapshot: this.snapshotId,
+      file_index: fileIndex,
+      new_start: newStart,
+      count,
+    });
+    this.reads.add(read.requestToken);
+    let result: DiffContextResult;
+    try {
+      result = await read.result;
+    } catch (reason) {
+      if (this.closed) return { status: "stale" };
+      if (isExpired(reason)) return { status: "expired" };
+      return {
+        status: "failed",
+        message: readFailure(reason, "Could not read the file."),
+      };
+    } finally {
+      this.reads.delete(read.requestToken);
+    }
+    if (this.closed) return { status: "stale" };
+    if (result.status === "expired") return { status: "expired" };
+    if (result.status !== "ok")
+      return {
+        status: "failed",
+        message:
+          result.message ||
+          CONTEXT_STATUS_MESSAGES[result.status] ||
+          "Could not read the file.",
+      };
+    return { status: "ok", result };
+  }
+
+  /**
+   * Generates a truncated file's diff in the sidecar and reads every page of
+   * the one-file snapshot it returns. The rows replace the file's rows for as
+   * long as this diff is open.
+   */
+  async generate(file: DiffFileRow): Promise<void> {
+    const fileIndex = file.file_index;
+    const state = this.file(fileIndex).generation?.state;
+    if (state === "running" || state === "done") return;
+    const run = (this.runs += 1);
+    const tokens: string[] = [];
+    this.generations.set(fileIndex, { run, tokens });
+    this.update(fileIndex, {
+      generation: { state: "running", notice: generatingNotice(file) },
+      message: null,
+    });
+    const live = (): boolean =>
+      !this.closed && this.generations.get(fileIndex)?.run === run;
+    const settle = (generation: Generation | null): void => {
+      if (!live()) return;
+      this.generations.delete(fileIndex);
+      this.update(fileIndex, { generation });
+    };
+    const fail = (message: string): void =>
+      settle({ state: "failed", message });
+    const failed = (reason: unknown): void => {
+      if (!live()) return;
+      if (isExpired(reason)) {
+        settle(null);
+        this.expired();
+        return;
+      }
+      fail(readFailure(reason, GENERATION_FAILED_MESSAGE));
+    };
+    const inconsistent = (): void =>
+      fail(
+        `${GENERATION_FAILED_MESSAGE} (The local service returned an inconsistent diff page.)`,
+      );
+    let first;
+    try {
+      const read = this.bridge.generateDiff({
+        review: this.review,
+        snapshot: this.snapshotId,
+        file_index: fileIndex,
+      });
+      tokens.push(read.requestToken);
+      first = await read.result;
+    } catch (reason) {
+      return failed(reason);
+    }
+    if (!live()) return;
+    if (first.status === "expired") {
+      settle(null);
+      this.expired();
+      return;
+    }
+    if (first.status !== "ok") return fail(first.message || GENERATION_FAILED_MESSAGE);
+    if (!sameRevisionValue(first.revision, this.revision)) return inconsistent();
+    const rows: DiffWireRow[] = [...first.entries];
+    let page: DiffPage<DiffWireRow> = first;
+    let pages = 1;
+    while (page.next_cursor !== null) {
+      if (page.next_cursor <= page.cursor) return inconsistent();
+      if (pages >= MAX_DIFF_PAGES || rows.length >= MAX_DIFF_ROWS)
+        return fail(
+          "The generated diff is too large to show in the desktop app.",
+        );
+      const cursor = page.next_cursor;
+      try {
+        const read = this.bridge.pageDiff<DiffWireRow>({
+          snapshot: first.snapshot_id,
+          resource: first.resource,
+          cursor,
+          max_items: 1000,
+        });
+        tokens.push(read.requestToken);
+        page = await read.result;
+      } catch (reason) {
+        return failed(reason);
+      }
+      if (!live()) return;
+      if (
+        page.snapshot_id !== first.snapshot_id ||
+        page.cursor !== cursor ||
+        !sameRevisionValue(page.revision, this.revision)
+      )
+        return inconsistent();
+      for (const row of page.entries) rows.push(row);
+      pages += 1;
+    }
+    if (rows.length > MAX_DIFF_ROWS)
+      return fail("The generated diff is too large to show in the desktop app.");
+    if (
+      rows[0]?.kind !== "file" ||
+      rows.some((row) => row.file_index !== fileIndex || row.kind === "gap")
+    )
+      return inconsistent();
+    settle({ state: "done", rows: Object.freeze(rows) });
+  }
+
+  /** Stops a running generation through the bridge's cancel frame. */
+  cancelGeneration(fileIndex: number): void {
+    const running = this.generations.get(fileIndex);
+    if (!running) return;
+    this.generations.delete(fileIndex);
+    for (const token of running.tokens)
+      void this.bridge.cancelRead(token).catch(() => false);
+    this.update(fileIndex, {
+      generation: { state: "failed", message: GENERATION_CANCELLED_MESSAGE },
+    });
+  }
+
+  private update(fileIndex: number, patch: Partial<FileContextView>): void {
+    if (this.closed) return;
+    this.files.set(fileIndex, Object.freeze({ ...this.file(fileIndex), ...patch }));
+    this.changed();
+  }
+}
+
+/**
+ * One file's rows with its expanded gaps replaced by their unchanged lines.
+ * A collapsed gap stays a gap row; the gap after the last hunk takes its
+ * length once a read has said how long the file is, and disappears when the
+ * file ends where the last hunk ends.
+ */
+function expandFileRows(
+  rows: readonly DiffWireRow[],
+  context: FileContextView,
+): readonly DiffViewRow[] {
+  if (!rows.some((row) => row.kind === "gap")) return rows;
+  const result: DiffViewRow[] = [];
+  for (const row of rows) {
+    if (row.kind !== "gap") {
+      result.push(row);
+      continue;
+    }
+    const lines = context.shown.has(row.gap_index)
+      ? context.lines.get(row.gap_index)
+      : undefined;
+    if (lines !== undefined) {
+      for (const line of lines) result.push(line);
+      continue;
+    }
+    const count = gapCount(row, context.lineCount);
+    if (count === 0) continue;
+    result.push(count === row.count ? row : Object.freeze({ ...row, count }));
+  }
+  return result;
+}
+
+const generatedSlices = new WeakMap<readonly DiffWireRow[], FileSlice>();
+
+/** The slice of a generated file's rows, built once per generation. */
+function generatedSlice(rows: readonly DiffWireRow[]): FileSlice {
+  let slice = generatedSlices.get(rows);
+  if (!slice) {
+    slice = Object.freeze({
+      rows,
+      hunks: rows.filter((row): row is DiffHunkRow => row.kind === "hunk"),
+    });
+    generatedSlices.set(rows, slice);
+  }
+  return slice;
+}
+
+/** Row presentation that depends on the file's context and generation. */
+interface RowExtras {
+  readonly expandGap: (gap: DiffGapRow) => void;
+  readonly loadingGaps: ReadonlySet<number>;
+  /** Shows a refusal for this file, such as a comment on an expanded line. */
+  readonly refuse: (message: string) => void;
+  /** True for a diff generated locally: no row is a comment anchor. */
+  readonly readOnly: boolean;
+  readonly generation: Generation | null;
+  readonly generate: (file: DiffFileRow) => void;
+}
+
+const contextHighlights = new WeakMap<
+  DiffContextRow,
+  { readonly length: number; readonly lines: readonly SyntaxLine[] | null }
+>();
+
+/**
+ * The colours of expanded lines. Each run of consecutive unchanged lines is
+ * highlighted as one text of the new side, the first time a row of it is
+ * drawn, and remembered with the run. A run past the highlighting cutoffs
+ * stays plain text, as a large diff does.
+ */
+function contextSyntaxOf(
+  file: DiffFileRow | null,
+  items: readonly DiffViewRow[],
+): (row: DiffContextRow) => SyntaxLine | undefined {
+  const runs = new WeakMap<DiffContextRow, { start: DiffContextRow; rows: DiffContextRow[]; index: number }>();
+  if (file === null) return () => undefined;
+  let run: DiffContextRow[] = [];
+  for (const row of items) {
+    if (row.kind !== "context") {
+      run = [];
+      continue;
+    }
+    const last = run.at(-1);
+    if (last !== undefined && last.new_line + 1 !== row.new_line) run = [];
+    run.push(row);
+    runs.set(row, { start: run[0]!, rows: run, index: run.length - 1 });
+  }
+  return (row) => {
+    const place = runs.get(row);
+    if (!place) return undefined;
+    let cached = contextHighlights.get(place.start);
+    if (cached === undefined || cached.length !== place.rows.length) {
+      let characters = 0;
+      for (const line of place.rows) characters += line.content.length;
+      const lines =
+        place.rows.length <= MAX_HIGHLIGHT_LINES &&
+        characters <= MAX_HIGHLIGHT_CHARACTERS
+          ? highlightLines(
+              file.language,
+              place.rows.map((line) => line.content),
+            )
+          : null;
+      cached = { length: place.rows.length, lines };
+      contextHighlights.set(place.start, cached);
+    }
+    return cached.lines?.[place.index];
+  };
+}
+
 function DiffWorkspace({
   bridge,
   review,
@@ -624,6 +1399,8 @@ function DiffWorkspace({
   viewed,
   reloadToken,
   anchors,
+  reloadExpired,
+  fileTools,
 }: {
   readonly bridge: DesktopBridge;
   readonly review: string;
@@ -636,6 +1413,10 @@ function DiffWorkspace({
   /** Bumped by the toolbar's Refresh, so the published threads are reread too. */
   readonly reloadToken: number;
   readonly anchors: InlineAnchorStore;
+  /** Reads the diff again, as Refresh does, after the sidecar dropped it. */
+  readonly reloadExpired: () => void;
+  /** The toolbar slot that holds the selected file's Full file toggle. */
+  readonly fileTools: HTMLElement | null;
 }): ReactNode {
   const selection = useSyncExternalStore(anchors.subscribe, anchors.current);
   const selectAnchor = anchors.select;
@@ -645,6 +1426,34 @@ function DiffWorkspace({
   const slices = useMemo(() => fileSlices(loaded.rows), [loaded.rows]);
   const [selected, setSelected] = useState(files[0]?.file_index ?? 0);
   const [target, setTarget] = useState(0);
+  // Unchanged lines and local generations belong to the open snapshot, so a
+  // new snapshot starts a new store and the old one stops its reads.
+  const [, setContextVersion] = useState(0);
+  const contextStore = useMemo(
+    () =>
+      new DiffContextStore(
+        bridge,
+        review,
+        loaded.snapshotId,
+        loaded.revision,
+        () => setContextVersion((value) => value + 1),
+        reloadExpired,
+      ),
+    [bridge, review, loaded.snapshotId],
+  );
+  useEffect(() => {
+    contextStore.open();
+    return () => contextStore.close();
+  }, [contextStore]);
+  const generatedRows = (fileIndex: number): readonly DiffWireRow[] | null => {
+    const generation = contextStore.file(fileIndex).generation;
+    return generation?.state === "done" ? generation.rows : null;
+  };
+  // A generated file reads its own rows in place of the forge's.
+  const sliceFor = (fileIndex: number): FileSlice => {
+    const rows = generatedRows(fileIndex);
+    return rows === null ? sliceOf(slices, fileIndex) : generatedSlice(rows);
+  };
   const [composerAnchor, setComposerAnchor] =
     useState<InlineAnchorSelection | null>(null);
   const [editingEntry, setEditingEntry] = useState<PendingDraftEntry | null>(
@@ -729,15 +1538,73 @@ function DiffWorkspace({
     setSelected(matchingFile.file_index);
     if (rowIndex >= 0) setTarget(rowIndex);
   }, [files, loaded, review, selectAnchor, selection, slices, viewed.files]);
+  const forgeFile = files.find((file) => file.file_index === selected) ?? null;
+  const selectedSlice = sliceFor(selected);
+  const fileContext = contextStore.file(selected);
+  const selectedGenerated = fileContext.generation?.state === "done";
+  // A generated file's header is the generated file row.
   const selectedFile =
-    files.find((file) => file.file_index === selected) ?? null;
+    selectedGenerated && selectedSlice.rows[0]?.kind === "file"
+      ? selectedSlice.rows[0]
+      : forgeFile;
   const selectedViewed =
     selectedFile !== null && viewed.files.has(viewedFileKey(selectedFile));
   // A viewed file collapses to its header row.
   const visible = useMemo(() => {
-    const rows = sliceOf(slices, selected).rows;
-    return selectedViewed ? rows.filter((row) => row.kind === "file") : rows;
-  }, [selected, selectedViewed, slices]);
+    const rows = selectedSlice.rows;
+    return selectedViewed
+      ? rows.filter((row) => row.kind === "file")
+      : expandFileRows(rows, fileContext);
+  }, [fileContext, selectedSlice, selectedViewed]);
+  // The target is a row of the file's slice; expanded lines shift where it is
+  // drawn, never which row it is.
+  const visibleTarget = useMemo(() => {
+    const row = selectedSlice.rows[target];
+    const at = row === undefined ? -1 : visible.indexOf(row);
+    return at < 0 ? 0 : at;
+  }, [selectedSlice, target, visible]);
+  // Full file belongs to the file it was turned on for: leaving the file turns
+  // it off and brings back the gaps shown before.
+  const fullFileOf = useRef(selected);
+  useEffect(() => {
+    if (fullFileOf.current === selected) return;
+    contextStore.leaveFull(fullFileOf.current);
+    fullFileOf.current = selected;
+  }, [contextStore, selected]);
+  // A generated diff replaces the rows a selection or a composer stood on.
+  useEffect(() => {
+    if (!selectedGenerated) return;
+    if (anchors.current()?.fileIndex === selected) anchors.select(null);
+    setComposerAnchor((anchor) =>
+      anchor !== null && anchor.fileIndex === selected ? null : anchor,
+    );
+  }, [anchors, selected, selectedGenerated]);
+  const gapRows = useMemo(
+    () =>
+      selectedSlice.rows.filter((row): row is DiffGapRow => row.kind === "gap"),
+    [selectedSlice],
+  );
+  const sourceRowCount = useMemo(
+    () =>
+      selectedSlice.rows.filter(
+        (row) => row.kind === "line" || row.kind === "split",
+      ).length,
+    [selectedSlice],
+  );
+  const fullRefusal =
+    selectedFile === null
+      ? "Select a file to show it in full."
+      : selectedViewed
+        ? "Clear Viewed to show this file."
+        : fullFileRefusal(selectedFile, selectedSlice.rows, selectedGenerated);
+  const extras: RowExtras = {
+    expandGap: (gap) => void contextStore.expand(gap),
+    loadingGaps: fileContext.loading,
+    refuse: (message) => contextStore.notify(selected, message),
+    readOnly: selectedGenerated,
+    generation: fileContext.generation,
+    generate: (file) => void contextStore.generate(file),
+  };
   // The entry the composer is editing is re-read from the controller on every
   // render, so a save that rewrote the pending list cannot leave the composer
   // holding a body the store no longer has.
@@ -994,7 +1861,7 @@ function DiffWorkspace({
           <FileNavigation
             key={file.file_index}
             file={file}
-            slice={sliceOf(slices, file.file_index)}
+            slice={sliceFor(file.file_index)}
             active={selected === file.file_index}
             viewed={viewed.files.has(viewedFileKey(file))}
             select={selectFile}
@@ -1031,13 +1898,23 @@ function DiffWorkspace({
             </button>
           </Notice>
         )}
+        {forgeFile !== null && !selectedViewed && (
+          <FileNotices
+            file={forgeFile}
+            context={fileContext}
+            cancel={() => contextStore.cancelGeneration(forgeFile.file_index)}
+            dismiss={() => contextStore.notify(forgeFile.file_index, null)}
+          />
+        )}
         <DiffRowsWindow
           review={review}
           loaded={loaded}
           items={visible}
           pageSize={200}
-          targetIndex={target}
+          targetIndex={visibleTarget}
+          targetKey={`${selected}:${target}`}
           file={selectedFile}
+          extras={extras}
           selection={selection}
           selectAnchor={selectAnchor}
           inline={inline}
@@ -1048,7 +1925,111 @@ function DiffWorkspace({
           markViewed={markViewed}
         />
       </section>
+      {fileTools !== null &&
+        createPortal(
+          <FullFileToggle
+            on={fileContext.full !== null}
+            busy={fileContext.fullLoading}
+            refusal={fullRefusal}
+            toggle={() =>
+              void contextStore.toggleFull(selected, gapRows, sourceRowCount)
+            }
+          />,
+          fileTools,
+        )}
     </div>
+  );
+}
+
+/**
+ * The toolbar's Full file toggle for the selected file. It is disabled, with
+ * the reason as its tooltip, on a file whose unchanged lines cannot be shown.
+ */
+function FullFileToggle({
+  on,
+  busy,
+  refusal,
+  toggle,
+}: {
+  readonly on: boolean;
+  readonly busy: boolean;
+  readonly refusal: string | null;
+  readonly toggle: () => void;
+}): ReactNode {
+  const disabled = refusal !== null && !on;
+  return (
+    <button
+      className={`button ${on ? "button-active" : "button-secondary"} full-file-toggle`}
+      aria-pressed={on}
+      aria-busy={busy}
+      disabled={disabled}
+      title={
+        disabled
+          ? refusal
+          : on
+            ? "Show only the changed lines and the gaps you expanded"
+            : "Show every line of this file"
+      }
+      onClick={toggle}
+    >
+      {busy ? "Full file…" : "Full file"}
+    </button>
+  );
+}
+
+/**
+ * The notices above a file's rows: the truncation notice of a file the forge
+ * did not send whole, with the progress and Cancel of its local generation,
+ * and the last refusal or failure for the file's unchanged lines.
+ */
+function FileNotices({
+  file,
+  context,
+  cancel,
+  dismiss,
+}: {
+  /** The file as the forge sent it. */
+  readonly file: DiffFileRow;
+  readonly context: FileContextView;
+  readonly cancel: () => void;
+  readonly dismiss: () => void;
+}): ReactNode {
+  const generation = context.generation;
+  return (
+    <>
+      {file.is_truncated &&
+        (generation?.state === "done" ? (
+          <Notice kind="generated">{GENERATED_COMMENT_MESSAGE}</Notice>
+        ) : generation?.state === "running" ? (
+          <Notice kind="loading">
+            <span>{generation.notice}</span>
+            <button
+              className="button button-secondary notice-action"
+              onClick={cancel}
+            >
+              Cancel
+            </button>
+          </Notice>
+        ) : (
+          <Notice kind="warning">
+            <span>{TRUNCATED_NOTICE}</span>
+            {generation?.state === "failed" && (
+              <span className="generation-failure"> {generation.message}</span>
+            )}
+          </Notice>
+        ))}
+      {context.message !== null && (
+        <Notice kind="warning">
+          <span>{context.message}</span>
+          <button
+            className="button button-secondary notice-action"
+            onClick={dismiss}
+          >
+            Dismiss
+          </button>
+        </Notice>
+      )}
+    </>
   );
 }
 
@@ -1058,7 +2039,9 @@ function DiffRowsWindow({
   items,
   pageSize,
   targetIndex,
+  targetKey,
   file,
+  extras,
   selection,
   selectAnchor,
   inline,
@@ -1070,10 +2053,17 @@ function DiffRowsWindow({
 }: {
   readonly review: string;
   readonly loaded: LoadedDiff;
-  readonly items: readonly DiffRow[];
+  readonly items: readonly DiffViewRow[];
   readonly pageSize: number;
   readonly targetIndex: number;
+  /**
+   * Names the row the reader asked for. The window moves to the target only
+   * when this changes, so expanding a gap leaves the window where it is even
+   * though the rows below it move down.
+   */
+  readonly targetKey: string;
   readonly file: DiffFileRow | null;
+  readonly extras: RowExtras;
   readonly selection: InlineAnchorSelection | null;
   readonly selectAnchor: (selection: InlineAnchorSelection | null) => void;
   readonly inline: InlineComposerSlot;
@@ -1089,11 +2079,28 @@ function DiffRowsWindow({
   );
   useEffect(
     () => setStart(Math.max(0, Math.floor(targetIndex / pageSize) * pageSize)),
-    [pageSize, targetIndex],
+    // The target index is read when the target changes, not when expanded
+    // lines move it.
+    [pageSize, targetKey],
   );
   // Highlighted once per file and remembered, so paging through the rows or
-  // selecting a line does not highlight the file again.
-  const syntax = useMemo(() => highlightFile(file, items), [file, items]);
+  // selecting a line does not highlight the file again. Expanded lines are
+  // coloured separately, so expanding a gap does not highlight the hunks again.
+  const sourceItems = useMemo(
+    () =>
+      items.filter(
+        (row): row is DiffRow => row.kind !== "gap" && row.kind !== "context",
+      ),
+    [items],
+  );
+  const syntax = useMemo(
+    () => highlightFile(file, sourceItems),
+    [file, sourceItems],
+  );
+  const contextSyntax = useMemo(
+    () => contextSyntaxOf(file, items),
+    [file, items],
+  );
   const boundedStart = Math.min(start, Math.max(0, items.length - 1));
   const end = Math.min(items.length, boundedStart + pageSize);
   const windowed = items.slice(boundedStart, end);
@@ -1102,7 +2109,7 @@ function DiffRowsWindow({
   // with its index in the file, which keys it.
   const header =
     boundedStart > 0 && items[0]?.kind === "file" ? items[0] : null;
-  const painted: readonly (readonly [DiffRow, number])[] = [
+  const painted: readonly (readonly [DiffViewRow, number])[] = [
     ...(header === null ? [] : [[header, 0] as const]),
     ...windowed.map((row, offset) => [row, boundedStart + offset] as const),
   ];
@@ -1140,6 +2147,8 @@ function DiffRowsWindow({
                     explains={explains}
                     threads={threads}
                     syntax={syntax}
+                    contextSyntax={contextSyntax}
+                    extras={extras}
                     viewed={viewed}
                     markViewed={markViewed}
                   />
@@ -1165,6 +2174,8 @@ function DiffRowsWindow({
               explains={explains}
               threads={threads}
               syntax={syntax}
+              contextSyntax={contextSyntax}
+              extras={extras}
               viewed={viewed}
               markViewed={markViewed}
             />
@@ -1203,7 +2214,7 @@ function DiffRowsWindow({
 
 /** One file's rows in diff order, and the hunk rows among them. */
 interface FileSlice {
-  readonly rows: readonly DiffRow[];
+  readonly rows: readonly DiffWireRow[];
   readonly hunks: readonly DiffHunkRow[];
 }
 
@@ -1215,8 +2226,10 @@ const EMPTY_SLICE: FileSlice = Object.freeze({
 });
 
 /** Groups the loaded rows by file in one pass, keeping their order. */
-function fileSlices(rows: readonly DiffRow[]): ReadonlyMap<number, FileSlice> {
-  const slices = new Map<number, { rows: DiffRow[]; hunks: DiffHunkRow[] }>();
+function fileSlices(
+  rows: readonly DiffWireRow[],
+): ReadonlyMap<number, FileSlice> {
+  const slices = new Map<number, { rows: DiffWireRow[]; hunks: DiffHunkRow[] }>();
   for (const row of rows) {
     let slice = slices.get(row.file_index);
     if (!slice) {
@@ -1289,12 +2302,14 @@ function DiffRowView({
   explains,
   threads,
   syntax,
+  contextSyntax,
+  extras,
   viewed,
   markViewed,
 }: {
   readonly review: string;
   readonly loaded: LoadedDiff;
-  readonly row: DiffRow;
+  readonly row: DiffViewRow;
   readonly file: DiffFileRow | null;
   readonly selection: InlineAnchorSelection | null;
   readonly selectAnchor: (selection: InlineAnchorSelection | null) => void;
@@ -1304,6 +2319,8 @@ function DiffRowView({
   readonly explains: string | null;
   readonly threads: DiscussionThreadSlot;
   readonly syntax: FileSyntax | null;
+  readonly contextSyntax: (row: DiffContextRow) => SyntaxLine | undefined;
+  readonly extras: RowExtras;
   readonly viewed: boolean;
   readonly markViewed: MarkViewed;
 }): ReactNode {
@@ -1317,7 +2334,7 @@ function DiffRowView({
         <strong className="file-path">{path}</strong>
         <span className="file-status">{row.status}</span>
         <FileMode file={row} />
-        <FileBadges file={row} />
+        <FileBadges file={row} extras={extras} controls />
         <PendingFileCount pending={pending} file={row} />
         <ThreadFileCount threads={threads} file={row} />
         <ViewedToggle file={row} viewed={viewed} markViewed={markViewed} />
@@ -1331,7 +2348,28 @@ function DiffRowView({
       </div>
     );
   if (row.kind === "split") return null;
-  const selectable = row.line_type !== "no_newline" && file !== null;
+  if (row.kind === "gap") return <GapRowView row={row} extras={extras} />;
+  if (row.kind === "context")
+    return (
+      <div
+        className="diff-line line-context line-expanded"
+        role="listitem"
+        data-expanded="true"
+      >
+        <span className="line-number">{row.old_line}</span>
+        <span className="line-number">{row.new_line}</span>
+        <ExpandedLineBody
+          row={row}
+          line={row.new_line}
+          side="new"
+          syntax={contextSyntax(row)}
+          refuse={extras.refuse}
+        />
+      </div>
+    );
+  // A diff generated locally has no forge diff to anchor a comment to.
+  const selectable =
+    row.line_type !== "no_newline" && file !== null && !extras.readOnly;
   const defaultSide =
     row.line_type === "deletion"
       ? "old"
@@ -1649,7 +2687,7 @@ function firstRenderedPendingEntry(
   pending: readonly PendingDraftEntry[],
   loaded: LoadedDiff,
   file: DiffFileRow | null,
-  windowed: readonly DiffRow[],
+  windowed: readonly DiffViewRow[],
   editing: PendingDraftEntry | null,
 ): string | null {
   if (!file || pending.length === 0) return null;
@@ -1846,12 +2884,14 @@ function SplitPaneRow({
   explains,
   threads,
   syntax,
+  contextSyntax,
+  extras,
   viewed,
   markViewed,
 }: {
   readonly review: string;
   readonly loaded: LoadedDiff;
-  readonly row: DiffRow;
+  readonly row: DiffViewRow;
   readonly file: DiffFileRow | null;
   readonly side: "old" | "new";
   readonly selection: InlineAnchorSelection | null;
@@ -1862,6 +2902,8 @@ function SplitPaneRow({
   readonly explains: string | null;
   readonly threads: DiscussionThreadSlot;
   readonly syntax: FileSyntax | null;
+  readonly contextSyntax: (row: DiffContextRow) => SyntaxLine | undefined;
+  readonly extras: RowExtras;
   readonly viewed: boolean;
   readonly markViewed: MarkViewed;
 }): ReactNode {
@@ -1873,7 +2915,8 @@ function SplitPaneRow({
         </strong>
         <span className="file-status">{row.status}</span>
         <FileMode file={row} />
-        <FileBadges file={row} />
+        {/* The new side's header carries the Generate diff locally button. */}
+        <FileBadges file={row} extras={extras} controls={side === "new"} />
         {side === "new" && <PendingFileCount pending={pending} file={row} />}
         {side === "new" && <ThreadFileCount threads={threads} file={row} />}
         {/* One control per file: the new side's header carries it, as it
@@ -1889,6 +2932,29 @@ function SplitPaneRow({
         {row.header}
       </div>
     );
+  // A gap spans both panes, so each pane draws it and either one expands it.
+  if (row.kind === "gap") return <GapRowView row={row} extras={extras} split />;
+  if (row.kind === "context") {
+    const line = side === "old" ? row.old_line : row.new_line;
+    return (
+      <div
+        className={`split-cell split-${side} line-context line-expanded`}
+        role="listitem"
+        data-expanded="true"
+        data-old-line={row.old_line}
+        data-new-line={row.new_line}
+      >
+        <span className="line-number">{line}</span>
+        <ExpandedLineBody
+          row={row}
+          line={line}
+          side={side}
+          syntax={contextSyntax(row)}
+          refuse={extras.refuse}
+        />
+      </div>
+    );
+  }
   if (row.kind !== "split") return null;
   const composerOpen =
     inline.anchor !== null &&
@@ -1924,6 +2990,7 @@ function SplitPaneRow({
         inline={inline}
         drag={drag}
         syntax={syntax}
+        readOnly={extras.readOnly}
       />
       {composerOpen &&
         inline.anchor &&
@@ -2024,14 +3091,131 @@ function FileMode({ file }: { readonly file: DiffFileRow }): ReactNode {
   return change ? <span className="file-status file-mode">{change}</span> : null;
 }
 
-function FileBadges({ file }: { readonly file: DiffFileRow }): ReactNode {
-  return FILE_BADGES.map(
-    ([matches, label, hint]) =>
-      matches(file) && (
-        <span key={label} className="badge" title={hint}>
-          {label}
+/**
+ * The file's badges. A generated file says so. In the header that carries the
+ * file's controls, a truncated file's badge is the Generate diff locally
+ * button instead.
+ */
+function FileBadges({
+  file,
+  extras,
+  controls,
+}: {
+  readonly file: DiffFileRow;
+  readonly extras: RowExtras;
+  readonly controls: boolean;
+}): ReactNode {
+  const generation = extras.generation;
+  return (
+    <>
+      {FILE_BADGES.map(([matches, label, hint]) =>
+        !matches(file) ? null : label === "Truncated" && controls ? (
+          <button
+            key={label}
+            className="button button-secondary file-generate"
+            title={TRUNCATED_NOTICE}
+            disabled={generation?.state === "running"}
+            onClick={() => extras.generate(file)}
+          >
+            Generate diff locally
+          </button>
+        ) : (
+          <span key={label} className="badge" title={hint}>
+            {label}
+          </span>
+        ),
+      )}
+      {generation?.state === "done" && (
+        <span className="badge" title={GENERATED_COMMENT_MESSAGE}>
+          {GENERATED_LABEL}
         </span>
-      ),
+      )}
+    </>
+  );
+}
+
+/** A collapsed gap: activating it reads and shows its unchanged lines. */
+function GapRowView({
+  row,
+  extras,
+  split = false,
+}: {
+  readonly row: DiffGapRow;
+  readonly extras: RowExtras;
+  readonly split?: boolean;
+}): ReactNode {
+  const loading = extras.loadingGaps.has(row.gap_index);
+  const expand = (): void => extras.expandGap(row);
+  return (
+    <div
+      className={`diff-hunk diff-gap${split ? " split-metadata" : ""}`}
+      role="listitem"
+      data-gap-index={row.gap_index}
+      data-gap-position={row.position}
+    >
+      <button
+        className="button button-quiet diff-gap-button"
+        aria-busy={loading}
+        aria-label={
+          row.count === null
+            ? "Expand the lines below"
+            : `Expand ${gapLabel(row.count)}`
+        }
+        onClick={expand}
+        onKeyDown={(event) => activateOnKeyboard(event, expand)}
+      >
+        {loading ? "Loading…" : gapLabel(row.count)}
+      </button>
+    </div>
+  );
+}
+
+/**
+ * The gutter and code of an expanded line. It is never a comment anchor: the
+ * gutter button and `c` explain that instead of opening a composer.
+ */
+function ExpandedLineBody({
+  row,
+  line,
+  side,
+  syntax,
+  refuse,
+}: {
+  readonly row: DiffContextRow;
+  readonly line: number;
+  readonly side: "old" | "new";
+  readonly syntax: SyntaxLine | undefined;
+  readonly refuse: (message: string) => void;
+}): ReactNode {
+  return (
+    <>
+      <button
+        className="gutter-comment gutter-comment-readonly"
+        aria-label={`Comment on ${side} line ${line}`}
+        title={EXPANDED_READ_ONLY_MESSAGE}
+        onClick={() => refuse(EXPANDED_READ_ONLY_MESSAGE)}
+        onKeyDown={(event) => {
+          if (event.key !== "Enter" && event.key !== " ") return;
+          if (event.ctrlKey || event.metaKey || event.altKey) return;
+          event.preventDefault();
+          refuse(EXPANDED_READ_ONLY_MESSAGE);
+        }}
+      >
+        +
+      </button>
+      <code
+        className="line-content"
+        tabIndex={0}
+        onKeyDown={(event) => {
+          if (!isCommentKey(event)) return;
+          event.preventDefault();
+          refuse(EXPANDED_READ_ONLY_MESSAGE);
+        }}
+      >
+        {marker(row.kind)}
+        <SyntaxContent line={syntax} text={row.content} />
+      </code>
+    </>
   );
 }
 
@@ -2047,6 +3231,7 @@ function SplitCell({
   inline,
   drag,
   syntax,
+  readOnly,
 }: {
   readonly review: string;
   readonly loaded: LoadedDiff;
@@ -2059,10 +3244,12 @@ function SplitCell({
   readonly inline: InlineComposerSlot;
   readonly drag: LineRangeDrag;
   readonly syntax: FileSyntax | null;
+  /** True for a diff generated locally, whose cells are never anchors. */
+  readonly readOnly: boolean;
 }): ReactNode {
   const cellNode = useRef<HTMLDivElement | null>(null);
   const selectable =
-    cell?.anchor_side !== null && cell !== null && file !== null;
+    cell?.anchor_side !== null && cell !== null && file !== null && !readOnly;
   const selected =
     selectable &&
     selection !== null &&
@@ -2915,7 +4102,10 @@ function marker(type: string): string {
         ? "\\ "
         : " ";
 }
-function sameRevision(left: DiffPage, right: DiffPage): boolean {
+function sameRevision(
+  left: DiffPage<DiffWireRow>,
+  right: DiffPage<DiffWireRow>,
+): boolean {
   return sameRevisionValue(left.revision, right.revision);
 }
 function sameRevisionValue(
