@@ -2,6 +2,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -909,23 +910,26 @@ function DiffWorkspace({
     // stands down for is offered there.
     { standDown: reviewDrawerIsOpen },
   );
-  // The changed-file list gets one handler for the life of the workspace, so a
-  // memoised entry re-renders only when its own file, slice or active state
-  // changes. The handler reads the current file and the anchor setter through
-  // refs instead of closing over one render's values.
+  // The changed-file list gets one handler per store, so a memoised entry
+  // re-renders only when its own file, slice or active state changes. The
+  // handler reads the current file through a ref, synced after each commit,
+  // instead of closing over one render's value; the store's setter is stable.
   const selectedRef = useRef(selected);
-  selectedRef.current = selected;
-  const selectAnchorRef = useRef(selectAnchor);
-  selectAnchorRef.current = selectAnchor;
-  const selectFile = useCallback((fileIndex: number, rowIndex: number) => {
-    const moved = fileIndex !== selectedRef.current;
-    setSelected(fileIndex);
-    setTarget(rowIndex);
-    if (moved) {
-      setComposerAnchor(null);
-      selectAnchorRef.current(null);
-    }
-  }, []);
+  useLayoutEffect(() => {
+    selectedRef.current = selected;
+  }, [selected]);
+  const selectFile = useCallback(
+    (fileIndex: number, rowIndex: number) => {
+      const moved = fileIndex !== selectedRef.current;
+      setSelected(fileIndex);
+      setTarget(rowIndex);
+      if (moved) {
+        setComposerAnchor(null);
+        anchors.select(null);
+      }
+    },
+    [anchors],
+  );
   const moveFocus = (event: KeyboardEvent<HTMLElement>): void => {
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
     const buttons = [
