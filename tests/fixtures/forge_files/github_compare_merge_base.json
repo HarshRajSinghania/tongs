@@ -1,0 +1,440 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "github",
+    "question": "4: merge base through /compare/{base}...{head}",
+    "source": "nodejs/node PR 66601 (open, head on a contributor fork, 1528 files, 12 commits, base branch 3 commits ahead of the merge base)",
+    "finding": "merge_base_commit.sha is present in every shape. Without paging params the body was 1,139,170 bytes (300 files, 12 commits, 0.96 s); per_page=1 alone still carries all 300 files (1,092,281 bytes, 0.52 s); per_page=1&page=2 drops 'files' entirely and returns at most one commit (15,238 bytes, 0.36 s). merge_base_commit.sha differs from the pull's base.sha, which is the branch tip.",
+    "pull_base_sha": "f9defa61fa95bcce4fa2e04b1204ca703d6604a2",
+    "measurements": [
+      {
+        "params": {},
+        "body_bytes": 1139170,
+        "elapsed_s": 0.96,
+        "files": 300,
+        "commits": 12
+      },
+      {
+        "params": {
+          "per_page": "1"
+        },
+        "body_bytes": 1092281,
+        "elapsed_s": 0.52,
+        "files": 300,
+        "commits": 1
+      },
+      {
+        "params": {
+          "per_page": "1",
+          "page": "2"
+        },
+        "body_bytes": 15238,
+        "elapsed_s": 0.36,
+        "files": "absent",
+        "commits": 1
+      }
+    ]
+  },
+  "exchanges": [
+    {
+      "case": "diverged_paged",
+      "request": {
+        "method": "GET",
+        "path": "/repos/nodejs/node/compare/f9defa61fa95bcce4fa2e04b1204ca703d6604a2...91c0ea6197a51df254ea569d4b5cf700526a9ee5",
+        "params": {
+          "per_page": "1",
+          "page": "2"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "Etag": "W/\"65575c1a9aae6f39b281dacae5064c8202e3c4e69ba66ffd512f6d2ab655f019\"",
+          "Link": "<https://api.github.com/repositories/27193779/compare/f9defa61fa95bcce4fa2e04b1204ca703d6604a2...91c0ea6197a51df254ea569d4b5cf700526a9ee5?per_page=1&page=12>; rel=\"last\", <https://api.github.com/repositories/27193779/compare/f9defa61fa95bcce4fa2e04b1204ca703d6604a2...91c0ea6197a51df254ea569d4b5cf700526a9ee5?per_page=1&page=3>; rel=\"next\", <https://api.github.com/repositories/27193779/compare/f9defa61fa95bcce4fa2e04b1204ca703d6604a2...91c0ea6197a51df254ea569d4b5cf700526a9ee5?per_page=1&page=1>; rel=\"first\", <https://api.github.com/repositories/27193779/compare/f9defa61fa95bcce4fa2e04b1204ca703d6604a2...91c0ea6197a51df254ea569d4b5cf700526a9ee5?per_page=1&page=1>; rel=\"prev\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4948",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "52"
+        },
+        "body_bytes": 15238,
+        "body_json": {
+          "url": "https://api.github.com/repos/nodejs/node/compare/f9defa61fa95bcce4fa2e04b1204ca703d6604a2...91c0ea6197a51df254ea569d4b5cf700526a9ee5",
+          "html_url": "https://github.com/nodejs/node/compare/f9defa61fa95bcce4fa2e04b1204ca703d6604a2...91c0ea6197a51df254ea569d4b5cf700526a9ee5",
+          "permalink_url": "https://github.com/nodejs/node/compare/nodejs:f9defa6...nodejs:91c0ea6",
+          "diff_url": "https://github.com/nodejs/node/compare/f9defa61fa95bcce4fa2e04b1204ca703d6604a2...91c0ea6197a51df254ea569d4b5cf700526a9ee5.diff",
+          "patch_url": "https://github.com/nodejs/node/compare/f9defa61fa95bcce4fa2e04b1204ca703d6604a2...91c0ea6197a51df254ea569d4b5cf700526a9ee5.patch",
+          "base_commit": {
+            "sha": "f9defa61fa95bcce4fa2e04b1204ca703d6604a2",
+            "node_id": "C_kwDOAZ7xs9oAKGY5ZGVmYTYxZmE5NWJjY2U0ZmEyZTA0YjEyMDRjYTcwM2Q2NjA0YTI",
+            "commit": {
+              "author": {
+                "name": "Example Author",
+                "email": "author@example.com",
+                "date": "2026-10-08T09:58:29Z"
+              },
+              "committer": {
+                "name": "Example Author",
+                "email": "author@example.com",
+                "date": "2026-10-08T09:58:29Z"
+              },
+              "message": "Example commit message",
+              "tree": {
+                "sha": "6d32b39b0c2dd36c7bee24f35ae7a8208c973271",
+                "url": "https://api.github.com/repos/nodejs/node/git/trees/6d32b39b0c2dd36c7bee24f35ae7a8208c973271"
+              },
+              "url": "https://api.github.com/repos/nodejs/node/git/commits/f9defa61fa95bcce4fa2e04b1204ca703d6604a2",
+              "comment_count": 0,
+              "verification": {
+                "verified": false,
+                "reason": "unsigned",
+                "signature": null,
+                "payload": null,
+                "verified_at": null
+              }
+            },
+            "url": "https://api.github.com/repos/nodejs/node/commits/f9defa61fa95bcce4fa2e04b1204ca703d6604a2",
+            "html_url": "https://github.com/nodejs/node/commit/f9defa61fa95bcce4fa2e04b1204ca703d6604a2",
+            "comments_url": "https://api.github.com/repos/nodejs/node/commits/f9defa61fa95bcce4fa2e04b1204ca703d6604a2/comments",
+            "author": {
+              "login": "example-user",
+              "id": 1,
+              "type": "User",
+              "site_admin": false
+            },
+            "committer": {
+              "login": "example-user",
+              "id": 1,
+              "type": "User",
+              "site_admin": false
+            },
+            "parents": [
+              {
+                "sha": "6d5e30987117e072bb4638c0535946464a314b7e",
+                "url": "https://api.github.com/repos/nodejs/node/commits/6d5e30987117e072bb4638c0535946464a314b7e",
+                "html_url": "https://github.com/nodejs/node/commit/6d5e30987117e072bb4638c0535946464a314b7e"
+              }
+            ]
+          },
+          "merge_base_commit": {
+            "sha": "7514ef8caff3feea55c60d628e003ccbda850485",
+            "node_id": "C_kwDOAZ7xs9oAKDc1MTRlZjhjYWZmM2ZlZWE1NWM2MGQ2MjhlMDAzY2NiZGE4NTA0ODU",
+            "commit": {
+              "author": {
+                "name": "Example Author",
+                "email": "author@example.com",
+                "date": "2026-10-05T13:38:59Z"
+              },
+              "committer": {
+                "name": "Example Author",
+                "email": "author@example.com",
+                "date": "2026-10-07T20:08:46Z"
+              },
+              "message": "Example commit message",
+              "tree": {
+                "sha": "05971ec4abb32a15e6a39c58443494501a4f9a8b",
+                "url": "https://api.github.com/repos/nodejs/node/git/trees/05971ec4abb32a15e6a39c58443494501a4f9a8b"
+              },
+              "url": "https://api.github.com/repos/nodejs/node/git/commits/7514ef8caff3feea55c60d628e003ccbda850485",
+              "comment_count": 0,
+              "verification": {
+                "verified": false,
+                "reason": "unsigned",
+                "signature": null,
+                "payload": null,
+                "verified_at": null
+              }
+            },
+            "url": "https://api.github.com/repos/nodejs/node/commits/7514ef8caff3feea55c60d628e003ccbda850485",
+            "html_url": "https://github.com/nodejs/node/commit/7514ef8caff3feea55c60d628e003ccbda850485",
+            "comments_url": "https://api.github.com/repos/nodejs/node/commits/7514ef8caff3feea55c60d628e003ccbda850485/comments",
+            "author": {
+              "login": "example-user",
+              "id": 1,
+              "type": "User",
+              "site_admin": false
+            },
+            "committer": {
+              "login": "example-user",
+              "id": 1,
+              "type": "User",
+              "site_admin": false
+            },
+            "parents": [
+              {
+                "sha": "c3189d436e14202a764d59aa35526ef9c44d9f6b",
+                "url": "https://api.github.com/repos/nodejs/node/commits/c3189d436e14202a764d59aa35526ef9c44d9f6b",
+                "html_url": "https://github.com/nodejs/node/commit/c3189d436e14202a764d59aa35526ef9c44d9f6b"
+              }
+            ]
+          },
+          "status": "diverged",
+          "ahead_by": 12,
+          "behind_by": 3,
+          "total_commits": 12,
+          "commits": [
+            {
+              "sha": "9e63eb537651f980b00dd7a32289f405b71fa8ee",
+              "node_id": "C_kwDOAZ7xs9oAKDllNjNlYjUzNzY1MWY5ODBiMDBkZDdhMzIyODlmNDA1YjcxZmE4ZWU",
+              "commit": {
+                "author": {
+                  "name": "Example Author",
+                  "email": "author@example.com",
+                  "date": "2026-10-07T16:00:45Z"
+                },
+                "committer": {
+                  "name": "Example Author",
+                  "email": "author@example.com",
+                  "date": "2026-10-07T21:52:33Z"
+                },
+                "message": "Example commit message",
+                "tree": {
+                  "sha": "4484859d7210deaa94bfff1ecf6c131c99260707",
+                  "url": "https://api.github.com/repos/nodejs/node/git/trees/4484859d7210deaa94bfff1ecf6c131c99260707"
+                },
+                "url": "https://api.github.com/repos/nodejs/node/git/commits/9e63eb537651f980b00dd7a32289f405b71fa8ee",
+                "comment_count": 0,
+                "verification": {
+                  "verified": false,
+                  "reason": "unsigned",
+                  "signature": null,
+                  "payload": null,
+                  "verified_at": null
+                }
+              },
+              "url": "https://api.github.com/repos/nodejs/node/commits/9e63eb537651f980b00dd7a32289f405b71fa8ee",
+              "html_url": "https://github.com/nodejs/node/commit/9e63eb537651f980b00dd7a32289f405b71fa8ee",
+              "comments_url": "https://api.github.com/repos/nodejs/node/commits/9e63eb537651f980b00dd7a32289f405b71fa8ee/comments",
+              "author": {
+                "login": "example-user",
+                "id": 1,
+                "type": "User",
+                "site_admin": false
+              },
+              "committer": {
+                "login": "example-user",
+                "id": 1,
+                "type": "User",
+                "site_admin": false
+              },
+              "parents": [
+                {
+                  "sha": "bde1a82edd512a4e8a03a9948409f3260555b4ac",
+                  "url": "https://api.github.com/repos/nodejs/node/commits/bde1a82edd512a4e8a03a9948409f3260555b4ac",
+                  "html_url": "https://github.com/nodejs/node/commit/bde1a82edd512a4e8a03a9948409f3260555b4ac"
+                }
+              ]
+            }
+          ]
+        },
+        "body_trimmed": true
+      }
+    },
+    {
+      "case": "first_page_has_files",
+      "request": {
+        "method": "GET",
+        "path": "/repos/nodejs/node/compare/f9defa61fa95bcce4fa2e04b1204ca703d6604a2...91c0ea6197a51df254ea569d4b5cf700526a9ee5",
+        "params": {
+          "per_page": "1"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "Etag": "W/\"ae57645dd131e7ceb05584b68f65f681416a369efcb0e87e9133a5a0756f59f3\"",
+          "Link": "<https://api.github.com/repositories/27193779/compare/f9defa61fa95bcce4fa2e04b1204ca703d6604a2...91c0ea6197a51df254ea569d4b5cf700526a9ee5?per_page=1&page=12>; rel=\"last\", <https://api.github.com/repositories/27193779/compare/f9defa61fa95bcce4fa2e04b1204ca703d6604a2...91c0ea6197a51df254ea569d4b5cf700526a9ee5?per_page=1&page=2>; rel=\"next\", <https://api.github.com/repositories/27193779/compare/f9defa61fa95bcce4fa2e04b1204ca703d6604a2...91c0ea6197a51df254ea569d4b5cf700526a9ee5?per_page=1&page=1>; rel=\"first\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4949",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "51"
+        },
+        "body_bytes": 1092281,
+        "body_json": {
+          "url": "https://api.github.com/repos/nodejs/node/compare/f9defa61fa95bcce4fa2e04b1204ca703d6604a2...91c0ea6197a51df254ea569d4b5cf700526a9ee5",
+          "html_url": "https://github.com/nodejs/node/compare/f9defa61fa95bcce4fa2e04b1204ca703d6604a2...91c0ea6197a51df254ea569d4b5cf700526a9ee5",
+          "permalink_url": "https://github.com/nodejs/node/compare/nodejs:f9defa6...nodejs:91c0ea6",
+          "diff_url": "https://github.com/nodejs/node/compare/f9defa61fa95bcce4fa2e04b1204ca703d6604a2...91c0ea6197a51df254ea569d4b5cf700526a9ee5.diff",
+          "patch_url": "https://github.com/nodejs/node/compare/f9defa61fa95bcce4fa2e04b1204ca703d6604a2...91c0ea6197a51df254ea569d4b5cf700526a9ee5.patch",
+          "base_commit": {
+            "sha": "f9defa61fa95bcce4fa2e04b1204ca703d6604a2",
+            "node_id": "C_kwDOAZ7xs9oAKGY5ZGVmYTYxZmE5NWJjY2U0ZmEyZTA0YjEyMDRjYTcwM2Q2NjA0YTI",
+            "commit": {
+              "author": {
+                "name": "Example Author",
+                "email": "author@example.com",
+                "date": "2026-10-08T09:58:29Z"
+              },
+              "committer": {
+                "name": "Example Author",
+                "email": "author@example.com",
+                "date": "2026-10-08T09:58:29Z"
+              },
+              "message": "Example commit message",
+              "tree": {
+                "sha": "6d32b39b0c2dd36c7bee24f35ae7a8208c973271",
+                "url": "https://api.github.com/repos/nodejs/node/git/trees/6d32b39b0c2dd36c7bee24f35ae7a8208c973271"
+              },
+              "url": "https://api.github.com/repos/nodejs/node/git/commits/f9defa61fa95bcce4fa2e04b1204ca703d6604a2",
+              "comment_count": 0,
+              "verification": {
+                "verified": false,
+                "reason": "unsigned",
+                "signature": null,
+                "payload": null,
+                "verified_at": null
+              }
+            },
+            "url": "https://api.github.com/repos/nodejs/node/commits/f9defa61fa95bcce4fa2e04b1204ca703d6604a2",
+            "html_url": "https://github.com/nodejs/node/commit/f9defa61fa95bcce4fa2e04b1204ca703d6604a2",
+            "comments_url": "https://api.github.com/repos/nodejs/node/commits/f9defa61fa95bcce4fa2e04b1204ca703d6604a2/comments",
+            "author": {
+              "login": "example-user",
+              "id": 1,
+              "type": "User",
+              "site_admin": false
+            },
+            "committer": {
+              "login": "example-user",
+              "id": 1,
+              "type": "User",
+              "site_admin": false
+            },
+            "parents": [
+              {
+                "sha": "6d5e30987117e072bb4638c0535946464a314b7e",
+                "url": "https://api.github.com/repos/nodejs/node/commits/6d5e30987117e072bb4638c0535946464a314b7e",
+                "html_url": "https://github.com/nodejs/node/commit/6d5e30987117e072bb4638c0535946464a314b7e"
+              }
+            ]
+          },
+          "merge_base_commit": {
+            "sha": "7514ef8caff3feea55c60d628e003ccbda850485",
+            "node_id": "C_kwDOAZ7xs9oAKDc1MTRlZjhjYWZmM2ZlZWE1NWM2MGQ2MjhlMDAzY2NiZGE4NTA0ODU",
+            "commit": {
+              "author": {
+                "name": "Example Author",
+                "email": "author@example.com",
+                "date": "2026-10-05T13:38:59Z"
+              },
+              "committer": {
+                "name": "Example Author",
+                "email": "author@example.com",
+                "date": "2026-10-07T20:08:46Z"
+              },
+              "message": "Example commit message",
+              "tree": {
+                "sha": "05971ec4abb32a15e6a39c58443494501a4f9a8b",
+                "url": "https://api.github.com/repos/nodejs/node/git/trees/05971ec4abb32a15e6a39c58443494501a4f9a8b"
+              },
+              "url": "https://api.github.com/repos/nodejs/node/git/commits/7514ef8caff3feea55c60d628e003ccbda850485",
+              "comment_count": 0,
+              "verification": {
+                "verified": false,
+                "reason": "unsigned",
+                "signature": null,
+                "payload": null,
+                "verified_at": null
+              }
+            },
+            "url": "https://api.github.com/repos/nodejs/node/commits/7514ef8caff3feea55c60d628e003ccbda850485",
+            "html_url": "https://github.com/nodejs/node/commit/7514ef8caff3feea55c60d628e003ccbda850485",
+            "comments_url": "https://api.github.com/repos/nodejs/node/commits/7514ef8caff3feea55c60d628e003ccbda850485/comments",
+            "author": {
+              "login": "example-user",
+              "id": 1,
+              "type": "User",
+              "site_admin": false
+            },
+            "committer": {
+              "login": "example-user",
+              "id": 1,
+              "type": "User",
+              "site_admin": false
+            },
+            "parents": [
+              {
+                "sha": "c3189d436e14202a764d59aa35526ef9c44d9f6b",
+                "url": "https://api.github.com/repos/nodejs/node/commits/c3189d436e14202a764d59aa35526ef9c44d9f6b",
+                "html_url": "https://github.com/nodejs/node/commit/c3189d436e14202a764d59aa35526ef9c44d9f6b"
+              }
+            ]
+          },
+          "status": "diverged",
+          "ahead_by": 12,
+          "behind_by": 3,
+          "total_commits": 12,
+          "commits": [
+            {
+              "sha": "bde1a82edd512a4e8a03a9948409f3260555b4ac",
+              "node_id": "C_kwDOAZ7xs9oAKGJkZTFhODJlZGQ1MTJhNGU4YTAzYTk5NDg0MDlmMzI2MDU1NWI0YWM",
+              "commit": {
+                "author": {
+                  "name": "Example Author",
+                  "email": "author@example.com",
+                  "date": "2026-10-07T16:00:42Z"
+                },
+                "committer": {
+                  "name": "Example Author",
+                  "email": "author@example.com",
+                  "date": "2026-10-07T21:52:32Z"
+                },
+                "message": "Example commit message",
+                "tree": {
+                  "sha": "353fff968b68eecdf533c40847edeb29de33c1c8",
+                  "url": "https://api.github.com/repos/nodejs/node/git/trees/353fff968b68eecdf533c40847edeb29de33c1c8"
+                },
+                "url": "https://api.github.com/repos/nodejs/node/git/commits/bde1a82edd512a4e8a03a9948409f3260555b4ac",
+                "comment_count": 0,
+                "verification": {
+                  "verified": false,
+                  "reason": "unsigned",
+                  "signature": null,
+                  "payload": null,
+                  "verified_at": null
+                }
+              },
+              "url": "https://api.github.com/repos/nodejs/node/commits/bde1a82edd512a4e8a03a9948409f3260555b4ac",
+              "html_url": "https://github.com/nodejs/node/commit/bde1a82edd512a4e8a03a9948409f3260555b4ac",
+              "comments_url": "https://api.github.com/repos/nodejs/node/commits/bde1a82edd512a4e8a03a9948409f3260555b4ac/comments",
+              "author": {
+                "login": "example-user",
+                "id": 1,
+                "type": "User",
+                "site_admin": false
+              },
+              "committer": {
+                "login": "example-user",
+                "id": 1,
+                "type": "User",
+                "site_admin": false
+              },
+              "parents": [
+                {
+                  "sha": "7514ef8caff3feea55c60d628e003ccbda850485",
+                  "url": "https://api.github.com/repos/nodejs/node/commits/7514ef8caff3feea55c60d628e003ccbda850485",
+                  "html_url": "https://github.com/nodejs/node/commit/7514ef8caff3feea55c60d628e003ccbda850485"
+                }
+              ]
+            }
+          ],
+          "files": [
+            {
+              "sha": "5586cbce856472d9e3ffc9cd59d488a211da1f0f",
+              "filename": "common.gypi",
+              "status": "modified",
+              "additions": 1,
+              "deletions": 1,
+              "changes": 2
+            }
+          ]
+        },
+        "body_trimmed": true,
+        "note": "files trimmed to one entry without patch; the live page held 300 entries"
+      }
+    }
+  ]
+}

@@ -1,0 +1,72 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "github",
+    "question": "3: redirects on file reads",
+    "source": "github/linguist, renamed to github-linguist/linguist (public)",
+    "finding": "A renamed or transferred repository answers 301 with a same-origin Location under https://api.github.com/repositories/<id>/. The compare endpoint does the same. No cross-origin redirect was seen for contents reads, LFS files included."
+  },
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/repos/github/linguist/contents/README.md",
+        "params": {
+          "ref": "5fbdfcb8133be2bed88bf3ce62b2335f50474525"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 301,
+        "headers": {
+          "Content-Length": "260",
+          "Content-Type": "application/json; charset=utf-8",
+          "Location": "https://api.github.com/repositories/1725199/contents/README.md?ref=5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+          "X-Ratelimit-Resource": "core"
+        },
+        "body_json": {
+          "message": "Moved Permanently",
+          "url": "https://api.github.com/repositories/1725199/contents/README.md?ref=5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+          "documentation_url": "https://docs.github.com/rest/guides/best-practices-for-using-the-rest-api#follow-redirects"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/repositories/1725199/contents/README.md",
+        "params": {
+          "ref": "5fbdfcb8133be2bed88bf3ce62b2335f50474525"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/vnd.github.raw; charset=utf-8"
+        },
+        "body_omitted": "third-party file content"
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/repos/github/linguist/compare/5fbdfcb8133be2bed88bf3ce62b2335f50474525...5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+        "params": {
+          "per_page": "1",
+          "page": "2"
+        }
+      },
+      "response": {
+        "status": 301,
+        "headers": {
+          "Location": "https://api.github.com/repositories/1725199/compare/5fbdfcb8133be2bed88bf3ce62b2335f50474525...5fbdfcb8133be2bed88bf3ce62b2335f50474525?per_page=1&page=2"
+        }
+      }
+    }
+  ]
+}

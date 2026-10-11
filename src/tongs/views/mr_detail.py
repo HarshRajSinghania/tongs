@@ -27,6 +27,8 @@ from textual.widgets import (
     TextArea,
 )
 
+from tongs.diff.context import verify_new_side
+from tongs.diff.models import DiffFile
 from tongs.diff.position import DiffPosition
 from tongs.forges.models import (
     CIStatus,
@@ -81,7 +83,10 @@ from tongs.widgets.comment_editor import (
 from tongs.widgets.diff_panel import (
     CommentMode,
     CommentRequested,
+    ContextRequested,
     DiffPanel,
+    GenerateCancelRequested,
+    GenerateRequested,
     ReplyRequested,
     ResolveRequested,
 )
@@ -106,10 +111,26 @@ from tongs.widgets.review_draft import (
     capture_draft_anchor,
     inline_markers,
 )
-from tongs.widgets.split_diff import DiffSelection
+from tongs.widgets.split_diff import GENERATED_COMMENT_MESSAGE, DiffSelection
 from tongs.widgets.two_press import TwoPressConfirm
 
 log = logging.getLogger(__name__)
+
+CONTEXT_MISMATCH_MESSAGE = (
+    "The file at this commit does not match the diff. Refresh the review."
+)
+"""Shown when the file read at the head does not match the diff's hunks."""
+
+CONTEXT_STATUS_MESSAGES: dict[str, str] = {
+    "too_large": "File too large to expand.",
+    "binary": "Binary file, there are no lines to expand.",
+    "not_found": "The file was not found at this commit.",
+    "unsupported": "This forge cannot read files, so lines cannot be expanded.",
+}
+"""Fallback text per file read status when the service sends no message."""
+
+_GENERATE_GROUP = "mr-generate"
+"""Worker group of the one local diff generation the screen runs at a time."""
 
 
 def _ci_label(status: CIStatus) -> str:
@@ -1088,6 +1109,7 @@ class MRDetailScreen(Screen):
     @work(exclusive=True, group="mr-diff")
     async def _load_diff(self) -> None:
         panel = self.query_one("#diff-panel", DiffPanel)
+        self._cancel_generation()
         self._displayed_diff_revision = None
         panel.show_placeholder("Loading diff...")
         try:
@@ -1190,6 +1212,120 @@ class MRDetailScreen(Screen):
         self.action_focus_tab("diff")
         panel = self.query_one("#diff-panel", DiffPanel)
         panel.jump_to_discussion(event.file_path, event.line, event.discussion_id)
+
+    def on_context_requested(self, event: ContextRequested) -> None:
+        """Read a file at the displayed head to fill its unchanged lines."""
+        event.stop()
+        panel = self.query_one("#diff-panel", DiffPanel)
+        revision = self._displayed_diff_revision
+        if revision is None:
+            panel.file_context_failed(
+                event.file, "The diff is still loading. Try again in a moment."
+            )
+            return
+        self._load_file_context(event.file, event.gap_index, revision)
+
+    @work(group="mr-file-context")
+    async def _load_file_context(
+        self, file: DiffFile, gap_index: int | None, revision: ReviewRevision
+    ) -> None:
+        panel = self.query_one("#diff-panel", DiffPanel)
+        try:
+            read = await self.app.services.read_review_file(
+                self.mr_summary, file.new_path, revision.head_sha
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - Report background/action failures without terminating the TUI.
+            if self._displayed_diff_revision is revision:
+                panel.file_context_failed(file, f"Could not read the file. ({exc})")
+            else:
+                panel.drop_file_context_request(file)
+            return
+        if self._displayed_diff_revision is not revision:
+            # The review was refreshed while the file was read: drop the reply
+            # and leave the gap row as it was before the request.
+            panel.drop_file_context_request(file)
+            return
+        text = read.text
+        if read.status != "ok" or text is None:
+            message = read.message or CONTEXT_STATUS_MESSAGES.get(
+                str(read.status), "Could not read the file."
+            )
+            panel.file_context_failed(file, message)
+            return
+        if not verify_new_side(file, text.lines, text.ends_with_newline):
+            panel.file_context_failed(file, CONTEXT_MISMATCH_MESSAGE)
+            return
+        panel.apply_file_context(
+            file, tuple(text.lines), text.ends_with_newline, gap_index
+        )
+
+    def on_generate_requested(self, event: GenerateRequested) -> None:
+        """Generate a truncated file's diff locally from its two versions."""
+        event.stop()
+        panel = self.query_one("#diff-panel", DiffPanel)
+        revision = self._displayed_diff_revision
+        if revision is None:
+            panel.generation_failed(
+                event.file, "The diff is still loading. Try again in a moment."
+            )
+            return
+        self._generate_file_diff(event.file, revision)
+
+    def on_generate_cancel_requested(self, event: GenerateCancelRequested) -> None:
+        """Stop the running download; the panel already shows it cancelled.
+
+        Only the worker is cancelled. The panel's state may already belong
+        to a newer generation the reader started after this cancel.
+        """
+        event.stop()
+        self.app.workers.cancel_group(self, _GENERATE_GROUP)
+
+    def _cancel_generation(self) -> None:
+        """Stop a running generation and show it as cancelled."""
+        self.app.workers.cancel_group(self, _GENERATE_GROUP)
+        self.query_one("#diff-panel", DiffPanel).cancel_generation()
+
+    @work(group=_GENERATE_GROUP, exclusive=True)
+    async def _generate_file_diff(
+        self, file: DiffFile, revision: ReviewRevision
+    ) -> None:
+        panel = self.query_one("#diff-panel", DiffPanel)
+        try:
+            result = await self.app.services.generate_file_diff(
+                self.mr_summary, revision, file
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - Report background/action failures without terminating the TUI.
+            if self._displayed_diff_revision is revision:
+                panel.generation_failed(file, f"Could not generate the diff. ({exc})")
+            else:
+                panel.drop_generation(file)
+            return
+        if self._displayed_diff_revision is not revision:
+            # The review was refreshed while the diff was generated: drop the
+            # reply and leave the truncated file as it was.
+            panel.drop_generation(file)
+            return
+        generated = result.file
+        if result.status != "ok" or generated is None:
+            # The service words every outcome; the panel has a fallback.
+            panel.generation_failed(file, result.message)
+            return
+        # The panel's own list is the one on screen: the screen's copy may
+        # have been rebuilt from another diff read since.
+        index = panel.index_of(file)
+        if index is None:
+            panel.drop_generation(file)
+            return
+        if panel.replace_file(index, generated, result.new_text):
+            # Keep the screen's copy in step when it is a separate list that
+            # still holds the same file.
+            files = self._cached_diff_files
+            if files is not None and index < len(files) and files[index] is file:
+                files[index] = generated
 
     @work(exclusive=True, group="mr-pipelines")
     async def _load_pipelines(self) -> None:
@@ -1666,6 +1802,10 @@ class MRDetailScreen(Screen):
 
     def on_comment_requested(self, event: CommentRequested) -> None:
         """Handle comment request from DiffPanel."""
+        if event.file is not None and event.file.generated_locally:
+            # The forge has no diff to anchor this to, in or out of a draft.
+            self.notify(GENERATED_COMMENT_MESSAGE)
+            return
         if event.mode == CommentMode.SUGGEST and event.file and event.line:
             self._open_suggestion(event)
             return
@@ -1918,6 +2058,9 @@ class MRDetailScreen(Screen):
 
     def on_reply_requested(self, event: ReplyRequested) -> None:
         """Open reply editor for an existing discussion thread."""
+        if event.file.generated_locally:
+            self.notify(GENERATED_COMMENT_MESSAGE)
+            return
         editor = self.query_one("#comment-editor", CommentEditor)
         defer = self._review_draft is not None
         if defer and not self._can_add_current_draft_target("reply"):
@@ -2188,6 +2331,7 @@ class MRDetailScreen(Screen):
 
     def action_refresh(self) -> None:
         self._two_press.reset()
+        self._cancel_generation()
         self._diff_loaded = False
         self._commits_loaded = False
         self._discussions_loaded = False

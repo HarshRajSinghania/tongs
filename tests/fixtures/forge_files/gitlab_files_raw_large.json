@@ -1,0 +1,46 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "gitlab",
+    "question": "2: raw read of a large file at a SHA",
+    "source": "gitlab-org/gitlab (project 278964, public)",
+    "finding": "200 text/plain with no Content-Length on the 2.5 MB body; X-Gitlab-Size carries the blob size and X-Gitlab-Blob-Id the git blob SHA-1, so a reader can refuse early from X-Gitlab-Size. No redirect."
+  },
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/projects/278964/repository/files/locale%2Fgitlab.pot/raw",
+        "params": {
+          "ref": "d97fbc50f66215f722664115f486c230a418e8ad"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Disposition": "inline; filename=\"gitlab.pot\"; filename*=UTF-8''gitlab.pot",
+          "Content-Type": "text/plain; charset=utf-8",
+          "Ratelimit-Limit": "2000",
+          "Ratelimit-Name": "throttle_authenticated_api",
+          "Ratelimit-Observed": "6",
+          "Ratelimit-Remaining": "1994",
+          "Ratelimit-Reset": "1791689940",
+          "X-Gitlab-Blob-Id": "76d0bdd9f2408ff30a0ef91f398e16d8a007c0a1",
+          "X-Gitlab-Commit-Id": "d97fbc50f66215f722664115f486c230a418e8ad",
+          "X-Gitlab-Content-Sha256": "d5b76ca3137cc41755d0c01977b5ce512d851f47c02f97cba84dda1eca559d82",
+          "X-Gitlab-Encoding": "base64",
+          "X-Gitlab-Execute-Filemode": "false",
+          "X-Gitlab-File-Name": "gitlab.pot",
+          "X-Gitlab-File-Path": "locale/gitlab.pot",
+          "X-Gitlab-Last-Commit-Id": "048aaba9aa01a4ce535c046be6d071fca260b85f",
+          "X-Gitlab-Ref": "d97fbc50f66215f722664115f486c230a418e8ad",
+          "X-Gitlab-Size": "2495597"
+        },
+        "body_bytes": 2495597,
+        "body_omitted": "third-party or bulky file content; size and git blob id recorded",
+        "body_git_blob_sha1": "76d0bdd9f2408ff30a0ef91f398e16d8a007c0a1",
+        "note": "elapsed 0.58 s"
+      }
+    }
+  ]
+}

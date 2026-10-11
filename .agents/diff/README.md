@@ -83,7 +83,14 @@ Groups: (1) old_start, (2) old_count (optional, defaults to "1"), (3) new_start,
 - `old_lineno: int | None`: line number in old file (None for additions)
 - `new_lineno: int | None`: line number in new file (None for deletions)
 - `content: str`: line content (prefix character stripped)
-- `line_type: LineType`: CONTEXT, ADDITION, DELETION, HUNK_HEADER, NO_NEWLINE
+- `line_type: LineType`: CONTEXT, ADDITION, DELETION, HUNK_HEADER, NO_NEWLINE,
+  EXPANDED. EXPANDED marks an unchanged line read from the file at the
+  review's head to fill a gap (see Expand in Place). It never appears in
+  `DiffFile.hunks`, so the desktop projection, MCP tools and review mutations
+  never see it, and every comment anchor whitelist (`is_actionable`,
+  `SplitDiffRow.old_anchor`/`new_anchor`,
+  `_find_line` in `review_mutations.py`) accepts only CONTEXT, ADDITION and
+  DELETION, so an expanded line cannot become an anchor.
 
 **DiffHunk:**
 
@@ -109,6 +116,10 @@ Groups: (1) old_start, (2) old_count (optional, defaults to "1"), (3) new_start,
   map would render both rather than fail.
 - `is_metadata_only`: derived property for binary, empty, mode-only,
   rename-only, or unavailable files
+- `generated_locally: bool = False`: the hunks were computed by tongs from the
+  two file versions because the forge withheld the patch. Appended last, so
+  positional construction, the parser, the converter and MCP output are
+  unchanged.
 
 **SplitDiffRow:**
 
@@ -261,6 +272,100 @@ did not expose the state rather than inventing a size limit or an empty diff.
 The desktop badge map in `desktop/src/renderer/features/diff/index.tsx` mirrors
 these states, so a new state must be added to the model, the projection, the DTO
 validator, the bridge type, the badge map and this widget together.
+
+## Expand in Place
+
+`src/tongs/diff/context.py` is the pure gap model behind `e` and `F` in the
+terminal diff. It takes the new file as a plain sequence of lines and never
+imports services, Textual or Rich.
+
+### Gap arithmetic
+
+For each hunk and side, `first = start if count > 0 else start + 1` and
+`next = start + count if count > 0 else start + 1`. A zero count means the
+hunk sits after line `start`, which is how `@@ -5,0 +6,2 @@` and
+`@@ -5,2 +4,0 @@` stay consistent.
+
+- The BEFORE gap runs from line 1 to `first(h0) - 1`.
+- Gap `i` runs from `next(h[i-1])` to `first(h[i]) - 1`.
+- The old and new lengths of every gap must agree, because the lines are
+  unchanged. If they do not, or hunks overlap, `is_expandable` is False and
+  the file renders exactly as before.
+- The AFTER gap starts at `next(last)`. Its length is None until the new file
+  is read. It is omitted when the last hunk holds a no-newline marker (that
+  side ends inside the hunk) or has fewer than 3 trailing context lines (the
+  hunk reaches the end of the file). With a forge context below 3 a trailing
+  gap is hidden, never mislabelled.
+- Zero-length gaps are omitted. `DiffGap.index` is the gap's position in
+  `file_gaps()`; the AFTER gap is always last, so indices do not move once
+  the line count is known. `hunk_index` is the hunk after the gap, or
+  `len(file.hunks)` for the AFTER gap.
+
+Only MODIFIED or RENAMED files with hunks qualify. Added and deleted files
+already show every line; binary, truncated and metadata-only files have no
+hunks to place lines around; mode 120000 (symlink) and 160000 (submodule)
+hold a target or a commit, not text.
+
+### Reading and checking the file
+
+Lines are split on `"\n"` only, so `\r`, `\x0b`, `\x0c`, `\x1c` and U+2028
+stay inside their line, as `parse_diff` keeps them. `verify_new_side()` checks
+every CONTEXT and ADDITION line against the file at its new number and the
+final newline against any new-side no-newline marker. A mismatch refuses
+expansion ("The file at this commit does not match the diff. Refresh the
+review.") instead of showing wrong numbers.
+
+`FileContextModel(file, lines, ends_with_newline)` builds each gap's EXPANDED
+lines once (`old_lineno = gap.old_start + k`, `new_lineno = gap.new_start + k`)
+and keeps them, so their identity is stable for `id()`-keyed highlight maps and
+cursor restoration. `FileExpansion(shown, full, folds)` records which gaps and
+in-hunk folds are open, and whether the whole-file view is on.
+`segments(file, model, expansion)` interleaves `HunkBlock`, `GapRow` and
+`ExpandedBlock` in file order; with no model every gap is a `GapRow`.
+
+### Terminal flow
+
+- `DiffContent` keeps the model, the `FileExpansion` and any read in flight per
+  file in maps keyed by `id(file)` that hold the file, so a reused id misses.
+  `DiffPanel.set_files()` and `show_placeholder()` clear them, which covers a
+  refresh or revision change.
+- `_show_diff()` renders from `segments()`. Gap rows are enabled options in
+  `DiffOptionList._gap_rows` reading `... N unchanged lines (e to expand) ...`,
+  `... more lines below (e to expand) ...` for an AFTER gap of unknown length,
+  or `... loading ...` while its read is in flight. Expanded lines render
+  through `DiffRenderer` with both numbers and a blank change marker, using the
+  per-line highlight fallback, and are registered in `_readonly_rows` and
+  `_line_types`, never `_line_map`, so they never form a `DiffSelection`.
+- `e` is bound on `DiffPanel`. On a gap row it opens the gap at once when the
+  file is loaded, otherwise it marks the read pending and posts
+  `ContextRequested(file, gap_index)`. Elsewhere it explains where to go.
+- `MRDetailScreen.on_context_requested` runs a `mr-file-context` worker that
+  calls `services.read_review_file(summary, file.new_path, head_sha)` at
+  `_displayed_diff_revision`, compares `read.status` with the status strings,
+  runs `verify_new_side`, and answers through `DiffPanel.apply_file_context`
+  or `file_context_failed`. A reply after the revision or the file objects
+  changed is dropped. The first newly shown line takes the cursor.
+- `c`, `f3`, `r`, `R` and `d` on a gap row or expanded line say "Expanded lines
+  are read-only. Comment on a line inside a hunk." A `J`/`K` range that
+  includes one says "A comment range must stay inside one hunk."
+  `_validate_anchor` in `review_mutations.py` still refuses them server-side.
+- The split view (`v`) renders the same segments through a `FileLayout`
+  (segments, gaps shown as loading, and the `FileExpansion`). Gap rows read the
+  same in both columns and sit in both columns' `_gap_rows`; expanded lines are
+  `SplitDiffRow(old=line, new=line)` cells in both columns' `_readonly_rows`.
+  The state lives in `DiffContent`, so `v` keeps it.
+- Long context runs inside a hunk fold into `FoldMarker` rows that carry a
+  `GapPosition.INSIDE` gap (index `INSIDE_GAP_INDEX`, told apart by
+  `DiffGap.key`). `e` on one adds it to `FileExpansion.folds` with no read; a
+  `J`/`K` range may still span one, because its lines belong to the hunk.
+- `F` (`DiffPanel.action_toggle_full_file`) sets `FileExpansion.full`, which
+  opens every gap and fold. It reads the file through
+  `ContextRequested(file, None)` unless the hunks already cover it, refuses
+  past `FULL_FILE_MAX_ROWS` rows, and resets when another file is shown.
+- Once a file is read, a `diff-context-highlight` worker lexes the whole new
+  file in a thread as one stream and merges the expanded lines' colours into
+  the file's `HighlightMap`, so a string opened in a hunk colours the lines
+  after it. Until then, or on a lexer error, the per-line fallback applies.
 
 ## Bulk Pygments Highlighting
 

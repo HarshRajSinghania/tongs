@@ -19,9 +19,9 @@ here are the same durable review drafts the terminal app uses; see
 ## Read the diff
 
 Open **Files changed** to see the changed-file list and the selected file's
-content. The toolbar has **Unified**, **Split** and **Refresh**. The current
-head revision is shown beside them, so you can tell which revision the diff
-represents.
+content. The toolbar has **Unified**, **Split**, **Refresh** and **Full file**.
+The current head revision is shown beside them, so you can tell which revision
+the diff represents.
 
 The file list shows each path, its additions and deletions, and any available
 hunk context. A file can carry one of these badges:
@@ -29,7 +29,8 @@ hunk context. A file can carry one of these badges:
 | Badge | Meaning |
 |-------|---------|
 | **Binary** | The file has no text diff. |
-| **Truncated** | The forge returned only a bounded portion. |
+| **Truncated** | The forge returned only a bounded portion. In the file header this is the **Generate diff locally** button; see [Generate a truncated diff locally](#generate-a-truncated-diff-locally). |
+| **Generated locally** | tongs built this diff from the file's two versions. |
 | **Empty** | The file has no changed rows. |
 | **Mode only** | The change is a file-mode update. |
 | **Rename only** | The file moved and its content did not change. |
@@ -55,6 +56,63 @@ snapshot expires or the review changes during loading, it asks you to reload
 the latest diff. If paging reaches a safety bound, it keeps a bounded partial
 view and says the diff is incomplete. Invalid or inconsistent page data is
 reported as an error, never combined with another revision.
+
+### Show unchanged lines
+
+The forge sends only the changed parts of a file, so the lines around them
+start out hidden behind gap rows: one above the first change, one between each
+pair of changes and one below the last. Each row says how many lines it hides,
+for example **42 unchanged lines**. The row below the last change reads **More
+lines below** until tongs knows how long the file is.
+
+- **Expand a gap.** Click a gap row, or focus it and press ++enter++. Its lines
+  appear in place with both line numbers, in **Unified** and **Split**. tongs
+  reads them from the forge at the review's latest commit, at most 1,000 lines
+  per request, and keeps them while the diff is open, so expanding again or
+  turning on **Full file** reads nothing more. **Refresh** and a layout switch
+  start again with every gap collapsed.
+- **Collapse a gap.** Each expanded gap starts with a row such as
+  **... hide 42 lines**. Click it, or focus it and press ++enter++, to put the
+  gap row back; focus moves to that gap row. Collapsing reads nothing, and
+  expanding the gap again uses the lines already read. With **Full file** on,
+  hiding a gap turns **Full file** off and keeps the gaps you had expanded
+  before.
+- **Full file.** The toolbar's **Full file** expands every gap of the selected
+  file. Turning it off brings back the gaps you had expanded before, and moving
+  to another file turns it off. It stops at 20,000 lines on screen and asks
+  you to expand single gaps instead.
+- **Read-only lines.** Expanded lines are never comment anchors. The `+` gutter
+  button and ++c++ on an expanded line say "Expanded lines are read-only.
+  Comment on a line inside a hunk." instead of opening a composer.
+- **Files that can't expand.** **Full file** is disabled on such a file, and
+  its tooltip says why: an added or deleted file already shows every line, and
+  a binary, truncated or metadata-only file, a symlink or a submodule has no
+  lines to show around its changes.
+- **Same limits as the terminal.** A file over 2 MiB or 20,000 lines, a binary
+  file, a file the forge cannot find at the commit, or a file that does not
+  match the diff's changes is refused with the terminal app's message; see
+  [Expanding context](/guides/diffs/#expanding-context).
+
+### Generate a truncated diff locally
+
+When the forge sends only part of a file's diff, or none of it, a notice above
+the file's rows says so, and the file header offers **Generate diff locally**.
+Pressing it downloads the file's old and new versions, or one version for an
+added or deleted file, from the forge and builds the diff on your machine, with
+the same limits as the terminal app: 5 MiB or 100,000 lines per version.
+
+- While it runs, the notice shows its progress and a **Cancel** button.
+  **Cancel** stops the work in the local service; press **Generate diff
+  locally** again to retry.
+- On success the file's rows are replaced by the generated diff, and the
+  header shows **Generated locally**. Comments are not available on a diff
+  generated locally, because the forge has no diff to anchor them to.
+- A refusal, such as a binary file or a diff too large to show, keeps the
+  notice and adds the reason.
+
+If the local service no longer holds the open diff when you expand a gap or
+generate a diff, the diff is read again, as **Refresh** reads it, and a notice
+asks you to try again.
 
 ## Write comments
 

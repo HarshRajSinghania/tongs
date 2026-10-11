@@ -1,0 +1,86 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "gitlab",
+    "question": "2: a fork MR's head SHA through the target project",
+    "source": "gitlab-org/gitlab MR 261339 (source project 41372369, target 278964)",
+    "finding": "The read through the target project returns 200 with the same X-Gitlab-Blob-Id as a read through the source project.",
+    "diff_refs": {
+      "base_sha": "3bd0c31bfb2202f0ec4f80022b6db05c0a9af68e",
+      "head_sha": "18682b01c2443b695561d1f5166de47f87c745b2",
+      "start_sha": "b0b523cffa1f0ad0ae9e20053bec9628130a6115"
+    }
+  },
+  "exchanges": [
+    {
+      "case": "target_project",
+      "request": {
+        "method": "GET",
+        "path": "/projects/278964/repository/files/app%2Fservices%2Fconcerns%2Fsearch%2Ffilter.rb/raw",
+        "params": {
+          "ref": "18682b01c2443b695561d1f5166de47f87c745b2"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Disposition": "inline; filename=\"filter.rb\"; filename*=UTF-8''filter.rb",
+          "Content-Type": "text/plain; charset=utf-8",
+          "Ratelimit-Limit": "2000",
+          "Ratelimit-Name": "throttle_authenticated_api",
+          "Ratelimit-Observed": "17",
+          "Ratelimit-Remaining": "1983",
+          "Ratelimit-Reset": "1791690060",
+          "X-Gitlab-Blob-Id": "d0ebce77fd38d060dc907418f2ee98c0c6b9629c",
+          "X-Gitlab-Commit-Id": "18682b01c2443b695561d1f5166de47f87c745b2",
+          "X-Gitlab-Content-Sha256": "fadaf273885c155832503694c98e795439e6aff87912128b3fc5fb8cdf5e7bba",
+          "X-Gitlab-Encoding": "base64",
+          "X-Gitlab-Execute-Filemode": "false",
+          "X-Gitlab-File-Name": "filter.rb",
+          "X-Gitlab-File-Path": "app/services/concerns/search/filter.rb",
+          "X-Gitlab-Last-Commit-Id": "18682b01c2443b695561d1f5166de47f87c745b2",
+          "X-Gitlab-Ref": "18682b01c2443b695561d1f5166de47f87c745b2",
+          "X-Gitlab-Size": "474"
+        },
+        "body_bytes": 474,
+        "body_omitted": "third-party or bulky file content; size and git blob id recorded",
+        "body_git_blob_sha1": "d0ebce77fd38d060dc907418f2ee98c0c6b9629c"
+      }
+    },
+    {
+      "case": "source_project",
+      "request": {
+        "method": "GET",
+        "path": "/projects/41372369/repository/files/app%2Fservices%2Fconcerns%2Fsearch%2Ffilter.rb/raw",
+        "params": {
+          "ref": "18682b01c2443b695561d1f5166de47f87c745b2"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Disposition": "inline; filename=\"filter.rb\"; filename*=UTF-8''filter.rb",
+          "Content-Type": "text/plain; charset=utf-8",
+          "Ratelimit-Limit": "2000",
+          "Ratelimit-Name": "throttle_authenticated_api",
+          "Ratelimit-Observed": "19",
+          "Ratelimit-Remaining": "1981",
+          "Ratelimit-Reset": "1791690060",
+          "X-Gitlab-Blob-Id": "d0ebce77fd38d060dc907418f2ee98c0c6b9629c",
+          "X-Gitlab-Commit-Id": "18682b01c2443b695561d1f5166de47f87c745b2",
+          "X-Gitlab-Content-Sha256": "fadaf273885c155832503694c98e795439e6aff87912128b3fc5fb8cdf5e7bba",
+          "X-Gitlab-Encoding": "base64",
+          "X-Gitlab-Execute-Filemode": "false",
+          "X-Gitlab-File-Name": "filter.rb",
+          "X-Gitlab-File-Path": "app/services/concerns/search/filter.rb",
+          "X-Gitlab-Last-Commit-Id": "18682b01c2443b695561d1f5166de47f87c745b2",
+          "X-Gitlab-Ref": "18682b01c2443b695561d1f5166de47f87c745b2",
+          "X-Gitlab-Size": "474"
+        },
+        "body_bytes": 474,
+        "body_omitted": "third-party or bulky file content; size and git blob id recorded",
+        "body_git_blob_sha1": "d0ebce77fd38d060dc907418f2ee98c0c6b9629c"
+      }
+    }
+  ]
+}

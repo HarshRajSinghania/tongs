@@ -1,0 +1,103 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "github",
+    "question": "1: the 404 shape",
+    "finding": "A missing path and a missing or inaccessible repository give the same 127-byte JSON body; an unknown commit gives 'No commit found for the ref <sha>'. All are application/json."
+  },
+  "exchanges": [
+    {
+      "case": "missing_path",
+      "request": {
+        "method": "GET",
+        "path": "/repos/github-linguist/linguist/contents/no/such/file.txt",
+        "params": {
+          "ref": "5fbdfcb8133be2bed88bf3ce62b2335f50474525"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "Content-Length": "127",
+          "Content-Type": "application/json; charset=utf-8",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4966",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "34"
+        },
+        "body_bytes": 127,
+        "body_json": {
+          "message": "Not Found",
+          "documentation_url": "https://docs.github.com/rest/repos/contents#get-repository-content",
+          "status": "404"
+        }
+      }
+    },
+    {
+      "case": "missing_commit",
+      "request": {
+        "method": "GET",
+        "path": "/repos/github-linguist/linguist/contents/README.md",
+        "params": {
+          "ref": "0000000000000000000000000000000000000001"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "Content-Length": "162",
+          "Content-Type": "application/json; charset=utf-8",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4965",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "35"
+        },
+        "body_bytes": 162,
+        "body_json": {
+          "message": "No commit found for the ref 0000000000000000000000000000000000000001",
+          "documentation_url": "https://docs.github.com/v3/repos/contents/",
+          "status": "404"
+        }
+      }
+    },
+    {
+      "case": "missing_repo",
+      "request": {
+        "method": "GET",
+        "path": "/repos/andre-motta/no-such-repo-r0/contents/README.md",
+        "params": {
+          "ref": "5fbdfcb8133be2bed88bf3ce62b2335f50474525"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "Content-Length": "127",
+          "Content-Type": "application/json; charset=utf-8",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4964",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "36"
+        },
+        "body_bytes": 127,
+        "body_json": {
+          "message": "Not Found",
+          "documentation_url": "https://docs.github.com/rest/repos/contents#get-repository-content",
+          "status": "404"
+        }
+      }
+    }
+  ]
+}

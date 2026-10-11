@@ -1,0 +1,149 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "github",
+    "question": "1: raw accept on a directory, a symlink, a submodule and an LFS pointer",
+    "source": "torvalds/linux, git/git, Unity-Technologies/BoatAttack (public)",
+    "finding": "Only a regular file or a symlink answers with Content-Type application/vnd.github.raw. A directory answers 200 with an application/json array and a submodule 200 with an application/json object of type 'submodule', so a reader must check the Content-Type and refuse anything that is not the raw media type. A symlink answers its target path as the body. An LFS-tracked file answers the pointer text, not the object, with no redirect."
+  },
+  "exchanges": [
+    {
+      "case": "directory",
+      "request": {
+        "method": "GET",
+        "path": "/repos/torvalds/linux/contents/scripts/dtc",
+        "params": {
+          "ref": "a5ebb76233b79db01e82e061173cb73c6d2b5c6b"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Length": "28783",
+          "Content-Type": "application/json; charset=utf-8",
+          "Etag": "\"b493225b8e2a8f99a4a25b51c1879b0b544f4aea\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4991",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "9"
+        },
+        "body_bytes": 28783,
+        "body_json": [
+          {
+            "name": ".gitignore",
+            "path": "scripts/dtc/.gitignore",
+            "sha": "e0b5c1d2464a788c729702a4a1e0532c132c05b0",
+            "size": 57,
+            "type": "file"
+          },
+          {
+            "name": "Makefile",
+            "path": "scripts/dtc/Makefile",
+            "sha": "b47f4daa4515dfa9ac5010a29968eeda7a177ca7",
+            "size": 1128,
+            "type": "file"
+          }
+        ],
+        "body_trimmed": true
+      }
+    },
+    {
+      "case": "symlink",
+      "request": {
+        "method": "GET",
+        "path": "/repos/torvalds/linux/contents/scripts/dtc/include-prefixes/arm",
+        "params": {
+          "ref": "a5ebb76233b79db01e82e061173cb73c6d2b5c6b"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Length": "26",
+          "Content-Type": "application/vnd.github.raw; charset=utf-8",
+          "Etag": "\"eb14d4515a57e9fba995487c1f3c9235086a9596\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4990",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "10"
+        },
+        "body_bytes": 26,
+        "body_text": "../../../arch/arm/boot/dts",
+        "body_git_blob_sha1": "eb14d4515a57e9fba995487c1f3c9235086a9596"
+      }
+    },
+    {
+      "case": "submodule",
+      "request": {
+        "method": "GET",
+        "path": "/repos/git/git/contents/sha1collisiondetection",
+        "params": {
+          "ref": "6de20f6092dcf9bdb1c8efe03db4b70c82b423dd"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Length": "985",
+          "Content-Type": "application/json; charset=utf-8",
+          "Etag": "\"5cb21f9acf8c31ce1a8f6bb0bbc3b9e4e8607ce8\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4987",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "13"
+        },
+        "body_bytes": 985,
+        "body_json": {
+          "name": "sha1collisiondetection",
+          "path": "sha1collisiondetection",
+          "sha": "855827c583bc30645ba427885caa40c5b81764d2",
+          "size": 0,
+          "type": "submodule",
+          "submodule_git_url": "https://github.com/cr-marcstevens/sha1collisiondetection.git"
+        },
+        "body_trimmed": true
+      }
+    },
+    {
+      "case": "lfs_pointer",
+      "request": {
+        "method": "GET",
+        "path": "/repos/Unity-Technologies/BoatAttack/contents/Assets/Textures/Island/BushTest_norm.png",
+        "params": {
+          "ref": "6acf5f773a440030489cb5e2b3c009fb5fe1e8ce"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Length": "131",
+          "Content-Type": "application/vnd.github.raw; charset=utf-8",
+          "Etag": "\"3b4e1c8d93b9d21f2c08274174546db9f188e8ba\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4976",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "24"
+        },
+        "body_bytes": 131,
+        "body_text": "version https://git-lfs.github.com/spec/v1\noid sha256:a834e90c2ebc95175dd98c0b50f545acb59fae4f2f13fbdf3f4fec9f12d1dc7f\nsize 586027\n",
+        "body_git_blob_sha1": "3b4e1c8d93b9d21f2c08274174546db9f188e8ba"
+      }
+    }
+  ]
+}

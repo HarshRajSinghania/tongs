@@ -1,7 +1,8 @@
 const { contextBridge, ipcRenderer } = require("electron") as typeof import("electron");
 import type {
   AcceptedResult, AssetDescriptor, CommitsResult, DesktopBridge, DesktopEvent,
-  DesktopRead, DiffPage, DiscussionsPage, InvokePluginParams, JobsResult,
+  DesktopRead, DiffContextParams, DiffContextResult, DiffPage, DiffWireRow, DiscussionsPage,
+  GenerateDiffParams, GenerateDiffResult, InvokePluginParams, JobsResult,
   JsonValue, ListPipelinesParams, ListReviewPipelinesParams, ListReviewsParams,
   LocationParams, LogPage, ServiceStatusDto, OpenDiffParams, OpenLogParams, OpenRepositoryParams,
   PageParams, PipelinesResult, PluginResult, PluginsResult,
@@ -54,7 +55,7 @@ import type {
 const IPC_CHANNELS = Object.freeze({
   discoverRepositories: "tongs:repositories.discover", openRepository: "tongs:repositories.open", listReviews: "tongs:reviews.list", getReview: "tongs:reviews.get",
   getReviewCIStatus: "tongs:reviews.ci-status",
-  openDiff: "tongs:diff.open", pageDiff: "tongs:diff.page", listDiscussions: "tongs:discussions.list", pageDiscussions: "tongs:discussions.page", listCommits: "tongs:commits.list",
+  openDiff: "tongs:diff.open", pageDiff: "tongs:diff.page", getDiffContext: "tongs:diff.context", generateDiff: "tongs:diff.generate", listDiscussions: "tongs:discussions.list", pageDiscussions: "tongs:discussions.page", listCommits: "tongs:commits.list",
   listPipelines: "tongs:pipelines.list", listReviewPipelines: "tongs:review-pipelines.list", listJobs: "tongs:jobs.list", openLog: "tongs:logs.open", pageLog: "tongs:logs.page",
   listPlugins: "tongs:plugins.list", invokePlugin: "tongs:plugins.invoke", setLocation: "tongs:host.set-location", listAssets: "tongs:assets.list",
   cancelRead: "tongs:read.cancel", openExternal: "tongs:external.open", event: "tongs:event",
@@ -128,7 +129,9 @@ const bridge: DesktopBridge = Object.freeze({
   getReview: (review: string): DesktopRead<ReviewSnapshotDto> => read(IPC_CHANNELS.getReview, { review }),
   getReviewCIStatus: (params: ReviewCIStatusParams): DesktopRead<ReviewCIStatusResult> => read(IPC_CHANNELS.getReviewCIStatus, params),
   openDiff: (params: OpenDiffParams): DesktopRead<DiffPage> => read(IPC_CHANNELS.openDiff, params),
-  pageDiff: (params: PageParams): DesktopRead<DiffPage> => read(IPC_CHANNELS.pageDiff, params),
+  pageDiff: <T extends DiffWireRow>(params: PageParams): DesktopRead<DiffPage<T>> => read(IPC_CHANNELS.pageDiff, params),
+  getDiffContext: (params: DiffContextParams): DesktopRead<DiffContextResult> => read(IPC_CHANNELS.getDiffContext, params),
+  generateDiff: (params: GenerateDiffParams): DesktopRead<GenerateDiffResult> => read(IPC_CHANNELS.generateDiff, params),
   listDiscussions: (review: string): DesktopRead<DiscussionsPage> => read(IPC_CHANNELS.listDiscussions, { review }),
   pageDiscussions: (params: PageParams): DesktopRead<DiscussionsPage> => read(IPC_CHANNELS.pageDiscussions, params),
   listCommits: (review: string): DesktopRead<CommitsResult> => read(IPC_CHANNELS.listCommits, { review }),

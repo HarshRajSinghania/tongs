@@ -1,0 +1,144 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "gitlab",
+    "question": "2: directory, symlink, submodule and LFS pointer",
+    "source": "gitlab-org/gitlab-test (project 72724) and gitlab-org/gitlab (project 278964), public",
+    "finding": "A directory is 404 'File Not Found'. A symlink answers its target as text/plain. A submodule answers 200 with an EMPTY body and X-Gitlab-Size 0, which looks like an empty file, so modes 120000 and 160000 must be refused from the diff metadata before any read. An LFS file answers the pointer text unless lfs=true is passed; never pass lfs=true."
+  },
+  "exchanges": [
+    {
+      "case": "directory",
+      "request": {
+        "method": "GET",
+        "path": "/projects/72724/repository/files/files%2Flfs/raw",
+        "params": {
+          "ref": "ddd0f15ae83993f5cb66a927a28673882e99100b"
+        }
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "Content-Length": "32",
+          "Content-Type": "application/json",
+          "Ratelimit-Limit": "2000",
+          "Ratelimit-Name": "throttle_authenticated_api",
+          "Ratelimit-Observed": "8",
+          "Ratelimit-Remaining": "1992",
+          "Ratelimit-Reset": "1791689940"
+        },
+        "body_bytes": 32,
+        "body_json": {
+          "message": "404 File Not Found"
+        }
+      }
+    },
+    {
+      "case": "symlink",
+      "request": {
+        "method": "GET",
+        "path": "/projects/278964/repository/files/Gemfile.next/raw",
+        "params": {
+          "ref": "d97fbc50f66215f722664115f486c230a418e8ad"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Disposition": "inline; filename=\"Gemfile.next\"; filename*=UTF-8''Gemfile.next",
+          "Content-Length": "7",
+          "Content-Type": "text/plain; charset=utf-8",
+          "Ratelimit-Limit": "2000",
+          "Ratelimit-Name": "throttle_authenticated_api",
+          "Ratelimit-Observed": "7",
+          "Ratelimit-Remaining": "1993",
+          "Ratelimit-Reset": "1791689940",
+          "X-Gitlab-Blob-Id": "6ab79009c0a374c4a9009595cb57f46476f36b38",
+          "X-Gitlab-Commit-Id": "d97fbc50f66215f722664115f486c230a418e8ad",
+          "X-Gitlab-Content-Sha256": "d09ea66f8227784ff4393d88a19836f321c915ae10031d16c93d67e6283ab55f",
+          "X-Gitlab-Encoding": "base64",
+          "X-Gitlab-Execute-Filemode": "false",
+          "X-Gitlab-File-Name": "Gemfile.next",
+          "X-Gitlab-File-Path": "Gemfile.next",
+          "X-Gitlab-Last-Commit-Id": "82ebaab4b27899e3f7387ec7322404612727aa49",
+          "X-Gitlab-Ref": "d97fbc50f66215f722664115f486c230a418e8ad",
+          "X-Gitlab-Size": "7"
+        },
+        "body_bytes": 7,
+        "body_text": "Gemfile",
+        "body_git_blob_sha1": "6ab79009c0a374c4a9009595cb57f46476f36b38"
+      }
+    },
+    {
+      "case": "submodule",
+      "request": {
+        "method": "GET",
+        "path": "/projects/72724/repository/files/six/raw",
+        "params": {
+          "ref": "ddd0f15ae83993f5cb66a927a28673882e99100b"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Disposition": "inline; filename=\"six\"; filename*=UTF-8''six",
+          "Content-Length": "0",
+          "Content-Type": "text/plain",
+          "Ratelimit-Limit": "2000",
+          "Ratelimit-Name": "throttle_authenticated_api",
+          "Ratelimit-Observed": "9",
+          "Ratelimit-Remaining": "1991",
+          "Ratelimit-Reset": "1791689940",
+          "X-Gitlab-Blob-Id": "409f37c4f05865e4fb208c771485f211a22c4c2d",
+          "X-Gitlab-Commit-Id": "ddd0f15ae83993f5cb66a927a28673882e99100b",
+          "X-Gitlab-Content-Sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "X-Gitlab-Encoding": "base64",
+          "X-Gitlab-Execute-Filemode": "false",
+          "X-Gitlab-File-Name": "six",
+          "X-Gitlab-File-Path": "six",
+          "X-Gitlab-Last-Commit-Id": "cfe32cf61b73a0d5e9f13e774abde7ff789b1660",
+          "X-Gitlab-Ref": "ddd0f15ae83993f5cb66a927a28673882e99100b",
+          "X-Gitlab-Size": "0"
+        },
+        "body_bytes": 0,
+        "body_text": "",
+        "body_git_blob_sha1": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+      }
+    },
+    {
+      "case": "lfs_pointer",
+      "request": {
+        "method": "GET",
+        "path": "/projects/72724/repository/files/files%2Flfs%2Flfs_object.iso/raw",
+        "params": {
+          "ref": "ddd0f15ae83993f5cb66a927a28673882e99100b"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Disposition": "inline; filename=\"lfs_object.iso\"; filename*=UTF-8''lfs_object.iso",
+          "Content-Type": "text/plain; charset=utf-8",
+          "Ratelimit-Limit": "2000",
+          "Ratelimit-Name": "throttle_authenticated_api",
+          "Ratelimit-Observed": "10",
+          "Ratelimit-Remaining": "1990",
+          "Ratelimit-Reset": "1791689940",
+          "X-Gitlab-Blob-Id": "0c304a93cb8430108629bbbcaa27db3343299bc0",
+          "X-Gitlab-Commit-Id": "ddd0f15ae83993f5cb66a927a28673882e99100b",
+          "X-Gitlab-Content-Sha256": "2179175a154b15d469ffbc113e02e7604fb259630804d8318e14c7751f853776",
+          "X-Gitlab-Encoding": "base64",
+          "X-Gitlab-Execute-Filemode": "false",
+          "X-Gitlab-File-Name": "lfs_object.iso",
+          "X-Gitlab-File-Path": "files/lfs/lfs_object.iso",
+          "X-Gitlab-Last-Commit-Id": "048721d90c449b244b7b4c53a9186b04330174ec",
+          "X-Gitlab-Ref": "ddd0f15ae83993f5cb66a927a28673882e99100b",
+          "X-Gitlab-Size": "133"
+        },
+        "body_bytes": 133,
+        "body_text": "version https://git-lfs.github.com/spec/v1\noid sha256:91eff75a492a3ed0dfcb544d7f31326bc4014c8551849c192fd1e48d4dd2c897\nsize 1575078\n\n",
+        "body_git_blob_sha1": "0c304a93cb8430108629bbbcaa27db3343299bc0"
+      }
+    }
+  ]
+}

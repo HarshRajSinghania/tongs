@@ -6,7 +6,7 @@ import bisect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Self
 
 from rich.console import Console
 from rich.markdown import Markdown as RichMarkdown
@@ -22,7 +22,17 @@ from textual.widgets import OptionList
 from textual.widgets.option_list import Option
 
 from tongs.diff.alignment import align_hunk
-from tongs.diff.models import DiffFile, DiffLine, LineType, SplitDiffRow
+from tongs.diff.context import (
+    DiffGap,
+    ExpandedBlock,
+    FileExpansion,
+    GapPosition,
+    GapRow,
+    HunkBlock,
+    Segment,
+    inside_gap,
+)
+from tongs.diff.models import DiffFile, DiffHunk, DiffLine, LineType, SplitDiffRow
 from tongs.forges.models import Discussion
 from tongs.helpers import relative_time
 from tongs.state.drafts import DiffSide
@@ -31,6 +41,78 @@ from tongs.widgets.two_press import TwoPressConfirm
 
 if TYPE_CHECKING:
     from tongs.widgets.review_draft import DraftMarker
+
+
+READ_ONLY_LINE_MESSAGE = (
+    "Expanded lines are read-only. Comment on a line inside a hunk."
+)
+"""Shown when a comment key is pressed on a gap row or an expanded line."""
+
+FOLD_READ_ONLY_MESSAGE = "Press e to show these lines, then comment on one."
+"""Shown when a comment key is pressed on a fold inside a hunk."""
+
+RANGE_CROSSES_GAP_MESSAGE = "A comment range must stay inside one hunk."
+"""Shown when a J/K range includes a gap row or an expanded line."""
+
+GENERATED_COMMENT_MESSAGE = "Comments are not available on a diff generated locally."
+"""Shown when a comment, suggest or reply key is pressed on a generated diff.
+
+The forge has no diff for the file to anchor a comment to, so it would refuse
+one; tongs says so before an editor opens.
+"""
+
+TRUNCATED_NOTICE = (
+    "This file's diff is too large for the forge to send. Press e to generate "
+    "it locally (downloads both versions of the file)."
+)
+"""Shown for a file whose diff the forge withheld in full or in part."""
+
+
+def gap_message(gap: DiffGap, *, loading: bool = False) -> str:
+    """Return the ASCII text of a collapsed gap or fold, without indentation."""
+    if loading:
+        return "... loading ..."
+    if gap.length is None:
+        return "... more lines below (e to expand) ..."
+    noun = "line" if gap.length == 1 else "lines"
+    return f"... {gap.length} unchanged {noun} (e to expand) ..."
+
+
+class FoldMarker(str):
+    """A fold marker row that carries the in-hunk gap it hides.
+
+    It is still the marker text, so code that treats fold markers as plain
+    strings keeps working.
+    """
+
+    gap: DiffGap
+
+    def __new__(cls, gap: DiffGap) -> Self:
+        marker = super().__new__(cls, gap_message(gap))
+        marker.gap = gap
+        return marker
+
+
+@dataclass(frozen=True, slots=True)
+class FileLayout:
+    """What both diff layouts draw for one file around and inside its hunks.
+
+    ``segments`` interleave hunks with collapsed and expanded gaps,
+    ``loading`` names the gaps whose file read is in flight, and
+    ``expansion`` says which in-hunk folds stay open. ``notice`` holds the
+    rows that stand above the hunks of a file the forge truncated, or in
+    place of them when it sent none.
+    """
+
+    segments: tuple[Segment, ...]
+    loading: frozenset[int] = frozenset()
+    expansion: FileExpansion = field(default_factory=FileExpansion)
+    notice: tuple[str, ...] = ()
+
+
+def _counts_against_range(gap: DiffGap) -> bool:
+    """Whether a gap row splits a J/K range: only gaps outside the hunks do."""
+    return gap.position is not GapPosition.INSIDE
 
 
 class DiffViewMode(str, Enum):
@@ -241,6 +323,10 @@ class SplitDiffColumn(TintedOptionList):
         self._current_file: DiffFile | None = None
         self._expanded_threads: set[str] = set()
         self._resolve_confirm = TwoPressConfirm()
+        # Gap rows and expanded lines take the cursor in both columns but
+        # never enter _line_map, so they never form a comment anchor.
+        self._gap_rows: dict[int, DiffGap] = {}
+        self._readonly_rows: dict[int, DiffLine] = {}
 
     @property
     def selection(self) -> DiffSelection | None:
@@ -253,12 +339,56 @@ class SplitDiffColumn(TintedOptionList):
         lines = self._selection_lines() or [line]
         return DiffSelection(self._current_file, self.side, line, tuple(lines))
 
+    def cursor_gap(self) -> DiffGap | None:
+        """Return the gap under the cursor, if the cursor is on a gap row."""
+        if self.highlighted is None:
+            return None
+        return self._gap_rows.get(self.highlighted)
+
+    def _on_read_only_row(self) -> bool:
+        highlighted = self.highlighted
+        return highlighted is not None and (
+            highlighted in self._gap_rows or highlighted in self._readonly_rows
+        )
+
+    def _range_crosses_read_only_row(self) -> bool:
+        if self._selection_anchor is None or self.highlighted is None:
+            return False
+        low = min(self._selection_anchor, self.highlighted)
+        high = max(self._selection_anchor, self.highlighted)
+        return any(
+            low <= index <= high and _counts_against_range(gap)
+            for index, gap in self._gap_rows.items()
+        ) or any(low <= index <= high for index in self._readonly_rows)
+
+    def _refuse_read_only(self, *, commenting: bool = False) -> bool:
+        """Notify and return True when the cursor or range cannot take a comment."""
+        if self._on_read_only_row():
+            # A fold inside a hunk hides lines that take a comment once shown.
+            gap = self.cursor_gap()
+            fold = gap is not None and gap.position is GapPosition.INSIDE
+            self.app.notify(FOLD_READ_ONLY_MESSAGE if fold else READ_ONLY_LINE_MESSAGE)
+            return True
+        if commenting and self._range_crosses_read_only_row():
+            self.app.notify(RANGE_CROSSES_GAP_MESSAGE)
+            return True
+        return False
+
+    def _refuse_generated(self) -> bool:
+        """Notify and return True when the file's diff was generated locally."""
+        if self._current_file is not None and self._current_file.generated_locally:
+            self.app.notify(GENERATED_COMMENT_MESSAGE)
+            return True
+        return False
+
     def reset(self, file: DiffFile, expanded_threads: set[str]) -> None:
         self.clear_options()
         self._line_map.clear()
         self._line_types.clear()
         self._comment_map.clear()
         self._comment_indices.clear()
+        self._gap_rows.clear()
+        self._readonly_rows.clear()
         self._selection_anchor = None
         self._current_file = file
         self._expanded_threads = expanded_threads
@@ -340,6 +470,8 @@ class SplitDiffColumn(TintedOptionList):
         self._split_view().focus_side(DiffSide.NEW)
 
     def action_comment(self) -> None:
+        if self._refuse_generated() or self._refuse_read_only(commenting=True):
+            return
         selection = self.selection
         if selection is None:
             self.app.notify("Move to a source line to comment")
@@ -349,6 +481,8 @@ class SplitDiffColumn(TintedOptionList):
         self.post_message(DiffSelectionChanged(self.selection))
 
     def action_suggest(self) -> None:
+        if self._refuse_generated() or self._refuse_read_only(commenting=True):
+            return
         if self.side is DiffSide.OLD:
             self.app.notify("Suggestions are available on the new side only")
             return
@@ -361,6 +495,8 @@ class SplitDiffColumn(TintedOptionList):
         self.post_message(DiffSelectionChanged(self.selection))
 
     def action_toggle_discussion(self) -> None:
+        if self._refuse_read_only():
+            return
         discussions = self._current_discussions()
         if not discussions:
             return
@@ -372,6 +508,8 @@ class SplitDiffColumn(TintedOptionList):
         self.post_message(_SplitThreadToggled(ids))
 
     def action_reply_discussion(self) -> None:
+        if self._refuse_generated() or self._refuse_read_only():
+            return
         discussion = self._target_discussion()
         selection = self.selection
         if discussion is None or selection is None:
@@ -380,6 +518,8 @@ class SplitDiffColumn(TintedOptionList):
         self.post_message(SplitReplyRequested(selection, discussion))
 
     def action_resolve_discussion(self) -> None:
+        if self._refuse_read_only():
+            return
         discussion = self._target_discussion()
         if discussion is None:
             self.app.notify("No discussion on this line")
@@ -479,6 +619,7 @@ class SplitDiffView(Widget):
         self._expanded_threads: set[str] = set()
         self._active_side = DiffSide.NEW
         self._draft_markers: tuple[DraftMarker, ...] = ()
+        self._layout: FileLayout | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -500,18 +641,158 @@ class SplitDiffView(Widget):
         highlight_map: HighlightMap,
         selection: DiffSelection | None = None,
         draft_markers: tuple[DraftMarker, ...] = (),
+        layout: FileLayout | None = None,
     ) -> None:
+        """Draw one file, keeping the cursor where it was when redrawing it.
+
+        ``layout`` adds gap rows, expanded lines and open folds; without it
+        the file shows its hunks with long context folded, as before.
+        """
+        cursor_mark = self._cursor_mark() if self._file is file else None
         self._file = file
         self._discussions = discussions
         self._discussion_index = _discussion_index(discussions)
         self._highlight_map = highlight_map
         self._draft_markers = draft_markers
+        self._layout = layout
         # Like the unified view, redrawing the file drops an armed resolve.
         for column in self._columns():
             column._resolve_confirm.reset()
         self._populate()
-        if selection is not None:
-            self.restore_selection(selection)
+        restored = selection is not None and self.restore_selection(selection)
+        if not restored and cursor_mark is not None:
+            self._restore_cursor_mark(cursor_mark)
+
+    def cursor_gap(self) -> DiffGap | None:
+        """Return the gap row under the cursor, in whichever column has it."""
+        return self._cursor_column().cursor_gap()
+
+    def cursor_new_line(self) -> int | None:
+        """Return the new-side line number under the cursor, if any.
+
+        A gap row answers with its first line, so a redraw that opens or
+        closes it can keep the cursor on the same stretch of the file.
+        """
+        column = self._cursor_column()
+        index = column.highlighted
+        if index is None:
+            return None
+        new_column = self._column(DiffSide.NEW)
+        if (gap := column._gap_rows.get(index)) is not None:
+            return gap.new_start
+        line = new_column._readonly_rows.get(index) or new_column._line_map.get(index)
+        return line.new_lineno if line is not None else None
+
+    def cursor_line(self) -> DiffLine | None:
+        """Return the expanded or unchanged line under the cursor, if any.
+
+        Both are drawn in the new column too, so it answers for either side.
+        """
+        index = self._cursor_column().highlighted
+        if index is None:
+            return None
+        new_column = self._column(DiffSide.NEW)
+        return new_column._readonly_rows.get(index) or new_column._line_map.get(index)
+
+    def folds_line(
+        self, file: DiffFile, hunk: DiffHunk, line: DiffLine, expansion: FileExpansion
+    ) -> bool:
+        """Whether a hunk line would sit inside a fold under ``expansion``.
+
+        It runs the same fold as :meth:`show_file`, so a line a thread or a
+        draft keeps on screen answers False, and nothing is drawn.
+        """
+        return not any(
+            not isinstance(row, str) and row.new is line
+            for row in _fold_context_rows(
+                align_hunk(hunk), preserve=self._fold_preserve(file, expansion)
+            )
+        )
+
+    def _fold_preserve(
+        self, file: DiffFile, expansion: FileExpansion
+    ) -> Callable[[SplitDiffRow], bool]:
+        """Rows that never fold: opened by the reader, or carrying a thread or draft."""
+        return lambda row: (
+            (row.old is not None and expansion.reveals(row.old))
+            or self._row_has_visible_detail(file, row)
+        )
+
+    def land_on(self, new_line: int) -> bool:
+        """Move the cursor to the row that shows a new-side line number.
+
+        A line that a gap row or a fold now hides lands on that row.
+        """
+        new_column = self._column(DiffSide.NEW)
+        rows = {**new_column._line_map, **new_column._readonly_rows}
+        index = next(
+            (i for i, line in sorted(rows.items()) if line.new_lineno == new_line),
+            None,
+        )
+        if index is None:
+            index = next(
+                (
+                    i
+                    for i, gap in sorted(new_column._gap_rows.items())
+                    if gap.covers(new_line)
+                ),
+                None,
+            )
+        if index is None:
+            return False
+        self._set_synchronized_highlight(index)
+        self._cursor_column().scroll_to_highlight()
+        return True
+
+    def _cursor_column(self) -> SplitDiffColumn:
+        old_column, new_column = self._columns()
+        if old_column.has_focus:
+            return old_column
+        if new_column.has_focus:
+            return new_column
+        return self._column(self._active_side)
+
+    def _cursor_mark(self) -> tuple[str, object] | None:
+        column = self._cursor_column()
+        index = column.highlighted
+        if index is None:
+            return None
+        if (gap := column._gap_rows.get(index)) is not None:
+            return ("gap", gap.key)
+        if (line := column._readonly_rows.get(index)) is not None:
+            return ("line", line)
+        return None
+
+    def _restore_cursor_mark(self, mark: tuple[str, object]) -> bool:
+        kind, value = mark
+        column = self._column(self._active_side)
+        if kind == "gap":
+            index = next(
+                (i for i, gap in column._gap_rows.items() if gap.key == value), None
+            )
+        else:
+            index = self.find_read_only(value)
+        if index is None:
+            return False
+        self._set_synchronized_highlight(index)
+        column.scroll_to_highlight()
+        return True
+
+    def find_read_only(self, target: object) -> int | None:
+        """Return the row of an expanded line, the same in both columns."""
+        return next(
+            (
+                index
+                for index, line in self._column(DiffSide.NEW)._readonly_rows.items()
+                if line is target
+            ),
+            None,
+        )
+
+    def highlight_row(self, index: int) -> None:
+        """Put the cursor of both columns on one row and scroll to it."""
+        self._set_synchronized_highlight(index)
+        self._column(self._active_side).scroll_to_highlight()
 
     def show_placeholder(self, message: str) -> None:
         self._file = None
@@ -521,12 +802,15 @@ class SplitDiffView(Widget):
         self._expanded_threads.clear()
         self._active_side = DiffSide.NEW
         self._draft_markers = ()
+        self._layout = None
         for column in self._columns():
             column.clear_options()
             column._line_map.clear()
             column._line_types.clear()
             column._comment_map.clear()
             column._comment_indices.clear()
+            column._gap_rows.clear()
+            column._readonly_rows.clear()
             column._selection_anchor = None
             column._current_file = None
             column._expanded_threads.clear()
@@ -539,7 +823,11 @@ class SplitDiffView(Widget):
         target = self._column(side)
         source = self._column(self._active_side)
         index = source.highlighted
-        if index is None or index not in target._line_map:
+        if index is None or not (
+            index in target._line_map
+            or index in target._gap_rows
+            or index in target._readonly_rows
+        ):
             index = self._nearest_actionable(target, index or 0)
         if index is None:
             self.app.notify(f"No {side.value}-side source lines in this file")
@@ -660,93 +948,93 @@ class SplitDiffView(Widget):
             DiffSide.NEW: None,
         }
 
+        layout = self._layout
         if file.is_binary or not file.hunks:
-            message = placeholder_message(file)
-            placeholder = Option(_single_line(message, Style(dim=True)), disabled=True)
-            old_options.append(placeholder)
-            new_options.append(
-                Option(_single_line(message, Style(dim=True)), disabled=True)
+            messages = (
+                layout.notice
+                if layout is not None and layout.notice
+                else (placeholder_message(file),)
             )
+            for message in messages:
+                old_options.append(
+                    Option(_single_line(message, Style(dim=True)), disabled=True)
+                )
+                new_options.append(
+                    Option(_single_line(message, Style(dim=True)), disabled=True)
+                )
         else:
-            for hunk in file.hunks:
+            if layout is None:
+                layout = FileLayout(
+                    tuple(HunkBlock(i, hunk) for i, hunk in enumerate(file.hunks))
+                )
+            expansion = layout.expansion
+            # A file the forge sent only in part says so above its hunks.
+            for message in layout.notice:
+                old_options.append(
+                    Option(_single_line(f" {message}", _NOTICE_STYLE), disabled=True)
+                )
+                new_options.append(
+                    Option(_single_line(f" {message}", _NOTICE_STYLE), disabled=True)
+                )
+                option_index += 1
+            for segment in layout.segments:
+                if isinstance(segment, GapRow):
+                    gap = segment.gap
+                    label = gap_message(gap, loading=gap.index in layout.loading)
+                    for options, column in (
+                        (old_options, old_column),
+                        (new_options, new_column),
+                    ):
+                        options.append(
+                            Option(_single_line(f"      {label}", Style(dim=True)))
+                        )
+                        column._gap_rows[option_index] = gap
+                    option_index += 1
+                    continue
+                if isinstance(segment, ExpandedBlock):
+                    for line in segment.lines:
+                        old_options.append(self._cell_option(line, DiffSide.OLD, []))
+                        new_options.append(self._cell_option(line, DiffSide.NEW, []))
+                        for column in (old_column, new_column):
+                            column._readonly_rows[option_index] = line
+                            column._line_types[option_index] = line.line_type
+                        option_index += 1
+                    continue
+                hunk = segment.hunk
                 header = _single_line(f" {hunk.header}", Style(bold=True, dim=True))
                 old_options.append(Option(header.copy(), disabled=True))
                 new_options.append(Option(header.copy(), disabled=True))
                 option_index += 1
                 for row in _fold_context_rows(
                     align_hunk(hunk),
-                    preserve=lambda row: self._row_has_visible_detail(file, row),
+                    preserve=self._fold_preserve(file, expansion),
+                    hunk_index=segment.hunk_index,
                 ):
                     if isinstance(row, str):
-                        marker = Option(
-                            _single_line(f"      {row}", Style(dim=True)), disabled=True
-                        )
-                        old_options.append(marker)
-                        new_options.append(
-                            Option(
-                                _single_line(f"      {row}", Style(dim=True)),
-                                disabled=True,
+                        gap = row.gap if isinstance(row, FoldMarker) else None
+                        for options, column in (
+                            (old_options, old_column),
+                            (new_options, new_column),
+                        ):
+                            options.append(
+                                Option(
+                                    _single_line(f"      {row}", Style(dim=True)),
+                                    disabled=gap is None,
+                                )
                             )
-                        )
+                            if gap is not None:
+                                column._gap_rows[option_index] = gap
                         option_index += 1
                         continue
-                    old_discussions = _line_discussions(
-                        row.old, DiffSide.OLD, self._discussion_index
+                    option_index = self._add_row(
+                        file,
+                        row,
+                        option_index,
+                        old_options,
+                        new_options,
+                        first_actionable,
+                        first_changed,
                     )
-                    new_discussions = _line_discussions(
-                        row.new, DiffSide.NEW, self._discussion_index
-                    )
-                    row_discussions = list(
-                        {
-                            discussion.id: discussion
-                            for discussion in [*old_discussions, *new_discussions]
-                        }.values()
-                    )
-                    old_options.append(
-                        self._cell_option(row.old, DiffSide.OLD, old_discussions)
-                    )
-                    new_options.append(
-                        self._cell_option(row.new, DiffSide.NEW, new_discussions)
-                    )
-                    for side, column, line, cell_discussions in (
-                        (DiffSide.OLD, old_column, row.old, old_discussions),
-                        (DiffSide.NEW, new_column, row.new, new_discussions),
-                    ):
-                        if is_actionable(line, side):
-                            assert line is not None
-                            column.register_line(option_index, line, cell_discussions)
-                            if first_actionable[side] is None:
-                                first_actionable[side] = option_index
-                            if (
-                                line.line_type in {LineType.ADDITION, LineType.DELETION}
-                                and first_changed[side] is None
-                            ):
-                                first_changed[side] = option_index
-                    option_index += 1
-
-                    expanded = [
-                        discussion
-                        for discussion in row_discussions
-                        if discussion.id in self._expanded_threads
-                    ]
-                    for thread_line in _thread_lines(expanded):
-                        old_options.append(Option(_single_line(""), disabled=True))
-                        new_options.append(Option(thread_line, disabled=True))
-                        option_index += 1
-
-                    for marker in self._markers_for_row(file, row.old, row.new):
-                        for marker_line in _draft_marker_lines(marker):
-                            if marker.side is DiffSide.OLD:
-                                old_options.append(Option(marker_line, disabled=True))
-                                new_options.append(
-                                    Option(_single_line(""), disabled=True)
-                                )
-                            else:
-                                old_options.append(
-                                    Option(_single_line(""), disabled=True)
-                                )
-                                new_options.append(Option(marker_line, disabled=True))
-                            option_index += 1
 
         old_column.add_options(old_options)
         new_column.add_options(new_options)
@@ -762,6 +1050,69 @@ class SplitDiffView(Widget):
                 self._active_side = other_side
         if preferred is not None:
             self._set_synchronized_highlight(preferred)
+
+    def _add_row(
+        self,
+        file: DiffFile,
+        row: SplitDiffRow,
+        option_index: int,
+        old_options: list[Option],
+        new_options: list[Option],
+        first_actionable: dict[DiffSide, int | None],
+        first_changed: dict[DiffSide, int | None],
+    ) -> int:
+        """Append one aligned hunk row with its threads and draft markers."""
+        old_column, new_column = self._columns()
+        old_discussions = _line_discussions(
+            row.old, DiffSide.OLD, self._discussion_index
+        )
+        new_discussions = _line_discussions(
+            row.new, DiffSide.NEW, self._discussion_index
+        )
+        row_discussions = list(
+            {
+                discussion.id: discussion
+                for discussion in [*old_discussions, *new_discussions]
+            }.values()
+        )
+        old_options.append(self._cell_option(row.old, DiffSide.OLD, old_discussions))
+        new_options.append(self._cell_option(row.new, DiffSide.NEW, new_discussions))
+        for side, column, line, cell_discussions in (
+            (DiffSide.OLD, old_column, row.old, old_discussions),
+            (DiffSide.NEW, new_column, row.new, new_discussions),
+        ):
+            if is_actionable(line, side):
+                assert line is not None
+                column.register_line(option_index, line, cell_discussions)
+                if first_actionable[side] is None:
+                    first_actionable[side] = option_index
+                if (
+                    line.line_type in {LineType.ADDITION, LineType.DELETION}
+                    and first_changed[side] is None
+                ):
+                    first_changed[side] = option_index
+        option_index += 1
+
+        expanded = [
+            discussion
+            for discussion in row_discussions
+            if discussion.id in self._expanded_threads
+        ]
+        for thread_line in _thread_lines(expanded):
+            old_options.append(Option(_single_line(""), disabled=True))
+            new_options.append(Option(thread_line, disabled=True))
+            option_index += 1
+
+        for marker in self._markers_for_row(file, row.old, row.new):
+            for marker_line in _draft_marker_lines(marker):
+                if marker.side is DiffSide.OLD:
+                    old_options.append(Option(marker_line, disabled=True))
+                    new_options.append(Option(_single_line(""), disabled=True))
+                else:
+                    old_options.append(Option(_single_line(""), disabled=True))
+                    new_options.append(Option(marker_line, disabled=True))
+                option_index += 1
+        return option_index
 
     def _markers_for_row(
         self,
@@ -828,7 +1179,10 @@ class SplitDiffView(Widget):
         text.append_text(
             highlighted.copy() if highlighted is not None else Text(line.content)
         )
-        return Option(text, disabled=not is_actionable(line, side))
+        # An expanded line takes the cursor like a source line, but it is not
+        # an anchor: its column registers it as read-only.
+        readable = is_actionable(line, side) or line.line_type is LineType.EXPANDED
+        return Option(text, disabled=not readable)
 
     def _set_synchronized_highlight(self, option_index: int) -> None:
         for column in self._columns():
@@ -878,6 +1232,10 @@ def _discussion_index(
     return index
 
 
+_NOTICE_STYLE = Style(dim=True, italic=True)
+"""Style of the truncation notice rows above a partial file's hunks."""
+
+
 def _single_line(content: str, style: Style | None = None) -> Text:
     """Build a non-wrapping row so paired columns stay vertically aligned."""
     return Text(content, style=style, no_wrap=True, overflow="crop")
@@ -903,15 +1261,24 @@ def _fold_context_rows(
     rows: tuple[SplitDiffRow, ...],
     context_lines: int = 3,
     preserve: Callable[[SplitDiffRow], bool] | None = None,
+    *,
+    hunk_index: int = 0,
 ) -> tuple[SplitDiffRow | str, ...]:
-    """Fold long unchanged runs equally on both source sides."""
+    """Fold long unchanged runs equally on both source sides.
+
+    Each fold is a :class:`FoldMarker` carrying the INSIDE gap it hides, so
+    ``e`` can reveal it without reading the file.
+    """
     result: list[SplitDiffRow | str] = []
     run: list[SplitDiffRow] = []
 
     def flush() -> None:
         if len(run) > context_lines * 2:
+            hidden = run[context_lines:-context_lines]
+            first = hidden[0].new
+            assert first is not None
             result.extend(run[:context_lines])
-            result.append(f"... {len(run) - context_lines * 2} unchanged lines ...")
+            result.append(FoldMarker(inside_gap(hunk_index, first, len(hidden))))
             result.extend(run[-context_lines:])
         else:
             result.extend(run)
@@ -945,7 +1312,7 @@ def placeholder_message(file: DiffFile) -> str:
     if file.is_binary:
         return "[Binary file]"
     if file.is_truncated:
-        return "Diff truncated by the forge. Press o to view in browser."
+        return TRUNCATED_NOTICE
     if file.is_empty:
         return "[Empty file]"
     if file.is_mode_only:
@@ -1012,17 +1379,25 @@ def _thread_lines(discussions: list[Discussion]) -> list[Text]:
 
 
 __all__ = [
+    "FOLD_READ_ONLY_MESSAGE",
+    "GENERATED_COMMENT_MESSAGE",
+    "RANGE_CROSSES_GAP_MESSAGE",
+    "READ_ONLY_LINE_MESSAGE",
+    "TRUNCATED_NOTICE",
     "DiffModeChanged",
     "DiffModeState",
     "DiffSelection",
     "DiffSelectionChanged",
     "DiffSide",
     "DiffViewMode",
+    "FileLayout",
+    "FoldMarker",
     "SplitCommentRequested",
     "SplitDiffColumn",
     "SplitDiffView",
     "SplitReplyRequested",
     "SplitResolveRequested",
+    "gap_message",
     "is_actionable",
     "placeholder_message",
 ]

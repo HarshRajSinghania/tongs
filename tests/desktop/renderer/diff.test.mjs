@@ -768,11 +768,12 @@ test("switching the layout re-projects the open snapshot and Refresh reads afres
   fireEvent.click(view.getByText("Refresh"));
   await waitFor(() => assert.equal(opens.length, 4));
 
+  // The diff view always asks for gap rows (#383).
   assert.deepEqual(opens, [
-    { review, layout: "unified", max_items: 1000 },
-    { review, layout: "split", max_items: 1000, from_snapshot: "snapshot-1" },
-    { review, layout: "unified", max_items: 1000, from_snapshot: "snapshot-2" },
-    { review, layout: "unified", max_items: 1000 },
+    { review, layout: "unified", max_items: 1000, gaps: true },
+    { review, layout: "split", max_items: 1000, from_snapshot: "snapshot-1", gaps: true },
+    { review, layout: "unified", max_items: 1000, from_snapshot: "snapshot-2", gaps: true },
+    { review, layout: "unified", max_items: 1000, gaps: true },
   ]);
   // Only the first open and the Refresh may read the forge.
   assert.equal(

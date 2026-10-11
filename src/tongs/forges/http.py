@@ -14,11 +14,13 @@ import httpx
 from tongs.errors import (
     AuthError,
     ConflictError,
+    ContentTooLargeError,
     ForgeError,
     ForgePermissionError,
     NetworkError,
     NotFoundError,
     RateLimitError,
+    UnsupportedFileReadError,
     ValidationError,
     redact_credentials,
 )
@@ -428,29 +430,217 @@ async def _send(
 
     if response.status_code >= 400:
         err = map_http_error(response)
-        if (
-            isinstance(err, RateLimitError)
-            and not _retried
-            and method.upper() in _RETRYABLE_METHODS
-        ):
-            delay = (
-                err.retry_after
-                if err.retry_after is not None
-                else DEFAULT_RETRY_AFTER_SECONDS
-            )
-            if delay > MAX_RETRY_AFTER_SECONDS:
-                log.warning(
-                    "Rate limited on %s %s for %ds; not retrying", method, path, delay
-                )
-                raise err
-            log.warning("Rate limited on %s %s, retrying in %ds", method, path, delay)
-            # The response is already read and closed, so no host request slot
-            # is held while sleeping.
-            await _sleep(delay)
-            return await _send(client, method, path, _retried=True, **kwargs)
+        if not _retried and method.upper() in _RETRYABLE_METHODS:
+            delay = _rate_limit_retry_delay(err, method, path)
+            if delay is not None:
+                # The response is already read and closed, so no host request
+                # slot is held while sleeping.
+                await _sleep(delay)
+                return await _send(client, method, path, _retried=True, **kwargs)
         raise err
 
     return response
+
+
+def _rate_limit_retry_delay(err: ForgeError, method: str, path: str) -> int | None:
+    """Return how long to wait before retrying ``err`` once, or ``None``.
+
+    Only a rate limit is retried, and only when the forge asks for a wait of
+    at most ``MAX_RETRY_AFTER_SECONDS``.
+    """
+    if not isinstance(err, RateLimitError):
+        return None
+    delay = (
+        err.retry_after if err.retry_after is not None else DEFAULT_RETRY_AFTER_SECONDS
+    )
+    if delay > MAX_RETRY_AFTER_SECONDS:
+        log.warning("Rate limited on %s %s for %ds; not retrying", method, path, delay)
+        return None
+    log.warning("Rate limited on %s %s, retrying in %ds", method, path, delay)
+    return delay
+
+
+#: The most bytes of an error body ``request_bytes`` reads before mapping it.
+ERROR_BODY_LIMIT = 64 * 1024
+
+# Headers that describe the wire body, dropped when an error body that was
+# already decoded is rebuilt for ``map_http_error``.
+_WIRE_BODY_HEADERS = frozenset(
+    {"content-encoding", "content-length", "transfer-encoding"}
+)
+
+
+async def request_bytes(
+    client: httpx.AsyncClient,
+    path: str,
+    *,
+    max_bytes: int,
+    params: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> bytes:
+    """GET ``path`` and return its body, refusing bodies over ``max_bytes``.
+
+    The response is streamed, so its host request slot is given back on every
+    exit: a body past the limit, a cancellation and an error status. The read
+    asks for ``Accept-Encoding: identity``, so the wire bytes are the counted
+    bytes: a ``Content-Length`` over the limit is refused before reading, and
+    the limit counts the bytes as they arrive. A forge that compresses the body
+    anyway is still capped on decoded bytes, but its ``Content-Length`` is not
+    trusted for the early refusal, and one wire chunk may briefly decode past
+    the limit before the read is refused. An error status
+    is mapped with ``map_http_error`` from at most ``ERROR_BODY_LIMIT`` bytes
+    of its body, and a rate limit is retried once, as ``request`` does.
+
+    The client's own redirect handling is turned off for this read. A forge
+    answers a read of a renamed or transferred repository with a redirect to
+    the same API, so up to ``MAX_READ_REDIRECTS`` such redirects are followed
+    by hand (see ``_redirect_target``); any other redirect raises
+    UnsupportedFileReadError, because it may lead the forge token elsewhere.
+    """
+    if max_bytes < 0:
+        raise ValueError("max_bytes must not be negative")
+    headers = {**(headers or {}), "Accept-Encoding": "identity"}
+    target: str | httpx.URL = path
+    request_params = params
+    hops = 0
+    retried = False
+    while True:
+        result = await _stream_bytes(
+            client, target, max_bytes, request_params, headers, params
+        )
+        if isinstance(result, bytes):
+            return result
+        if isinstance(result, httpx.URL):
+            hops += 1
+            if hops > MAX_READ_REDIRECTS:
+                raise UnsupportedFileReadError(
+                    "The forge redirected the read too many times"
+                )
+            # The redirect target carries the query, checked against params.
+            target = result
+            request_params = None
+            continue
+        delay = None if retried else _rate_limit_retry_delay(result, "GET", path)
+        if delay is None:
+            raise result
+        retried = True
+        # The response is closed, so no host request slot is held here.
+        await _sleep(delay)
+
+
+#: The most same-API redirects one bounded read follows.
+MAX_READ_REDIRECTS = 2
+_FOLLOWED_REDIRECTS = frozenset({301, 302, 307, 308})
+
+
+def _redirect_target(
+    client: httpx.AsyncClient,
+    response: httpx.Response,
+    params: dict[str, str] | None,
+) -> httpx.URL:
+    """Return where a redirect may be followed, or raise UnsupportedFileReadError.
+
+    Only a 301, 302, 307 or 308 is followed, and only to a Location that,
+    resolved against the request, has the scheme, host and port of the
+    client's base URL, stays under its path (``/`` for api.github.com,
+    ``/api/v3/`` for GitHub Enterprise, ``/api/v4/`` for GitLab), carries no
+    user info or dot segment, and keeps every query parameter of the first
+    request, so a read never moves to another commit.
+    """
+    status = response.status_code
+    refused = UnsupportedFileReadError(
+        f"The forge answered the file read with a redirect ({status})"
+    )
+    location = response.headers.get("Location")
+    if status not in _FOLLOWED_REDIRECTS or not location:
+        raise refused
+    try:
+        target = response.request.url.join(location)
+    except (httpx.InvalidURL, ValueError):
+        raise refused from None
+    base = client.base_url
+    if (
+        target.scheme != base.scheme
+        or target.host != base.host
+        or target.port != base.port
+        or target.userinfo
+        or not target.path.startswith(base.path)
+        or any(segment in {".", ".."} for segment in target.path.split("/"))
+    ):
+        raise refused
+    for name, value in (params or {}).items():
+        if target.params.get_list(name) != [value]:
+            raise refused
+    return target.copy_with(fragment=None)
+
+
+async def _stream_bytes(
+    client: httpx.AsyncClient,
+    target: str | httpx.URL,
+    max_bytes: int,
+    params: dict[str, str] | None,
+    headers: dict[str, str],
+    first_params: dict[str, str] | None,
+) -> bytes | httpx.URL | ForgeError:
+    """Read one response.
+
+    Return its body, the URL of a redirect that may be followed, or the error
+    its status maps to. ``first_params`` are the first request's query
+    parameters, which a followed redirect must keep.
+    """
+    try:
+        async with client.stream(
+            "GET", target, params=params, headers=headers, follow_redirects=False
+        ) as response:
+            status = response.status_code
+            if 300 <= status < 400:
+                return _redirect_target(client, response, first_params)
+            if status >= 400:
+                body = await _read_prefix(response, ERROR_BODY_LIMIT)
+                return map_http_error(_error_response(response, body))
+            length = response.headers.get("Content-Length")
+            encoding = response.headers.get("Content-Encoding", "identity")
+            if (
+                length is not None
+                and encoding.strip().lower() == "identity"
+                and _is_bounded_digits(length.strip())
+                and int(length.strip()) > max_bytes
+            ):
+                raise ContentTooLargeError(max_bytes)
+            data = bytearray()
+            async for chunk in response.aiter_bytes():
+                if len(data) + len(chunk) > max_bytes:
+                    raise ContentTooLargeError(max_bytes)
+                data.extend(chunk)
+            return bytes(data)
+    except httpx.TimeoutException as e:
+        raise NetworkError(f"Request timed out: {redact_credentials(str(e))}") from e
+    except httpx.RequestError as e:
+        raise NetworkError(f"Transport error: {redact_credentials(str(e))}") from e
+
+
+async def _read_prefix(response: httpx.Response, limit: int) -> bytes:
+    data = bytearray()
+    async for chunk in response.aiter_bytes():
+        data.extend(chunk[: limit - len(data)])
+        if len(data) >= limit:
+            break
+    return bytes(data)
+
+
+def _error_response(response: httpx.Response, body: bytes) -> httpx.Response:
+    """Rebuild a streamed error response around its already decoded prefix."""
+    headers = [
+        (name, value)
+        for name, value in response.headers.multi_items()
+        if name.lower() not in _WIRE_BODY_HEADERS
+    ]
+    return httpx.Response(
+        response.status_code,
+        headers=headers,
+        content=body,
+        request=response.request,
+    )
 
 
 async def paginate(

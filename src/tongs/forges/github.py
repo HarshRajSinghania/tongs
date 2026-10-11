@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, fields
@@ -23,12 +24,13 @@ from tongs.errors import (
     ValidationError,
     redact_credentials,
 )
-from tongs.forges.base import ForgeClient
+from tongs.forges.base import ForgeClient, is_full_commit_sha
 from tongs.forges.http import (
     graphql_rate_limit_error,
     map_http_error,
     paginate,
     request,
+    request_bytes,
     request_page,
 )
 from tongs.forges.models import (
@@ -52,6 +54,11 @@ from tongs.forges.models import (
 
 # The pull request files API lists at most this many files.
 _PR_FILES_CAP = 3000
+
+#: The most bytes read from the compare call that finds a merge base. The
+#: paged call answers about 15 KB; an unpaged one can pass 1 MB, so dropping
+#: the paging parameters fails closed.
+MERGE_BASE_MAX_BYTES = 512 * 1024
 
 # The search API returns at most this many results for one query, in pages of
 # at most 100.
@@ -789,6 +796,46 @@ class GitHubClient(ForgeClient):
             f"/repos/{owner}/{repo}/pulls/{number}/files",
         )
         return data
+
+    async def get_file_at_ref(
+        self, repo_path: str, path: str, ref: str, *, max_bytes: int
+    ) -> bytes:
+        """Read one file's raw bytes at a commit through the contents API."""
+        owner, repo = _split_repo_path(repo_path)
+        return await request_bytes(
+            self._http,
+            f"/repos/{owner}/{repo}/contents/{urlquote(path, safe='/')}",
+            max_bytes=max_bytes,
+            params={"ref": ref},
+            headers={"Accept": "application/vnd.github.raw"},
+        )
+
+    async def get_merge_base(self, repo_path: str, base_sha: str, head_sha: str) -> str:
+        """Return the merge base of ``base_sha`` and ``head_sha``.
+
+        The compare call asks for its second page of one commit, which drops
+        the changed-file list, so the body stays small (about 15 KB); the
+        read is still capped at ``MERGE_BASE_MAX_BYTES``. The compare runs on
+        the base repository, which also resolves a head commit on a fork.
+        """
+        if not is_full_commit_sha(base_sha) or not is_full_commit_sha(head_sha):
+            raise ValidationError("A merge base needs two full commit SHAs")
+        owner, repo = _split_repo_path(repo_path)
+        body = await request_bytes(
+            self._http,
+            f"/repos/{owner}/{repo}/compare/{base_sha}...{head_sha}",
+            max_bytes=MERGE_BASE_MAX_BYTES,
+            params={"per_page": "1", "page": "2"},
+        )
+        try:
+            data = json.loads(body)
+        except ValueError:
+            data = None
+        commit = data.get("merge_base_commit") if isinstance(data, dict) else None
+        sha = commit.get("sha") if isinstance(commit, dict) else None
+        if not is_full_commit_sha(sha):
+            raise NotFoundError("The forge returned no merge base")
+        return sha
 
     async def list_mr_commits(self, repo_path: str, number: int) -> list[Commit]:
         owner, repo = _split_repo_path(repo_path)

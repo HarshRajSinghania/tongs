@@ -20,6 +20,8 @@ DEFAULT_SUBMITTED_RETENTION = timedelta(hours=24)
 #: The shortest and longest accepted ``[drafts] submitted_retention`` values.
 MIN_SUBMITTED_RETENTION = timedelta(hours=1)
 MAX_SUBMITTED_RETENTION = timedelta(days=365)
+#: How long a file body read at a commit stays in the cache database by default.
+DEFAULT_FILE_CONTENT_TTL = timedelta(days=1)
 _RETENTION_PATTERN = re.compile(r"([1-9][0-9]{0,5})([hd])")
 
 
@@ -56,6 +58,7 @@ class Config:
     max_cache_size_mb: int = 100
     max_parallel: int = 8
     request_timeout: int = 30
+    file_content_ttl: timedelta = DEFAULT_FILE_CONTENT_TTL
     submitted_draft_retention: timedelta = DEFAULT_SUBMITTED_RETENTION
     extra_hosts: dict[str, HostConfig] = field(default_factory=dict)
     plugin_config: dict[str, dict] = field(default_factory=dict)
@@ -111,6 +114,21 @@ def _submitted_retention(drafts: object) -> timedelta:
     return DEFAULT_SUBMITTED_RETENTION
 
 
+def _file_content_ttl(cache: object) -> timedelta:
+    value = cache.get("file_content_ttl") if isinstance(cache, dict) else None
+    if value is None:
+        return DEFAULT_FILE_CONTENT_TTL
+    try:
+        return parse_retention(value)
+    except ValueError:
+        pass
+    log.warning(
+        "Ignoring an invalid [cache] file_content_ttl; use Xh for hours or "
+        "Xd for days, from 1h to 365d. Using the default of 1d."
+    )
+    return DEFAULT_FILE_CONTENT_TTL
+
+
 def load_config(path: Path | None = None) -> Config:
     """Load config from TOML file. Returns defaults if file doesn't exist."""
     if path is None:
@@ -152,6 +170,7 @@ def load_config(path: Path | None = None) -> Config:
         mr_list_ttl=cache.get("mr_list_ttl", 60),
         diff_ttl=cache.get("diff_ttl", 300),
         max_cache_size_mb=cache.get("max_size_mb", 100),
+        file_content_ttl=_file_content_ttl(cache),
         max_parallel=concurrency.get("max_parallel", 8),
         request_timeout=concurrency.get("request_timeout", 30),
         submitted_draft_retention=_submitted_retention(drafts),

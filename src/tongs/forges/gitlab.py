@@ -11,7 +11,13 @@ import httpx
 
 from tongs.errors import ForgeError, NetworkError, NotFoundError, redact_credentials
 from tongs.forges.base import ForgeClient
-from tongs.forges.http import map_http_error, paginate, request, request_page
+from tongs.forges.http import (
+    map_http_error,
+    paginate,
+    request,
+    request_bytes,
+    request_page,
+)
 from tongs.forges.models import (
     CIStatus,
     Commit,
@@ -201,6 +207,11 @@ class GitLabClient(ForgeClient):
     def __init__(self, host: ForgeHost, http_client: httpx.AsyncClient):
         self._host = host
         self._http = http_client
+
+    @property
+    def revision_base_is_merge_base(self) -> bool:
+        """GitLab's ``diff_refs.base_sha`` is the merge base of the review."""
+        return True
 
     async def list_mrs(
         self,
@@ -411,6 +422,18 @@ class GitLabClient(ForgeClient):
             legacy = await request(self._http, "GET", f"{base}/changes")
             data = legacy.get("changes", []) if isinstance(legacy, dict) else []
         return [change for change in data if isinstance(change, dict)]
+
+    async def get_file_at_ref(
+        self, repo_path: str, path: str, ref: str, *, max_bytes: int
+    ) -> bytes:
+        """Read one file's raw bytes at a commit through the repository files API."""
+        project = _encode_project(repo_path)
+        return await request_bytes(
+            self._http,
+            f"/projects/{project}/repository/files/{urlquote(path, safe='')}/raw",
+            max_bytes=max_bytes,
+            params={"ref": ref},
+        )
 
     async def list_mr_commits(self, repo_path: str, number: int) -> list[Commit]:
         project = _encode_project(repo_path)

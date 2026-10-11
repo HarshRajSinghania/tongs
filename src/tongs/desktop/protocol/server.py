@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import math
 import os
 import secrets
 import sys
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
@@ -34,9 +35,12 @@ from tongs.desktop.protocol.ci_operations import (
     CIOperations,
 )
 from tongs.desktop.protocol.diff_projection import (
+    CachedDiff,
     ConvertedDiffCache,
     DiffLayout,
+    context_wire,
     flatten_diff,
+    flatten_file,
 )
 from tongs.desktop.protocol.messages import (
     DEFAULT_JSON_LIMITS,
@@ -71,13 +75,16 @@ from tongs.desktop.protocol.state import (
     HandleKind,
     HandleRegistry,
     SnapshotStore,
+    retained_size,
 )
 from tongs.desktop.protocol.utility_operations import (
     UTILITY_CAPABILITY,
     UTILITY_METHODS,
     UtilityOperations,
 )
+from tongs.diff.context import GapPosition, file_gaps, verify_new_side
 from tongs.diff.conversion import convert_forge_changes
+from tongs.diff.models import DiffFile
 from tongs.errors import redact_credentials
 from tongs.forges.models import MRState, MRSummary, Pipeline, PipelineJob
 from tongs.plugins.desktop import (
@@ -118,7 +125,8 @@ from tongs.services import (
     ServiceErrorCode,
     ServiceEvent,
 )
-from tongs.services.models import review_cursor_page
+from tongs.services.models import ReviewRevision, review_cursor_page
+from tongs.services.review_files import FileReadStatus, GenerationStatus
 from tongs.services.session import RATE_LIMIT_UNKNOWN_WAIT
 from tongs.state.drafts.models import RecoveryWarning
 
@@ -126,12 +134,44 @@ _DIFF_SNAPSHOT = "diff"
 _DISCUSSIONS_SNAPSHOT = "discussions"
 _LOG_SNAPSHOT = "log"
 _DISCUSSION_PAGE_ITEMS = 400
+_DIFF_PAGE_ITEMS = 400
+
+DIFF_CONTEXT_CAPABILITY = "diff_context"
+#: The most unchanged lines one ``diff.context`` request asks for.
+MAX_CONTEXT_LINES = 1000
+#: The most encoded row bytes one ``diff.context`` response carries.
+MAX_CONTEXT_BYTES = 4 * 1024 * 1024
+# Bounds on the integers a renderer may send: a diff snapshot holds at most
+# 100,000 rows. A gap may start past any line count the service reads, so a
+# line number is bounded only by the largest integer JSON carries exactly; a
+# read of such a file comes back as too_large.
+_MAX_FILE_INDEX = 100_000
+_MAX_LINE_NUMBER = 2**53 - 1
+_MAX_SNAPSHOT_ID_LENGTH = 100
+# JSON values in one context row: the object and its five members.
+_CONTEXT_ROW_VALUES = 6
+# Generated diff snapshots kept on record to release after their last page.
+_MAX_GENERATED_SNAPSHOTS = 64
+_CONTEXT_PARAMS = frozenset({"review", "snapshot", "file_index", "new_start", "count"})
+_GENERATE_PARAMS = frozenset({"review", "snapshot", "file_index"})
+
+CONTEXT_MISMATCH_MESSAGE = (
+    "The file at this commit does not match the diff. Refresh the review."
+)
+"""The terminal's wording for a file read that disagrees with the hunks."""
+DIFF_EXPIRED_MESSAGE = "This diff is no longer open. Reload it to continue."
+GENERATE_NO_ROOM_MESSAGE = (
+    "The generated diff is too large to show with the other diffs already open. "
+    "Close one and try again."
+)
+"""Desktop only: the terminal has no snapshot store, so it never refuses this."""
 
 SUPPORTED_CAPABILITIES = frozenset(
     {
         "assets",
         "cancellation",
         CI_CAPABILITY,
+        DIFF_CONTEXT_CAPABILITY,
         "events",
         "opaque_handles",
         "paged_diffs",
@@ -148,6 +188,8 @@ SUPPORTED_METHODS = (
     "assets.read",
     *CI_METHODS,
     "commits.list",
+    "diff.context",
+    "diff.generate",
     "diff.open",
     "diff.page",
     "discussions.list",
@@ -379,6 +421,9 @@ class DesktopSidecarServer:
         # Converted files of recent diff reads, so a layout switch re-projects
         # the read the reader sees instead of reading the forge again.
         self._diff_cache = ConvertedDiffCache()
+        # One-file snapshots of locally generated diffs, released after their
+        # last page so they never linger next to the review's own diff.
+        self._generated_snapshots: OrderedDict[str, None] = OrderedDict()
         self._assets = AssetCatalog()
         self._operations: dict[str, _Operation] = {}
         self._pending: dict[str, _PendingRequest] = {}
@@ -476,6 +521,8 @@ class DesktopSidecarServer:
             "assets.list": self._assets_list,
             "assets.read": self._assets_read,
             "commits.list": self._commits_list,
+            "diff.context": self._diff_context,
+            "diff.generate": self._diff_generate,
             "diff.open": self._diff_open,
             "diff.page": self._diff_page,
             "discussions.list": self._discussions_list,
@@ -902,12 +949,19 @@ class DesktopSidecarServer:
         shows the same revision. A snapshot the cache no longer holds falls
         back to a fresh read. An open without it is a fresh read, and it drops
         the review's cached files before reading.
+
+        With ``gaps`` true, expandable files also carry ``gap`` rows for the
+        unchanged lines around their hunks. They come from the hunks alone,
+        so asking for them reads nothing more from the forge.
         """
         _require_params(
             params,
-            allowed=frozenset({"review", "layout", "max_items", "from_snapshot"}),
+            allowed=frozenset(
+                {"review", "layout", "max_items", "from_snapshot", "gaps"}
+            ),
             required=frozenset({"review"}),
         )
+        gaps = _optional_bool(params, "gaps", False)
         try:
             layout = DiffLayout(
                 _optional_text(params, "layout", "unified", max_length=20)
@@ -935,7 +989,7 @@ class DesktopSidecarServer:
         else:
             files = cached.files
             revision = cached.revision
-        entries = flatten_diff(files, layout)
+        entries = flatten_diff(files, layout, gaps=gaps)
         snapshot_id = self._snapshots.create(
             review_handle,
             revision,
@@ -944,9 +998,11 @@ class DesktopSidecarServer:
             kind=_DIFF_SNAPSHOT,
         )
         if cached is None:
-            self._diff_cache.store(review_handle, snapshot_id, revision, files)
+            self._diff_cache.store(
+                review_handle, snapshot_id, revision, files, layout=layout
+            )
         else:
-            self._diff_cache.remember(review_handle, snapshot_id)
+            self._diff_cache.remember(review_handle, snapshot_id, layout=layout)
         return self._snapshot_page_wire(
             self._snapshots.page(
                 snapshot_id,
@@ -968,10 +1024,196 @@ class DesktopSidecarServer:
             params["snapshot"],
             params["resource"],
             params["cursor"],
-            params.get("max_items", 400),
+            params.get("max_items", _DIFF_PAGE_ITEMS),
             kind=_DIFF_SNAPSHOT,
         )
+        if page.next_cursor is None:
+            self._release_generated(page.snapshot_id)
         return self._snapshot_page_wire(page)
+
+    async def _diff_context(
+        self, params: JsonObject, _context: RequestContext
+    ) -> object:
+        """Return unchanged lines of one file in a gap of an open diff.
+
+        The renderer names the review, a diff snapshot this connection
+        projected for it, the file's index in that snapshot and a run of new
+        line numbers; never a path or a commit. The file is read at the head
+        of the revision the snapshot shows and checked against its hunks
+        before any line is returned. The lines come back inline, never as a
+        retained snapshot, so expanding can never evict the diff being read.
+        A response holds at most ``count`` lines, stops at the end of the gap
+        and before ``MAX_CONTEXT_BYTES``; the renderer asks again from the
+        next line for the rest.
+        """
+        _require_params(params, allowed=_CONTEXT_PARAMS, required=_CONTEXT_PARAMS)
+        review_handle = _text(params, "review", max_length=100)
+        snapshot = _text(params, "snapshot", max_length=_MAX_SNAPSHOT_ID_LENGTH)
+        file_index = _required_int(params, "file_index", 0, _MAX_FILE_INDEX)
+        new_start = _required_int(params, "new_start", 1, _MAX_LINE_NUMBER)
+        count = _required_int(params, "count", 1, MAX_CONTEXT_LINES)
+        review = self._handles.resolve(review_handle, HandleKind.REVIEW, ReviewRef)
+        source = self._diff_source(review_handle, snapshot, file_index)
+        if source is None:
+            return _context_result("expired", DIFF_EXPIRED_MESSAGE)
+        cached, file, _layout = source
+        _require_gap_line(file, new_start)
+        revision = _revision_from_wire(cached.revision)
+        read = await self._session.review_files.read_file(
+            review, file.new_path, revision.head_sha
+        )
+        text = read.text
+        if read.status is not FileReadStatus.OK or text is None:
+            return _context_result(read.status.value, read.message)
+        if not verify_new_side(file, text.lines, text.ends_with_newline):
+            return _context_result("mismatch", CONTEXT_MISMATCH_MESSAGE)
+        rows = self._context_rows(file_index, file, text.lines, new_start, count)
+        return {
+            "status": "ok",
+            "message": None,
+            "line_count": len(text.lines),
+            "rows": rows,
+        }
+
+    def _context_rows(
+        self,
+        file_index: int,
+        file: DiffFile,
+        lines: tuple[str, ...],
+        new_start: int,
+        count: int,
+    ) -> list[JsonValue]:
+        """Rows for the gap lines from ``new_start``, within every bound."""
+        gap = next(
+            (
+                gap
+                for gap in file_gaps(file, len(lines))
+                if gap.length is not None
+                and gap.new_start <= new_start < gap.new_start + gap.length
+            ),
+            None,
+        )
+        if gap is None:
+            # The file ends where the last hunk ends: the gap after it is empty.
+            return []
+        end = min(new_start + count, gap.new_start + gap.length)
+        # Half the negotiated value budget leaves ample room for the envelope.
+        max_rows = max(1, (self._json_limits.values // 2) // _CONTEXT_ROW_VALUES)
+        rows: list[JsonValue] = []
+        size = 0
+        for new_line in range(new_start, end):
+            if len(rows) >= max_rows:
+                break
+            row = context_wire(
+                file_index,
+                gap.old_start + (new_line - gap.new_start),
+                new_line,
+                lines[new_line - 1],
+            )
+            row_size = len(
+                json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode()
+            )
+            if size + row_size > MAX_CONTEXT_BYTES:
+                if not rows:
+                    raise ProtocolError(
+                        ProtocolErrorCode.RESPONSE_TOO_LARGE,
+                        "This line is too long to show.",
+                    )
+                break
+            rows.append(row)
+            size += row_size
+        return rows
+
+    async def _diff_generate(
+        self, params: JsonObject, _context: RequestContext
+    ) -> object:
+        """Generate one truncated file's diff locally and return its first page.
+
+        The file is resolved like ``diff.context``. On success the generated
+        file is projected on its own, at its original index and in the layout
+        of the snapshot it came from, into a new diff snapshot that is read
+        with ``diff.page`` and released after its last page. The snapshot is
+        created only when the store has room for it without evicting another
+        one. A cancel frame stops the generation and keeps nothing.
+        """
+        _require_params(params, allowed=_GENERATE_PARAMS, required=_GENERATE_PARAMS)
+        review_handle = _text(params, "review", max_length=100)
+        snapshot = _text(params, "snapshot", max_length=_MAX_SNAPSHOT_ID_LENGTH)
+        file_index = _required_int(params, "file_index", 0, _MAX_FILE_INDEX)
+        review = self._handles.resolve(review_handle, HandleKind.REVIEW, ReviewRef)
+        source = self._diff_source(review_handle, snapshot, file_index)
+        if source is None:
+            return _generate_failure("expired", DIFF_EXPIRED_MESSAGE)
+        cached, file, layout = source
+        revision = _revision_from_wire(cached.revision)
+        generated = await self._session.review_files.generate_file_diff(
+            review, revision, file
+        )
+        if generated.status is not GenerationStatus.OK or generated.file is None:
+            return _generate_failure(generated.status.value, generated.message)
+        entries = flatten_file(file_index, generated.file, layout)
+        if not self._snapshots.can_retain(
+            len(entries), retained_size(cached.revision, entries)
+        ):
+            return _generate_failure("too_large", GENERATE_NO_ROOM_MESSAGE)
+        snapshot_id = self._snapshots.create(
+            review_handle,
+            cached.revision,
+            entries,
+            projection=layout.value,
+            kind=_DIFF_SNAPSHOT,
+        )
+        self._generated_snapshots[snapshot_id] = None
+        while len(self._generated_snapshots) > _MAX_GENERATED_SNAPSHOTS:
+            self._generated_snapshots.popitem(last=False)
+        try:
+            page = self._snapshots.page(
+                snapshot_id, review_handle, 0, _DIFF_PAGE_ITEMS, kind=_DIFF_SNAPSHOT
+            )
+        except BaseException:
+            self._release_generated(snapshot_id)
+            raise
+        if page.next_cursor is None:
+            self._release_generated(snapshot_id)
+        return {
+            "status": "ok",
+            "message": None,
+            "generated": True,
+            **self._snapshot_page_wire(page),
+        }
+
+    def _diff_source(
+        self, review_handle: str, snapshot: str, file_index: int
+    ) -> tuple[CachedDiff, DiffFile, DiffLayout] | None:
+        """Resolve a file of an open diff, or None when the read is gone.
+
+        Only a snapshot projected from the review's cached read resolves, so
+        the file and the revision are the ones the reader sees. A snapshot of
+        another review is refused outright.
+        """
+        layout = self._diff_cache.layout(review_handle, snapshot)
+        if layout is None:
+            owner = self._diff_cache.owner(snapshot)
+            if owner is not None and owner != review_handle:
+                raise ProtocolError(
+                    ProtocolErrorCode.INVALID_PARAMS,
+                    "The diff snapshot belongs to another review.",
+                )
+            return None
+        cached = self._diff_cache.lookup(review_handle, snapshot)
+        if cached is None:
+            return None
+        if file_index >= len(cached.files):
+            raise ProtocolError(
+                ProtocolErrorCode.INVALID_PARAMS,
+                "The file_index parameter is invalid.",
+            )
+        return cached, cached.files[file_index], layout
+
+    def _release_generated(self, snapshot_id: str) -> None:
+        if snapshot_id in self._generated_snapshots:
+            del self._generated_snapshots[snapshot_id]
+            self._snapshots.expire(snapshot_id)
 
     async def _discussions_list(
         self, params: JsonObject, _context: RequestContext
@@ -1533,6 +1775,7 @@ class DesktopSidecarServer:
             await _bounded_cleanup(self._editor_exports.close(), self._shutdown_timeout)
         self._snapshots.clear()
         self._diff_cache.clear()
+        self._generated_snapshots.clear()
         self._handles.clear()
         self._assets.clear()
         await self._events.close()
@@ -1824,6 +2067,70 @@ def _optional_int(
             f"The {key} parameter is invalid.",
         )
     return value
+
+
+def _required_int(params: JsonObject, key: str, minimum: int, maximum: int) -> int:
+    if key not in params:
+        raise ProtocolError(
+            ProtocolErrorCode.INVALID_PARAMS,
+            f"The {key} parameter is invalid.",
+        )
+    return _optional_int(params, key, minimum, minimum=minimum, maximum=maximum)
+
+
+def _require_gap_line(file: DiffFile, new_start: int) -> None:
+    """Refuse a line outside the file's gaps before anything is read.
+
+    The gap after the last hunk has no known end until the file is read, so
+    any line from its start on is accepted here and bounded after the read.
+    """
+    for gap in file_gaps(file):
+        if gap.length is None:
+            if gap.position is GapPosition.AFTER and new_start >= gap.new_start:
+                return
+        elif gap.new_start <= new_start < gap.new_start + gap.length:
+            return
+    raise ProtocolError(
+        ProtocolErrorCode.INVALID_PARAMS,
+        "The requested lines are not unchanged lines of this file.",
+    )
+
+
+def _revision_from_wire(value: JsonObject) -> ReviewRevision:
+    head_sha = value.get("head_sha")
+    base_sha = value.get("base_sha")
+    start_sha = value.get("start_sha")
+    if (
+        isinstance(head_sha, str)
+        and isinstance(base_sha, str)
+        and (start_sha is None or isinstance(start_sha, str))
+    ):
+        try:
+            return ReviewRevision(head_sha, base_sha, start_sha)
+        except ValueError:
+            pass
+    raise ProtocolError(
+        ProtocolErrorCode.INTERNAL,
+        "The diff revision could not be resolved safely.",
+    )
+
+
+def _context_result(status: str, message: str) -> JsonObject:
+    return {"status": status, "message": message, "line_count": None, "rows": []}
+
+
+def _generate_failure(status: str, message: str) -> JsonObject:
+    return {
+        "status": status,
+        "message": message,
+        "generated": False,
+        "snapshot_id": None,
+        "resource": None,
+        "revision": None,
+        "cursor": None,
+        "next_cursor": None,
+        "entries": [],
+    }
 
 
 def _summary_wire(summary: MRSummary) -> JsonObject:

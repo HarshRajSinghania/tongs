@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable
 from functools import partial
 
+from tongs.config import DEFAULT_FILE_CONTENT_TTL
 from tongs.errors import AuthError
 from tongs.forges.auth import refresh_token, resolve_token
 from tongs.forges.base import ForgeClient
@@ -55,6 +56,7 @@ class ForgeRegistry:
         mr_list_ttl: int = 60,
         diff_ttl: int = 300,
         *,
+        file_content_ttl: int = int(DEFAULT_FILE_CONTENT_TTL.total_seconds()),
         max_parallel: int | None = None,
         auth_failure_ttl: float = AUTH_FAILURE_TTL_SECONDS,
         auth_retry_grace: float = AUTH_RETRY_GRACE_SECONDS,
@@ -68,6 +70,7 @@ class ForgeRegistry:
         self._cache = cache
         self._mr_list_ttl = mr_list_ttl
         self._diff_ttl = diff_ttl
+        self._file_content_ttl = file_content_ttl
         self._max_parallel = max_parallel
         self._auth_failure_ttl = auth_failure_ttl
         self._auth_retry_grace = auth_retry_grace
@@ -146,6 +149,7 @@ class ForgeRegistry:
                 hostname=hostname,
                 mr_list_ttl=self._mr_list_ttl,
                 diff_ttl=self._diff_ttl,
+                file_content_ttl=self._file_content_ttl,
             )
 
         self._clients[hostname] = client

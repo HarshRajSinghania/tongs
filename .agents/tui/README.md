@@ -186,6 +186,30 @@ suggestion. `]` and `[` navigate discussion anchors; `d`, `r`, and `R` toggle,
 reply, and resolve. Draft markers are display-only and protect their captured
 lines from context folding.
 
+Unchanged lines outside the hunks expand in place. `e` (`expand_context`) and
+`F` (`toggle_full_file`, "Full file") are bound on `DiffPanel`, so they work
+from either layout and from both split columns, and the help panel lists them.
+`e` opens the gap row under the cursor; on an in-hunk fold it opens with no
+read. `e` on an expanded line, or on a context line shown from a fold, hides
+it again through `DiffContent.collapse_at_cursor()` (`FileExpansion.collapse`
+and `refold`), with no read, and lands on the gap row or fold; in the
+whole-file view that also turns `F` off. `F` shows the whole current file in both layouts, per file, and resets
+when another file is shown. The widgets never read files: they post
+`ContextRequested(file, gap_index)` (None for `F`), and `MRDetailScreen` reads
+the file at the displayed head once and answers through
+`DiffPanel.apply_file_context()` or `file_context_failed()`.
+
+Each list keeps three row maps. `_line_map` holds the hunk lines that can
+anchor a comment or form a `DiffSelection`. `_gap_rows` holds collapsed gaps
+and in-hunk folds, and `_readonly_rows` holds expanded lines. Both take the
+cursor but never enter `_line_map`, so comment, reply, resolve and thread keys
+on them notify "Expanded lines are read-only. Comment on a line inside a hunk."
+and a `J`/`K` range across a gap row is refused. In split view both columns
+register the same gap and expanded rows at the same index, so the cursor stays
+in step. The expansion state lives in `DiffContent`, so `v` keeps it. All gap
+row text is ASCII. See `.agents/diff/README.md` (Expand in Place) for the gap
+model.
+
 `src/tongs/views/suggestion.py` contains pure helpers. GitLab suggestion fences
 describe how many original lines replacement content covers. GitHub anchors a
 multi-line suggestion at the final new line and supplies

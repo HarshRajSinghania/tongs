@@ -1,0 +1,77 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "gitlab",
+    "question": "2: diff_refs.base_sha equals the git merge base",
+    "source": "gitlab-org/gitlab MRs 261339, 259765, 261289 (all fork MRs where start_sha moved past base_sha)",
+    "finding": "In all three MRs GET /repository/merge_base?refs[]=start_sha&refs[]=head_sha returned diff_refs.base_sha, so on GitLab the revision base is the merge base and needs no extra call.",
+    "samples": [
+      {
+        "iid": 261339,
+        "base_sha": "3bd0c31bfb2202f0ec4f80022b6db05c0a9af68e",
+        "start_sha": "b0b523cffa1f0ad0ae9e20053bec9628130a6115",
+        "merge_base": "3bd0c31bfb2202f0ec4f80022b6db05c0a9af68e"
+      },
+      {
+        "iid": 259765,
+        "base_sha": "f1d4fb379294cba21173703e656a02fd54e49a78",
+        "start_sha": "88813472db829cd518feeb450223e2d1c2a507d4",
+        "merge_base": "f1d4fb379294cba21173703e656a02fd54e49a78"
+      },
+      {
+        "iid": 261289,
+        "base_sha": "d77ac9dd14280e9f4f1089f4446d05fcdeac71d6",
+        "start_sha": "70f446140a95d4e4496d4a185c55f1da79398e7c",
+        "merge_base": "d77ac9dd14280e9f4f1089f4446d05fcdeac71d6"
+      }
+    ]
+  },
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/projects/278964/repository/merge_base",
+        "params": {
+          "refs[]": [
+            "b0b523cffa1f0ad0ae9e20053bec9628130a6115",
+            "18682b01c2443b695561d1f5166de47f87c745b2"
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "Etag": "W/\"12e309c689d6e03349a9e1fbde49045b\"",
+          "Ratelimit-Limit": "2000",
+          "Ratelimit-Name": "throttle_authenticated_api",
+          "Ratelimit-Observed": "18",
+          "Ratelimit-Remaining": "1982",
+          "Ratelimit-Reset": "1791690060"
+        },
+        "body_bytes": 1072,
+        "body_json": {
+          "id": "3bd0c31bfb2202f0ec4f80022b6db05c0a9af68e",
+          "short_id": "3bd0c31b",
+          "created_at": "2026-10-07T13:47:07.000+02:00",
+          "parent_ids": [
+            "5b43e5fbb12aef3dabacbbdd05d0778137642428",
+            "243b18e88da7cdf5b88128354b7cc9174b6e7c78"
+          ],
+          "title": "Example commit message",
+          "message": "Example commit message\n",
+          "author_name": "Example Author",
+          "author_email": "author@example.com",
+          "authored_date": "2026-10-07T13:47:07.000+02:00",
+          "committer_name": "Example Author",
+          "committer_email": "author@example.com",
+          "committed_date": "2026-10-07T13:47:07.000+02:00",
+          "trailers": {},
+          "extended_trailers": {},
+          "web_url": "https://gitlab.com/gitlab-org/gitlab/-/commit/3bd0c31bfb2202f0ec4f80022b6db05c0a9af68e"
+        },
+        "body_trimmed": true
+      }
+    }
+  ]
+}

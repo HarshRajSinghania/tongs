@@ -1,0 +1,206 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "github",
+    "question": "1: paths with spaces, unicode, '#', '?' and '%'",
+    "source": "github-linguist/linguist (public)",
+    "finding": "urllib.parse.quote(path, safe='/') works for every case. Bodies are third-party sample code and are omitted."
+  },
+  "exchanges": [
+    {
+      "case": "space_and_unicode",
+      "repo_path": "samples/1C Enterprise/Document.РасходТовара.ObjectModule.bsl",
+      "request": {
+        "method": "GET",
+        "path": "/repos/github-linguist/linguist/contents/samples/1C%20Enterprise/Document.%D0%A0%D0%B0%D1%81%D1%85%D0%BE%D0%B4%D0%A2%D0%BE%D0%B2%D0%B0%D1%80%D0%B0.ObjectModule.bsl",
+        "params": {
+          "ref": "5fbdfcb8133be2bed88bf3ce62b2335f50474525"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Length": "17010",
+          "Content-Type": "application/vnd.github.raw; charset=utf-8",
+          "Etag": "\"1edbfb085c08184e8888e48b22d8dd1e8febeecb\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4972",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "28"
+        },
+        "body_bytes": 17010,
+        "body_omitted": "third-party or bulky file content; size and git blob id recorded",
+        "body_git_blob_sha1": "1edbfb085c08184e8888e48b22d8dd1e8febeecb"
+      }
+    },
+    {
+      "case": "hash",
+      "repo_path": "samples/C#/AssemblyInfo.cs",
+      "request": {
+        "method": "GET",
+        "path": "/repos/github-linguist/linguist/contents/samples/C%23/AssemblyInfo.cs",
+        "params": {
+          "ref": "5fbdfcb8133be2bed88bf3ce62b2335f50474525"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Length": "971",
+          "Content-Type": "application/vnd.github.raw; charset=utf-8",
+          "Etag": "\"1ef68427bfb5b3c25ee783ac3b1c22fa8b6154df\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4971",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "29"
+        },
+        "body_bytes": 971,
+        "body_omitted": "third-party or bulky file content; size and git blob id recorded",
+        "body_git_blob_sha1": "1ef68427bfb5b3c25ee783ac3b1c22fa8b6154df"
+      }
+    },
+    {
+      "case": "percent",
+      "repo_path": "samples/BitBake/qtbase_%.bbappend",
+      "request": {
+        "method": "GET",
+        "path": "/repos/github-linguist/linguist/contents/samples/BitBake/qtbase_%25.bbappend",
+        "params": {
+          "ref": "5fbdfcb8133be2bed88bf3ce62b2335f50474525"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Length": "1152",
+          "Content-Type": "application/vnd.github.raw; charset=utf-8",
+          "Etag": "\"6d3de3f8a7177ad191886d466e33160365e456f9\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4970",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "30"
+        },
+        "body_bytes": 1152,
+        "body_omitted": "third-party or bulky file content; size and git blob id recorded",
+        "body_git_blob_sha1": "6d3de3f8a7177ad191886d466e33160365e456f9"
+      }
+    },
+    {
+      "case": "cjk",
+      "repo_path": "test/fixtures/Generic/url/INI/绿盟.url",
+      "request": {
+        "method": "GET",
+        "path": "/repos/github-linguist/linguist/contents/test/fixtures/Generic/url/INI/%E7%BB%BF%E7%9B%9F.url",
+        "params": {
+          "ref": "5fbdfcb8133be2bed88bf3ce62b2335f50474525"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Length": "285",
+          "Content-Type": "application/vnd.github.raw; charset=utf-8",
+          "Etag": "\"163e1a33739850a8053713badbb5ffc1e91a4bb1\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4969",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "31"
+        },
+        "body_bytes": 285,
+        "body_omitted": "third-party or bulky file content; size and git blob id recorded",
+        "body_git_blob_sha1": "163e1a33739850a8053713badbb5ffc1e91a4bb1"
+      }
+    },
+    {
+      "case": "hash_unquoted",
+      "repo_path": "samples/C#/AssemblyInfo.cs",
+      "request": {
+        "method": "GET",
+        "path": "/repos/github-linguist/linguist/contents/samples/C#/AssemblyInfo.cs",
+        "params": {
+          "ref": "5fbdfcb8133be2bed88bf3ce62b2335f50474525"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Length": "49402",
+          "Content-Type": "application/json; charset=utf-8",
+          "Etag": "\"56c014880db1717db09b0ab1f0542f529c6cf0c1\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4968",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "32"
+        },
+        "body_bytes": 49402,
+        "body_json": [
+          {
+            "name": "2D.C",
+            "path": "samples/C/2D.C",
+            "type": "file"
+          },
+          {
+            "name": "2D.H",
+            "path": "samples/C/2D.H",
+            "type": "file"
+          }
+        ],
+        "body_trimmed": true,
+        "note": "The unquoted '#' starts a URL fragment, so the request reads the directory samples/C and gets a JSON listing with status 200. Quoting is required, and so is the Content-Type check."
+      }
+    },
+    {
+      "case": "question_mark_quoted_probe",
+      "repo_path": "samples/C?x",
+      "request": {
+        "method": "GET",
+        "path": "/repos/github-linguist/linguist/contents/samples/C%3Fx",
+        "params": {
+          "ref": "5fbdfcb8133be2bed88bf3ce62b2335f50474525"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "Content-Length": "127",
+          "Content-Type": "application/json; charset=utf-8",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4967",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "33"
+        },
+        "body_bytes": 127,
+        "body_json": {
+          "message": "Not Found",
+          "documentation_url": "https://docs.github.com/rest/repos/contents#get-repository-content",
+          "status": "404"
+        },
+        "note": "No public file with '?' in its name was found. The quoted probe is a plain 404 for the literal path, so %3F is taken as part of the path and not as a query."
+      }
+    }
+  ]
+}

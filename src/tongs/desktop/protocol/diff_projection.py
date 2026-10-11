@@ -8,6 +8,7 @@ from enum import StrEnum
 
 from tongs.desktop.protocol.messages import JsonObject
 from tongs.diff.alignment import align_hunk
+from tongs.diff.context import DiffGap, file_gaps
 from tongs.diff.models import DiffFile, DiffHunk, DiffLine, SplitDiffRow
 
 
@@ -19,24 +20,72 @@ class DiffLayout(StrEnum):
 
 
 def flatten_diff(
-    files: tuple[DiffFile, ...], layout: DiffLayout
+    files: tuple[DiffFile, ...], layout: DiffLayout, *, gaps: bool = False
 ) -> tuple[JsonObject, ...]:
-    """Serialize files using one immutable projection for the whole snapshot."""
+    """Serialize files using one immutable projection for the whole snapshot.
+
+    With ``gaps`` every expandable file also gets a ``gap`` row before each
+    hunk that unchanged lines precede and one after its last hunk when lines
+    can follow it. Without it the projection is exactly what it was before
+    gap rows existed, so a renderer that never asks for them sees no change.
+    """
     entries: list[JsonObject] = []
     for file_index, file in enumerate(files):
-        entries.append(_file_wire(file_index, file))
-        for hunk_index, hunk in enumerate(file.hunks):
-            entries.append(_hunk_wire(file_index, hunk_index, hunk))
-            if layout is DiffLayout.UNIFIED:
-                entries.extend(
-                    _line_wire(file_index, hunk_index, line) for line in hunk.lines
-                )
-            else:
-                entries.extend(
-                    _split_row_wire(file_index, hunk_index, row_index, row)
-                    for row_index, row in enumerate(align_hunk(hunk))
-                )
+        entries.extend(flatten_file(file_index, file, layout, gaps=gaps))
     return tuple(entries)
+
+
+def flatten_file(
+    file_index: int, file: DiffFile, layout: DiffLayout, *, gaps: bool = False
+) -> tuple[JsonObject, ...]:
+    """Serialize one file at ``file_index``, as ``flatten_diff`` would."""
+    entries: list[JsonObject] = [_file_wire(file_index, file)]
+    by_hunk = {gap.hunk_index: gap for gap in file_gaps(file)} if gaps else {}
+    for hunk_index, hunk in enumerate(file.hunks):
+        gap = by_hunk.get(hunk_index)
+        if gap is not None:
+            entries.append(_gap_wire(file_index, gap))
+        entries.append(_hunk_wire(file_index, hunk_index, hunk))
+        if layout is DiffLayout.UNIFIED:
+            entries.extend(
+                _line_wire(file_index, hunk_index, line) for line in hunk.lines
+            )
+        else:
+            entries.extend(
+                _split_row_wire(file_index, hunk_index, row_index, row)
+                for row_index, row in enumerate(align_hunk(hunk))
+            )
+    after = by_hunk.get(len(file.hunks))
+    if after is not None:
+        entries.append(_gap_wire(file_index, after))
+    return tuple(entries)
+
+
+def context_wire(
+    file_index: int, old_line: int, new_line: int, content: str
+) -> JsonObject:
+    """One unchanged line read from the file, outside any hunk."""
+    return {
+        "kind": "context",
+        "file_index": file_index,
+        "old_line": old_line,
+        "new_line": new_line,
+        "content": content,
+    }
+
+
+def _gap_wire(file_index: int, gap: DiffGap) -> JsonObject:
+    # ``count`` is null for the gap after the last hunk: its length is only
+    # known once the file is read, and it may turn out to be empty.
+    return {
+        "kind": "gap",
+        "file_index": file_index,
+        "gap_index": gap.index,
+        "position": gap.position.value,
+        "old_start": gap.old_start,
+        "new_start": gap.new_start,
+        "count": gap.length,
+    }
 
 
 def _file_wire(file_index: int, file: DiffFile) -> JsonObject:
@@ -136,7 +185,8 @@ class CachedDiff:
 class _CacheEntry:
     diff: CachedDiff
     line_count: int
-    snapshot_ids: tuple[str, ...]
+    # Each snapshot projected from this read, with the layout it was in.
+    snapshots: tuple[tuple[str, DiffLayout], ...]
 
 
 class ConvertedDiffCache:
@@ -174,6 +224,8 @@ class ConvertedDiffCache:
         snapshot_id: str,
         revision: JsonObject,
         files: tuple[DiffFile, ...],
+        *,
+        layout: DiffLayout = DiffLayout.UNIFIED,
     ) -> None:
         """Keep the files of a fresh read, replacing the review's older entry."""
         self.drop(review_handle)
@@ -187,26 +239,48 @@ class ConvertedDiffCache:
             _handle, evicted = self._entries.popitem(last=False)
             self._lines -= evicted.line_count
         self._entries[review_handle] = _CacheEntry(
-            CachedDiff(revision, files), line_count, (snapshot_id,)
+            CachedDiff(revision, files), line_count, ((snapshot_id, layout),)
         )
         self._lines += line_count
 
     def lookup(self, review_handle: str, snapshot_id: str) -> CachedDiff | None:
         """Return the cached read ``snapshot_id`` was projected from, if kept."""
-        entry = self._entries.get(review_handle)
-        if entry is None or snapshot_id not in entry.snapshot_ids:
+        if self.layout(review_handle, snapshot_id) is None:
             return None
         self._entries.move_to_end(review_handle)
-        return entry.diff
+        return self._entries[review_handle].diff
 
-    def remember(self, review_handle: str, snapshot_id: str) -> None:
+    def layout(self, review_handle: str, snapshot_id: str) -> DiffLayout | None:
+        """Return the layout ``snapshot_id`` was projected in, if it is kept."""
+        entry = self._entries.get(review_handle)
+        if entry is None:
+            return None
+        for kept_id, layout in entry.snapshots:
+            if kept_id == snapshot_id:
+                return layout
+        return None
+
+    def owner(self, snapshot_id: str) -> str | None:
+        """Return the review handle whose cached read ``snapshot_id`` is from."""
+        for review_handle, entry in self._entries.items():
+            if any(kept_id == snapshot_id for kept_id, _layout in entry.snapshots):
+                return review_handle
+        return None
+
+    def remember(
+        self,
+        review_handle: str,
+        snapshot_id: str,
+        *,
+        layout: DiffLayout = DiffLayout.UNIFIED,
+    ) -> None:
         """Record another snapshot projected from the review's cached read."""
         entry = self._entries.get(review_handle)
         if entry is None:
             return
-        snapshot_ids = (*entry.snapshot_ids, snapshot_id)[-self._max_snapshots :]
+        snapshots = (*entry.snapshots, (snapshot_id, layout))[-self._max_snapshots :]
         self._entries[review_handle] = _CacheEntry(
-            entry.diff, entry.line_count, snapshot_ids
+            entry.diff, entry.line_count, snapshots
         )
 
     def drop(self, review_handle: str) -> None:
@@ -225,4 +299,11 @@ def _line_count(files: tuple[DiffFile, ...]) -> int:
     )
 
 
-__all__ = ["CachedDiff", "ConvertedDiffCache", "DiffLayout", "flatten_diff"]
+__all__ = [
+    "CachedDiff",
+    "ConvertedDiffCache",
+    "DiffLayout",
+    "context_wire",
+    "flatten_diff",
+    "flatten_file",
+]

@@ -1,5 +1,13 @@
 import type { IpcMainInvokeEvent, WebContents } from "electron";
-import { CI_STATUS_VALUES, type JsonObject, type JsonValue } from "../shared/bridge.js";
+import {
+  CI_STATUS_VALUES,
+  DIFF_CONTEXT_STATUSES,
+  DIFF_GAP_POSITIONS,
+  GENERATE_DIFF_STATUSES,
+  MAX_DIFF_CONTEXT_LINES,
+  type JsonObject,
+  type JsonValue,
+} from "../shared/bridge.js";
 
 export const APP_ORIGIN = "tongs://app";
 export const APP_DOCUMENT = `${APP_ORIGIN}/index.html`;
@@ -24,6 +32,14 @@ const MAX_IPC_BYTES = 256 * 1024;
 const MAX_TEXT = 2048;
 // The longest rate-limit wait a CI lookup may name (a day, in seconds).
 const MAX_RATE_LIMIT_WAIT_SECONDS = 86_400;
+// Bounds the service applies to a file index and to the line count of a file
+// it reads, and the most encoded bytes of unchanged lines one context read
+// returns. Line numbers in a diff have no upper bound: a small patch to a long
+// file still opens, and a read past the cap comes back as too_large.
+const MAX_FILE_INDEX = 100_000;
+const MAX_LINE_COUNT = 1_000_000;
+const MAX_CONTEXT_BYTES = 4 * 1024 * 1024;
+const SNAPSHOT_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 export function assertAuthorizedSender(event: IpcMainInvokeEvent, owner: WebContents): void {
   if (event.sender !== owner || event.senderFrame !== owner.mainFrame || event.senderFrame.url !== APP_DOCUMENT) {
@@ -43,7 +59,9 @@ export function assertParams(method: string, value: unknown): asserts value is J
     "reviews.get": { required: ["review"] }, "discussions.list": { required: ["review"] },
     "reviews.ci_status": { required: ["review"], optional: ["fresh"] },
     "commits.list": { required: ["review"] }, "jobs.list": { required: ["pipeline"] },
-    "diff.open": { required: ["review"], optional: ["layout", "max_items", "from_snapshot"] },
+    "diff.open": { required: ["review"], optional: ["layout", "max_items", "from_snapshot", "gaps"] },
+    "diff.context": { required: ["review", "snapshot", "file_index", "new_start", "count"] },
+    "diff.generate": { required: ["review", "snapshot", "file_index"] },
     "logs.open": { required: ["job"], optional: ["max_items"] },
     "diff.page": { required: ["snapshot", "resource", "cursor"], optional: ["max_items"] },
     "discussions.page": { required: ["snapshot", "resource", "cursor"], optional: ["max_items"] },
@@ -62,9 +80,15 @@ export function assertParams(method: string, value: unknown): asserts value is J
     if (method === "reviews.list" && key === "cursor") {
       // An opaque cursor the service sealed; the service rejects forged ones.
       if (item !== null && (typeof item !== "string" || !/^[A-Za-z0-9._-]{1,64}$/.test(item))) throw new Error("Invalid desktop cursor parameter");
-    } else if (method === "diff.open" && key === "from_snapshot") {
-      // The snapshot id a diff open issued, for a layout switch that reuses it.
-      if (typeof item !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(item)) throw new Error("Invalid desktop snapshot parameter");
+    } else if ((method === "diff.open" && key === "from_snapshot") || ((method === "diff.context" || method === "diff.generate") && key === "snapshot")) {
+      // The snapshot id a diff open issued, for a layout switch that reuses it
+      // or for a context read or generation that names a file of it.
+      if (typeof item !== "string" || !SNAPSHOT_ID.test(item)) throw new Error("Invalid desktop snapshot parameter");
+    } else if (method === "diff.open" && key === "gaps") {
+      if (typeof item !== "boolean") throw new Error("Invalid desktop boolean parameter");
+    } else if ((method === "diff.context" || method === "diff.generate") && ["file_index", "new_start", "count"].includes(key)) {
+      const [minimum, maximum] = key === "file_index" ? [0, MAX_FILE_INDEX] : key === "new_start" ? [1, Number.MAX_SAFE_INTEGER] : [1, MAX_DIFF_CONTEXT_LINES];
+      if (!Number.isSafeInteger(item) || Number(item) < minimum || Number(item) > maximum) throw new Error("Invalid desktop numeric parameter");
     } else if ((method === "reviews.list" || method === "reviews.ci_status") && key === "fresh") {
       // An explicit refresh that reads past the service's list cache.
       if (typeof item !== "boolean") throw new Error("Invalid desktop boolean parameter");
@@ -130,6 +154,8 @@ function assertResultValue(method: string, value: unknown): asserts value is Jso
     return;
   }
   if (method === "diff.open" || method === "diff.page") return assertSnapshot(value, assertDiffRow, assertRevision);
+  if (method === "diff.context") return assertDiffContext(value);
+  if (method === "diff.generate") return assertGeneratedDiff(value);
   if (method === "logs.open" || method === "logs.page") return assertSnapshot(value, (row) => { assertKeys(row, ["text"]); boundedText(row.text, 512 * 1024, "text"); }, (revision) => { assertKeys(revision, ["sha256", "byte_count"]); digest(revision.sha256, "sha256"); integer(revision.byte_count, 0, "byte_count"); });
   if (method === "discussions.list" || method === "discussions.page") return assertDiscussionsPage(value);
   if (method === "commits.list") return assertArrayField(value, "commits", assertCommit);
@@ -237,6 +263,16 @@ function assertDiffRow(value: unknown): void {
   if (value.kind === "file") { assertKeys(value, [...common, "old_path", "new_path", "status", "additions", "deletions", "is_binary", "language", "is_truncated", "is_empty", "is_mode_only", "is_rename_only", "is_unavailable", "old_mode", "new_mode"]); integer(value.file_index, 0, "file_index"); for (const key of ["old_path", "new_path", "status"] as const) text(value[key], MAX_TEXT, key); integer(value.additions, 0, "additions"); integer(value.deletions, 0, "deletions"); for (const key of ["is_binary", "is_truncated", "is_empty", "is_mode_only", "is_rename_only", "is_unavailable"] as const) bool(value[key], key); nullableText(value.language, "language"); for (const key of ["old_mode", "new_mode"] as const) nullableText(value[key], key); return; }
   if (value.kind === "hunk") { assertKeys(value, [...common, "hunk_index", "header", "old_start", "old_count", "new_start", "new_count", "context_text"]); for (const key of ["file_index", "hunk_index", "old_start", "old_count", "new_start", "new_count"] as const) integer(value[key], 0, key); text(value.header, MAX_TEXT, "header"); if (typeof value.context_text !== "string") fail("context_text", "must be text"); return; }
   if (value.kind === "line") { assertKeys(value, [...common, "hunk_index", "old_line", "new_line", "content", "line_type"]); integer(value.file_index, 0, "file_index"); integer(value.hunk_index, 0, "hunk_index"); numberOrNull(value.old_line, "old_line"); numberOrNull(value.new_line, "new_line"); if (typeof value.content !== "string") fail("content", "must be text"); text(value.line_type, MAX_TEXT, "line_type"); return; }
+  if (value.kind === "gap") {
+    assertKeys(value, [...common, "gap_index", "position", "old_start", "new_start", "count"]);
+    integer(value.file_index, 0, "file_index"); integer(value.gap_index, 0, "gap_index");
+    integer(value.old_start, 1, "old_start"); integer(value.new_start, 1, "new_start");
+    if (!(DIFF_GAP_POSITIONS as readonly unknown[]).includes(value.position)) fail("position", "must be before, between or after");
+    // Only the gap after the last hunk has an unknown length.
+    if (value.count === null) { if (value.position !== "after") fail("count", "must be a line count before or between hunks"); }
+    else integer(value.count, 1, "count");
+    return;
+  }
   if (value.kind === "split") {
     assertKeys(value, [...common, "hunk_index", "row_index", "old", "new"]);
     integer(value.file_index, 0, "file_index"); integer(value.hunk_index, 0, "hunk_index"); integer(value.row_index, 0, "row_index");
@@ -246,6 +282,56 @@ function assertDiffRow(value: unknown): void {
     return;
   }
   throw new Error("Invalid diff row kind");
+}
+function assertDiffContext(value: unknown): void {
+  assertKeys(value, ["status", "message", "line_count", "rows"]);
+  if (!(DIFF_CONTEXT_STATUSES as readonly unknown[]).includes(value.status)) fail("status", "must be a known context status");
+  if (value.status !== "ok") {
+    // A refused read explains itself and carries no lines.
+    text(value.message, MAX_TEXT, "message");
+    if (value.line_count !== null) fail("line_count", "must be null when the read failed");
+    assertArray(value.rows, () => fail("rows", "must be empty when the read failed"), 0);
+    return;
+  }
+  if (value.message !== null) fail("message", "must be null when the read succeeded");
+  integer(value.line_count, 0, "line_count");
+  if (Number(value.line_count) > MAX_LINE_COUNT) fail("line_count", `must be at most ${MAX_LINE_COUNT}`);
+  let bytes = 0;
+  let previous: number | null = null;
+  assertArray(value.rows, (row) => {
+    assertKeys(row, ["kind", "file_index", "old_line", "new_line", "content"]);
+    if (row.kind !== "context") fail("kind", "must be context");
+    integer(row.file_index, 0, "file_index");
+    integer(row.old_line, 1, "old_line"); integer(row.new_line, 1, "new_line");
+    if (Number(row.new_line) > Number(value.line_count)) fail("new_line", "must be inside the file");
+    // Rows are one consecutive run of lines inside a single file.
+    if (previous !== null && Number(row.new_line) !== previous + 1) fail("new_line", "must follow the previous row");
+    previous = Number(row.new_line);
+    if (typeof row.content !== "string") fail("content", "must be text");
+    bytes += Buffer.byteLength(row.content, "utf8");
+    if (bytes > MAX_CONTEXT_BYTES) fail("rows", `must hold at most ${MAX_CONTEXT_BYTES} bytes of content`);
+  }, MAX_DIFF_CONTEXT_LINES);
+  const rows = value.rows as RecordValue[];
+  if (rows.some((row) => row.file_index !== rows[0]?.file_index)) fail("file_index", "must name one file");
+}
+function assertGeneratedDiff(value: unknown): void {
+  assertKeys(value, ["status", "message", "generated", "snapshot_id", "resource", "revision", "cursor", "next_cursor", "entries"]);
+  if (!(GENERATE_DIFF_STATUSES as readonly unknown[]).includes(value.status)) fail("status", "must be a known generation status");
+  if (value.status !== "ok") {
+    text(value.message, MAX_TEXT, "message");
+    if (value.generated !== false) fail("generated", "must be false when nothing was generated");
+    for (const key of ["snapshot_id", "resource", "revision", "cursor", "next_cursor"] as const) if (value[key] !== null) fail(key, "must be null when nothing was generated");
+    assertArray(value.entries, () => fail("entries", "must be empty when nothing was generated"), 0);
+    return;
+  }
+  if (value.message !== null) fail("message", "must be null when the diff was generated");
+  if (value.generated !== true) fail("generated", "must be true for a generated diff");
+  const page = Object.fromEntries(["snapshot_id", "resource", "revision", "cursor", "next_cursor", "entries"].map((key) => [key, value[key]]));
+  assertSnapshot(page, assertDiffRow, assertRevision);
+  const entries = value.entries as RecordValue[];
+  // A generated diff is one file, with no gap rows, starting at its file row.
+  if (Number(value.cursor) !== 0 || entries[0]?.kind !== "file") fail("entries", "must start with the generated file's row");
+  if (entries.some((entry) => entry.kind === "gap" || entry.file_index !== entries[0]?.file_index)) fail("entries", "must hold the rows of one file");
 }
 function assertSplitCell(value: unknown): void {
   assertKeys(value, ["old_line", "new_line", "content", "line_type", "anchor_side"]);

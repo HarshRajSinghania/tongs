@@ -23,6 +23,8 @@ export const methods = [
   "ci.capabilities",
   "ci.receipt",
   "commits.list",
+  "diff.context",
+  "diff.generate",
   "diff.open",
   "diff.page",
   "discussions.list",

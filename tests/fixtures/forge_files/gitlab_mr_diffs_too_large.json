@@ -1,0 +1,61 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "gitlab",
+    "question": "5: GitLab /diffs too_large",
+    "source": "gitlab-org/gitlab MR 252015 (27 files, 2,291,521 bytes of diff text)",
+    "finding": "Files over the per-file patch limit come back with too_large true, collapsed false and diff ''. The largest diff sent was 168,250 bytes and a withheld file's raw diff was 304,081 bytes, consistent with the default 200 KiB diff_max_patch_bytes. collapsed was never true on /diffs in the five MRs scanned.",
+    "note": "locale/de/gitlab.po (138,558 bytes of raw diff) was sent; locale/fr/gitlab.po (304,081 bytes) was too_large.",
+    "too_large_paths": [
+      "locale/es/gitlab.po",
+      "locale/fr/gitlab.po",
+      "locale/it/gitlab.po",
+      "locale/ja/gitlab.po",
+      "locale/pt_BR/gitlab.po",
+      "locale/zh_CN/gitlab.po"
+    ]
+  },
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/projects/278964/merge_requests/252015/diffs",
+        "params": {
+          "per_page": "100"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body_json": [
+          {
+            "diff": "",
+            "collapsed": false,
+            "too_large": true,
+            "new_path": "locale/es/gitlab.po",
+            "old_path": "locale/es/gitlab.po",
+            "a_mode": "100644",
+            "b_mode": "100644",
+            "new_file": false,
+            "renamed_file": false,
+            "deleted_file": false,
+            "generated_file": false
+          },
+          {
+            "diff": "<omitted: 916 bytes>",
+            "collapsed": false,
+            "too_large": false,
+            "new_path": "lib/gitlab/i18n.rb",
+            "old_path": "lib/gitlab/i18n.rb",
+            "a_mode": "100644",
+            "b_mode": "100644",
+            "new_file": false,
+            "renamed_file": false,
+            "deleted_file": false,
+            "generated_file": false
+          }
+        ],
+        "body_trimmed": true
+      }
+    }
+  ]
+}

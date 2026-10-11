@@ -220,3 +220,47 @@ class TestSubmittedRetention:
         assert len(warnings) == 1
         assert "submitted_retention" in warnings[0]
         assert "Xh" in warnings[0] and "Xd" in warnings[0]
+
+
+class TestFileContentTtl:
+    def test_default_is_one_day(self, tmp_path: Path) -> None:
+        assert Config().file_content_ttl == timedelta(days=1)
+        assert load_config(tmp_path / "missing.toml").file_content_ttl == (
+            timedelta(days=1)
+        )
+        toml_file = tmp_path / "config.toml"
+        toml_file.write_text("[cache]\ndiff_ttl = 60\n")
+        assert load_config(toml_file).file_content_ttl == timedelta(days=1)
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ('"12h"', timedelta(hours=12)),
+            ('"7d"', timedelta(days=7)),
+            ('"1h"', timedelta(hours=1)),
+            ('"365d"', timedelta(days=365)),
+        ],
+    )
+    def test_reads_the_cache_table(
+        self, tmp_path: Path, value: str, expected: timedelta
+    ) -> None:
+        toml_file = tmp_path / "config.toml"
+        toml_file.write_text(f"[cache]\nfile_content_ttl = {value}\n")
+        assert load_config(toml_file).file_content_ttl == expected
+
+    @pytest.mark.parametrize(
+        "value",
+        ['"0h"', "24", '"24H"', '"1w"', '"-1d"', '"366d"', '""', "1.5", "true"],
+    )
+    def test_invalid_value_falls_back_with_one_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, value: str
+    ) -> None:
+        toml_file = tmp_path / "config.toml"
+        toml_file.write_text(f"[cache]\nfile_content_ttl = {value}\n")
+        with caplog.at_level(logging.WARNING, logger="tongs.config"):
+            cfg = load_config(toml_file)
+        assert cfg.file_content_ttl == timedelta(days=1)
+        warnings = [r.getMessage() for r in caplog.records if r.name == "tongs.config"]
+        assert len(warnings) == 1
+        assert "file_content_ttl" in warnings[0]
+        assert "Xh" in warnings[0] and "Xd" in warnings[0]
