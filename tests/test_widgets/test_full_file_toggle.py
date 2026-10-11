@@ -274,7 +274,7 @@ async def test_f_opens_in_hunk_folds_too_and_off_closes_them_again() -> None:
         ),
         (
             DiffFile("t.txt", "t.txt", FileStatus.MODIFIED, (), is_truncated=True),
-            "The forge did not send this diff. Press o to view it in the browser.",
+            "The forge did not send this whole diff. Press e to generate it locally.",
         ),
         (
             DiffFile("l", "l", FileStatus.MODIFIED, _file().hunks, new_mode="120000"),

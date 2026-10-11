@@ -757,7 +757,10 @@ def _metadata_file(**flags: object) -> DiffFile:
         ({"is_rename_only": True}, "[Renamed with no content change]"),
         (
             {"is_truncated": True},
-            "Diff truncated by the forge. Press o to view in browser.",
+            (
+                "This file's diff is too large for the forge to send. Press e to "
+                "generate it locally (downloads both versions of the file)."
+            ),
         ),
         (
             {"is_unavailable": True},
