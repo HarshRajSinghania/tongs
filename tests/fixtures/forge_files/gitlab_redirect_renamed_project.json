@@ -1,0 +1,43 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "gitlab",
+    "question": "3: redirects on file reads",
+    "source": "gitlab-org/gitlab-ce, renamed to gitlab-org/gitlab-foss (project 13083)",
+    "finding": "A renamed project answers 301 with a same-origin Location under /api/v4/projects/<id>/. Ordinary reads, LFS pointers included, answered 200 in one hop. lfs=true on gitlab-org/gitlab-design answered the object inline (200 application/octet-stream), also in one hop."
+  },
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/projects/gitlab-org%2Fgitlab-ce/repository/files/README.md/raw",
+        "params": {
+          "ref": "master"
+        }
+      },
+      "response": {
+        "status": 301,
+        "headers": {
+          "Content-Length": "126",
+          "Content-Type": "text/plain; charset=utf-8",
+          "Location": "https://gitlab.com/api/v4/projects/13083/repository/files/README.md/raw?ref=master",
+          "Ratelimit-Name": "throttle_authenticated_api"
+        },
+        "body_text": "This resource has been moved permanently to https://gitlab.com/api/v4/projects/13083/repository/files/README.md/raw?ref=master"
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/projects/13083/repository/files/README.md/raw",
+        "params": {
+          "ref": "master"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body_omitted": "third-party file content"
+      }
+    }
+  ]
+}

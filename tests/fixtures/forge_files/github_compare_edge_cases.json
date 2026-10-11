@@ -1,0 +1,323 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "github",
+    "question": "4: per_page=1&page=2 when there are fewer than two commits, and errors",
+    "source": "github-linguist/linguist PR 8265 (1 commit)",
+    "finding": "page=2 past the last commit still answers 200 with merge_base_commit, an empty commits list and no files key; identical refs answer status 'identical'. An unknown SHA answers 404."
+  },
+  "exchanges": [
+    {
+      "case": "ahead_one_commit",
+      "request": {
+        "method": "GET",
+        "path": "/repos/github-linguist/linguist/compare/5fbdfcb8133be2bed88bf3ce62b2335f50474525...4c8de62af1693131afcc568dde2da47244187c8f",
+        "params": {
+          "per_page": "1",
+          "page": "2"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "Etag": "W/\"f601e1316faba485f24802324dce8b18c60078d2130a7f41078bc0c14e72e973\"",
+          "Link": "<https://api.github.com/repositories/1725199/compare/5fbdfcb8133be2bed88bf3ce62b2335f50474525...4c8de62af1693131afcc568dde2da47244187c8f?per_page=1&page=1>; rel=\"first\", <https://api.github.com/repositories/1725199/compare/5fbdfcb8133be2bed88bf3ce62b2335f50474525...4c8de62af1693131afcc568dde2da47244187c8f?per_page=1&page=1>; rel=\"prev\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4943",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "57"
+        },
+        "body_bytes": 14593,
+        "body_json": {
+          "url": "https://api.github.com/repos/github-linguist/linguist/compare/5fbdfcb8133be2bed88bf3ce62b2335f50474525...4c8de62af1693131afcc568dde2da47244187c8f",
+          "html_url": "https://github.com/github-linguist/linguist/compare/5fbdfcb8133be2bed88bf3ce62b2335f50474525...4c8de62af1693131afcc568dde2da47244187c8f",
+          "permalink_url": "https://github.com/github-linguist/linguist/compare/github-linguist:5fbdfcb...github-linguist:4c8de62",
+          "diff_url": "https://github.com/github-linguist/linguist/compare/5fbdfcb8133be2bed88bf3ce62b2335f50474525...4c8de62af1693131afcc568dde2da47244187c8f.diff",
+          "patch_url": "https://github.com/github-linguist/linguist/compare/5fbdfcb8133be2bed88bf3ce62b2335f50474525...4c8de62af1693131afcc568dde2da47244187c8f.patch",
+          "base_commit": {
+            "sha": "5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+            "node_id": "C_kwDOABpTD9oAKDVmYmRmY2I4MTMzYmUyYmVkODhiZjNjZTYyYjIzMzVmNTA0NzQ1MjU",
+            "commit": {
+              "author": {
+                "name": "Example Author",
+                "email": "author@example.com",
+                "date": "2026-09-29T08:54:57Z"
+              },
+              "committer": {
+                "name": "Example Author",
+                "email": "author@example.com",
+                "date": "2026-09-29T08:54:57Z"
+              },
+              "message": "Example commit message",
+              "tree": {
+                "sha": "56c014880db1717db09b0ab1f0542f529c6cf0c1",
+                "url": "https://api.github.com/repos/github-linguist/linguist/git/trees/56c014880db1717db09b0ab1f0542f529c6cf0c1"
+              },
+              "url": "https://api.github.com/repos/github-linguist/linguist/git/commits/5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+              "comment_count": 0,
+              "verification": {
+                "verified": false,
+                "reason": "unsigned",
+                "signature": null,
+                "payload": null,
+                "verified_at": null
+              }
+            },
+            "url": "https://api.github.com/repos/github-linguist/linguist/commits/5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+            "html_url": "https://github.com/github-linguist/linguist/commit/5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+            "comments_url": "https://api.github.com/repos/github-linguist/linguist/commits/5fbdfcb8133be2bed88bf3ce62b2335f50474525/comments",
+            "author": {
+              "login": "example-user",
+              "id": 1,
+              "type": "User",
+              "site_admin": false
+            },
+            "committer": {
+              "login": "example-user",
+              "id": 1,
+              "type": "User",
+              "site_admin": false
+            },
+            "parents": [
+              {
+                "sha": "2f6ca8eb0084766c98bc44cdcd30374a115ab524",
+                "url": "https://api.github.com/repos/github-linguist/linguist/commits/2f6ca8eb0084766c98bc44cdcd30374a115ab524",
+                "html_url": "https://github.com/github-linguist/linguist/commit/2f6ca8eb0084766c98bc44cdcd30374a115ab524"
+              }
+            ]
+          },
+          "merge_base_commit": {
+            "sha": "5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+            "node_id": "C_kwDOABpTD9oAKDVmYmRmY2I4MTMzYmUyYmVkODhiZjNjZTYyYjIzMzVmNTA0NzQ1MjU",
+            "commit": {
+              "author": {
+                "name": "Example Author",
+                "email": "author@example.com",
+                "date": "2026-09-29T08:54:57Z"
+              },
+              "committer": {
+                "name": "Example Author",
+                "email": "author@example.com",
+                "date": "2026-09-29T08:54:57Z"
+              },
+              "message": "Example commit message",
+              "tree": {
+                "sha": "56c014880db1717db09b0ab1f0542f529c6cf0c1",
+                "url": "https://api.github.com/repos/github-linguist/linguist/git/trees/56c014880db1717db09b0ab1f0542f529c6cf0c1"
+              },
+              "url": "https://api.github.com/repos/github-linguist/linguist/git/commits/5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+              "comment_count": 0,
+              "verification": {
+                "verified": false,
+                "reason": "unsigned",
+                "signature": null,
+                "payload": null,
+                "verified_at": null
+              }
+            },
+            "url": "https://api.github.com/repos/github-linguist/linguist/commits/5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+            "html_url": "https://github.com/github-linguist/linguist/commit/5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+            "comments_url": "https://api.github.com/repos/github-linguist/linguist/commits/5fbdfcb8133be2bed88bf3ce62b2335f50474525/comments",
+            "author": {
+              "login": "example-user",
+              "id": 1,
+              "type": "User",
+              "site_admin": false
+            },
+            "committer": {
+              "login": "example-user",
+              "id": 1,
+              "type": "User",
+              "site_admin": false
+            },
+            "parents": [
+              {
+                "sha": "2f6ca8eb0084766c98bc44cdcd30374a115ab524",
+                "url": "https://api.github.com/repos/github-linguist/linguist/commits/2f6ca8eb0084766c98bc44cdcd30374a115ab524",
+                "html_url": "https://github.com/github-linguist/linguist/commit/2f6ca8eb0084766c98bc44cdcd30374a115ab524"
+              }
+            ]
+          },
+          "status": "ahead",
+          "ahead_by": 1,
+          "behind_by": 0,
+          "total_commits": 1,
+          "commits": []
+        },
+        "body_trimmed": true
+      }
+    },
+    {
+      "case": "identical",
+      "request": {
+        "method": "GET",
+        "path": "/repos/github-linguist/linguist/compare/5fbdfcb8133be2bed88bf3ce62b2335f50474525...5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+        "params": {
+          "per_page": "1",
+          "page": "2"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "Etag": "W/\"3521730844f2b9e7e1cfde0e120fac4a2ef12a0cdf2d3f9c98e52e29e9acc3ca\"",
+          "Link": "<https://api.github.com/repositories/1725199/compare/5fbdfcb8133be2bed88bf3ce62b2335f50474525...5fbdfcb8133be2bed88bf3ce62b2335f50474525?per_page=1&page=1>; rel=\"first\", <https://api.github.com/repositories/1725199/compare/5fbdfcb8133be2bed88bf3ce62b2335f50474525...5fbdfcb8133be2bed88bf3ce62b2335f50474525?per_page=1&page=1>; rel=\"prev\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4939",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "61"
+        },
+        "body_bytes": 14597,
+        "body_json": {
+          "url": "https://api.github.com/repos/github-linguist/linguist/compare/5fbdfcb8133be2bed88bf3ce62b2335f50474525...5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+          "html_url": "https://github.com/github-linguist/linguist/compare/5fbdfcb8133be2bed88bf3ce62b2335f50474525...5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+          "permalink_url": "https://github.com/github-linguist/linguist/compare/github-linguist:5fbdfcb...github-linguist:5fbdfcb",
+          "diff_url": "https://github.com/github-linguist/linguist/compare/5fbdfcb8133be2bed88bf3ce62b2335f50474525...5fbdfcb8133be2bed88bf3ce62b2335f50474525.diff",
+          "patch_url": "https://github.com/github-linguist/linguist/compare/5fbdfcb8133be2bed88bf3ce62b2335f50474525...5fbdfcb8133be2bed88bf3ce62b2335f50474525.patch",
+          "base_commit": {
+            "sha": "5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+            "node_id": "C_kwDOABpTD9oAKDVmYmRmY2I4MTMzYmUyYmVkODhiZjNjZTYyYjIzMzVmNTA0NzQ1MjU",
+            "commit": {
+              "author": {
+                "name": "Example Author",
+                "email": "author@example.com",
+                "date": "2026-09-29T08:54:57Z"
+              },
+              "committer": {
+                "name": "Example Author",
+                "email": "author@example.com",
+                "date": "2026-09-29T08:54:57Z"
+              },
+              "message": "Example commit message",
+              "tree": {
+                "sha": "56c014880db1717db09b0ab1f0542f529c6cf0c1",
+                "url": "https://api.github.com/repos/github-linguist/linguist/git/trees/56c014880db1717db09b0ab1f0542f529c6cf0c1"
+              },
+              "url": "https://api.github.com/repos/github-linguist/linguist/git/commits/5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+              "comment_count": 0,
+              "verification": {
+                "verified": false,
+                "reason": "unsigned",
+                "signature": null,
+                "payload": null,
+                "verified_at": null
+              }
+            },
+            "url": "https://api.github.com/repos/github-linguist/linguist/commits/5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+            "html_url": "https://github.com/github-linguist/linguist/commit/5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+            "comments_url": "https://api.github.com/repos/github-linguist/linguist/commits/5fbdfcb8133be2bed88bf3ce62b2335f50474525/comments",
+            "author": {
+              "login": "example-user",
+              "id": 1,
+              "type": "User",
+              "site_admin": false
+            },
+            "committer": {
+              "login": "example-user",
+              "id": 1,
+              "type": "User",
+              "site_admin": false
+            },
+            "parents": [
+              {
+                "sha": "2f6ca8eb0084766c98bc44cdcd30374a115ab524",
+                "url": "https://api.github.com/repos/github-linguist/linguist/commits/2f6ca8eb0084766c98bc44cdcd30374a115ab524",
+                "html_url": "https://github.com/github-linguist/linguist/commit/2f6ca8eb0084766c98bc44cdcd30374a115ab524"
+              }
+            ]
+          },
+          "merge_base_commit": {
+            "sha": "5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+            "node_id": "C_kwDOABpTD9oAKDVmYmRmY2I4MTMzYmUyYmVkODhiZjNjZTYyYjIzMzVmNTA0NzQ1MjU",
+            "commit": {
+              "author": {
+                "name": "Example Author",
+                "email": "author@example.com",
+                "date": "2026-09-29T08:54:57Z"
+              },
+              "committer": {
+                "name": "Example Author",
+                "email": "author@example.com",
+                "date": "2026-09-29T08:54:57Z"
+              },
+              "message": "Example commit message",
+              "tree": {
+                "sha": "56c014880db1717db09b0ab1f0542f529c6cf0c1",
+                "url": "https://api.github.com/repos/github-linguist/linguist/git/trees/56c014880db1717db09b0ab1f0542f529c6cf0c1"
+              },
+              "url": "https://api.github.com/repos/github-linguist/linguist/git/commits/5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+              "comment_count": 0,
+              "verification": {
+                "verified": false,
+                "reason": "unsigned",
+                "signature": null,
+                "payload": null,
+                "verified_at": null
+              }
+            },
+            "url": "https://api.github.com/repos/github-linguist/linguist/commits/5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+            "html_url": "https://github.com/github-linguist/linguist/commit/5fbdfcb8133be2bed88bf3ce62b2335f50474525",
+            "comments_url": "https://api.github.com/repos/github-linguist/linguist/commits/5fbdfcb8133be2bed88bf3ce62b2335f50474525/comments",
+            "author": {
+              "login": "example-user",
+              "id": 1,
+              "type": "User",
+              "site_admin": false
+            },
+            "committer": {
+              "login": "example-user",
+              "id": 1,
+              "type": "User",
+              "site_admin": false
+            },
+            "parents": [
+              {
+                "sha": "2f6ca8eb0084766c98bc44cdcd30374a115ab524",
+                "url": "https://api.github.com/repos/github-linguist/linguist/commits/2f6ca8eb0084766c98bc44cdcd30374a115ab524",
+                "html_url": "https://github.com/github-linguist/linguist/commit/2f6ca8eb0084766c98bc44cdcd30374a115ab524"
+              }
+            ]
+          },
+          "status": "identical",
+          "ahead_by": 0,
+          "behind_by": 0,
+          "total_commits": 0,
+          "commits": []
+        },
+        "body_trimmed": true
+      }
+    },
+    {
+      "case": "unknown_head",
+      "request": {
+        "method": "GET",
+        "path": "/repos/github-linguist/linguist/compare/5fbdfcb8133be2bed88bf3ce62b2335f50474525...0000000000000000000000000000000000000001",
+        "params": {
+          "per_page": "1",
+          "page": "2"
+        }
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4938",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "62"
+        },
+        "body_bytes": 125,
+        "body_json": {
+          "message": "Not Found",
+          "documentation_url": "https://docs.github.com/rest/commits/commits#compare-two-commits",
+          "status": "404"
+        }
+      }
+    }
+  ]
+}

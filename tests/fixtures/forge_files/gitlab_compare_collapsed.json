@@ -1,0 +1,92 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "gitlab",
+    "question": "5: collapsed versus too_large, and other ways to read a withheld diff",
+    "source": "gitlab-org/gitlab MR 252015, compared through /repository/compare from base_sha to head_sha",
+    "finding": "The compare endpoint marks large files collapsed true with too_large false and diff '' (even locale/de/gitlab.po, which /diffs sent in full), so collapsed carries no diff either. GET /merge_requests/:iid/raw_diffs returned the whole MR as one 3,898,803-byte text/plain unified diff that does include the too_large files (fr/gitlab.po: 499 hunks), but it has no per-file filter and grows with the whole MR, so it is not a bounded per-file source.",
+    "collapsed_paths": [
+      "locale/bg/gitlab.po",
+      "locale/cs_CZ/gitlab.po",
+      "locale/da_DK/gitlab.po",
+      "locale/de/gitlab.po",
+      "locale/eo/gitlab.po",
+      "locale/es/gitlab.po",
+      "locale/fil_PH/gitlab.po",
+      "locale/fr/gitlab.po",
+      "locale/ga_IE/gitlab.po",
+      "locale/gl_ES/gitlab.po",
+      "locale/id_ID/gitlab.po",
+      "locale/it/gitlab.po",
+      "locale/ja/gitlab.po",
+      "locale/ko/gitlab.po",
+      "locale/nb_NO/gitlab.po",
+      "locale/nl_NL/gitlab.po",
+      "locale/pl_PL/gitlab.po",
+      "locale/pt_BR/gitlab.po",
+      "locale/ro_RO/gitlab.po",
+      "locale/ru/gitlab.po",
+      "locale/si_LK/gitlab.po",
+      "locale/tr_TR/gitlab.po",
+      "locale/uk/gitlab.po",
+      "locale/zh_CN/gitlab.po",
+      "locale/zh_HK/gitlab.po",
+      "locale/zh_TW/gitlab.po"
+    ],
+    "raw_diffs": {
+      "status": 200,
+      "content_type": "text/plain; charset=utf-8",
+      "body_bytes": 3898803,
+      "files": 27,
+      "elapsed_s": 0.88
+    }
+  },
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/projects/278964/repository/compare",
+        "params": {
+          "from": "b81540583c75e94615fc83e58ef5f809ced7fc25",
+          "to": "8436f5ead34124cd5dc6fcf07862778d9bb4327a"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body_json": {
+          "compare_timeout": false,
+          "compare_same_ref": false,
+          "diffs": [
+            {
+              "diff": "",
+              "collapsed": true,
+              "too_large": false,
+              "new_path": "locale/bg/gitlab.po",
+              "old_path": "locale/bg/gitlab.po",
+              "a_mode": "100644",
+              "b_mode": "100644",
+              "new_file": false,
+              "renamed_file": false,
+              "deleted_file": false,
+              "generated_file": null
+            },
+            {
+              "diff": "",
+              "collapsed": true,
+              "too_large": false,
+              "new_path": "locale/cs_CZ/gitlab.po",
+              "old_path": "locale/cs_CZ/gitlab.po",
+              "a_mode": "100644",
+              "b_mode": "100644",
+              "new_file": false,
+              "renamed_file": false,
+              "deleted_file": false,
+              "generated_file": null
+            }
+          ]
+        },
+        "body_trimmed": true
+      }
+    }
+  ]
+}
