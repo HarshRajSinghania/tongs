@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import test, { afterEach } from "node:test";
+import { InlineAnchorStore } from "../../../desktop/dist/src/renderer/core/navigation.js";
 import { QueryCoordinator } from "../../../desktop/dist/src/renderer/core/query.js";
 import {
   CHANGES_OVERFLOW_NOTICE,
@@ -356,7 +357,7 @@ function renderOverflowDiff(review, detail) {
     panel: "diff",
   };
   function Harness() {
-    const [inlineAnchor, setInlineAnchor] = React.useState(null);
+    const inlineAnchors = React.useMemo(() => new InlineAnchorStore(), []);
     const queries = React.useMemo(() => new QueryCoordinator(bridge), []);
     return feature.render(
       {
@@ -368,8 +369,7 @@ function renderOverflowDiff(review, detail) {
         repositoriesReady: true,
         repositoryGeneration: 1,
         reviewPanels: [{ id: "diff", label: "Files changed", order: 20 }],
-        inlineAnchor,
-        selectInlineAnchor: setInlineAnchor,
+        inlineAnchors,
         navigate: () => {},
       },
       route,
@@ -639,7 +639,7 @@ function renderDiff(review, bridge) {
     panel: "diff",
   };
   function Harness() {
-    const [inlineAnchor, setInlineAnchor] = React.useState(null);
+    const inlineAnchors = React.useMemo(() => new InlineAnchorStore(), []);
     const queries = React.useMemo(() => new QueryCoordinator(bridge), []);
     return feature.render(
       {
@@ -651,8 +651,7 @@ function renderDiff(review, bridge) {
         repositoriesReady: true,
         repositoryGeneration: 1,
         reviewPanels: [{ id: "diff", label: "Files changed", order: 20 }],
-        inlineAnchor,
-        selectInlineAnchor: setInlineAnchor,
+        inlineAnchors,
         navigate: () => {},
       },
       route,

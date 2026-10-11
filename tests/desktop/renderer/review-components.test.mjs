@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import test, { afterEach } from "node:test";
 
+import { InlineAnchorStore } from "../../../desktop/dist/src/renderer/core/navigation.js";
 import { QueryCoordinator } from "../../../desktop/dist/src/renderer/core/query.js";
 import {
   allocateDiscussionMarkdown,
@@ -1418,8 +1419,7 @@ function renderFeature(bridge, review, contextChanges = {}) {
         repositoriesReady: true,
         repositoryGeneration: 1,
         reviewPanels: [{ id: "discussions", label: "Discussions", order: 40 }],
-        inlineAnchor: null,
-        selectInlineAnchor: () => {},
+        inlineAnchors: new InlineAnchorStore(),
         navigate: () => {},
         ...contextChanges,
       },
@@ -1442,8 +1442,7 @@ function renderOverview(bridge, review, contextChanges = {}) {
         repositoriesReady: true,
         repositoryGeneration: 1,
         reviewPanels: [{ id: "overview", label: "Overview", order: 10 }],
-        inlineAnchor: null,
-        selectInlineAnchor: () => {},
+        inlineAnchors: new InlineAnchorStore(),
         navigate: () => {},
         ...contextChanges,
       },

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import test, { afterEach } from "node:test";
 
+import { InlineAnchorStore } from "../../../desktop/dist/src/renderer/core/navigation.js";
 import { QueryCoordinator } from "../../../desktop/dist/src/renderer/core/query.js";
 import { createDiffFeature } from "../../../desktop/dist/src/renderer/features/diff/index.js";
 import { readAllDiscussions } from "../../../desktop/dist/src/renderer/features/review/discussions.js";
@@ -415,7 +416,7 @@ function renderDiff(bridge, review) {
   const feature = createDiffFeature();
   const route = { kind: "review", item: reviewItem(review), panel: "diff" };
   function Harness() {
-    const [inlineAnchor, setInlineAnchor] = React.useState(null);
+    const inlineAnchors = React.useMemo(() => new InlineAnchorStore(), []);
     const queries = React.useMemo(() => new QueryCoordinator(bridge), []);
     return feature.render(
       {
@@ -427,8 +428,7 @@ function renderDiff(bridge, review) {
         repositoriesReady: true,
         repositoryGeneration: 1,
         reviewPanels: [{ id: "diff", label: "Files changed", order: 20 }],
-        inlineAnchor,
-        selectInlineAnchor: setInlineAnchor,
+        inlineAnchors,
         navigate: () => {},
       },
       route,

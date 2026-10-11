@@ -1,6 +1,8 @@
 // #306: a click or a drag in a large diff must not redo work for every changed
 // file. The changed-file list renders one memoised entry per file, and this
-// file counts how often each entry renders.
+// file counts how often each entry renders. The line selection lives in a
+// store outside the app shell, so a click must not render the shell or the
+// review view around the diff either.
 //
 // The count comes from the React DevTools global hook, the integration point
 // React DOM reports every commit to, so the product code carries no test
@@ -27,6 +29,11 @@ Object.assign(globalThis, {
 });
 
 const renders = new Map();
+// Renders of the review heading, which only the diff view around the
+// workspace draws: a heading render means that view rendered.
+let headerRenders = 0;
+// Renders of the harness that stands in for the app shell.
+let shellRenders = 0;
 const seenProps = new WeakSet();
 globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__ = {
   supportsFiber: true,
@@ -51,11 +58,16 @@ function countFileNavigationRenders(rootFiber) {
     const fiber = stack.pop();
     if (fiber.sibling) stack.push(fiber.sibling);
     if (fiber.child) stack.push(fiber.child);
-    if (typeof fiber.type !== "function" || fiber.type.name !== "FileNavigation")
-      continue;
+    if (typeof fiber.type !== "function") continue;
+    const name = fiber.type.name;
+    if (name !== "FileNavigation" && name !== "ReviewHeader") continue;
     const props = fiber.memoizedProps;
     if (seenProps.has(props)) continue;
     seenProps.add(props);
+    if (name === "ReviewHeader") {
+      headerRenders += 1;
+      continue;
+    }
     const index = props.file.file_index;
     renders.set(index, (renders.get(index) ?? 0) + 1);
   }
@@ -69,6 +81,9 @@ const { cleanup, fireEvent, render, waitFor } = desktopRequire(
   "@testing-library/react",
 );
 const React = desktopRequire("react");
+const { InlineAnchorStore } = await import(
+  "../../../desktop/dist/src/renderer/core/navigation.js"
+);
 const { QueryCoordinator } = await import(
   "../../../desktop/dist/src/renderer/core/query.js"
 );
@@ -83,6 +98,8 @@ afterEach(() => {
   cleanup();
   clearPendingEdit();
   renders.clear();
+  headerRenders = 0;
+  shellRenders = 0;
 });
 
 const revision = { head_sha: "head", base_sha: "base", start_sha: null };
@@ -116,6 +133,32 @@ test("selecting or dragging lines re-renders no changed-file entry", async () =>
   await waitFor(() => assert.equal(selectedLineCount(view), LINES));
   await settle();
   assert.deepEqual(renderCounts(), []);
+});
+
+test("a line click renders neither the app shell nor the review view", async () => {
+  const view = renderDiff();
+  await waitFor(() => assert.equal(lineAnchorCount(view), LINES));
+  await settle();
+  assert.equal(shellRenders > 0, true);
+  assert.equal(headerRenders > 0, true);
+
+  shellRenders = 0;
+  headerRenders = 0;
+  fireEvent.click(lineAnchor(view, 3));
+  await waitFor(() => assert.equal(selectedLineCount(view), 1));
+  await settle();
+  assert.deepEqual([shellRenders, headerRenders], [0, 0]);
+
+  // Another line in the same file moves the selection the same way.
+  fireEvent.click(lineAnchor(view, 1));
+  await waitFor(() =>
+    assert.equal(
+      lineAnchor(view, 1).classList.contains("line-anchor-selected"),
+      true,
+    ),
+  );
+  await settle();
+  assert.deepEqual([shellRenders, headerRenders], [0, 0]);
 });
 
 test("moving to another file re-renders only the two entries whose state changed", async () => {
@@ -304,7 +347,8 @@ function renderDiff() {
     panel: "diff",
   };
   function Harness() {
-    const [inlineAnchor, setInlineAnchor] = React.useState(null);
+    shellRenders += 1;
+    const inlineAnchors = React.useMemo(() => new InlineAnchorStore(), []);
     const queries = React.useMemo(() => new QueryCoordinator(bridge), []);
     return feature.render(
       {
@@ -316,8 +360,7 @@ function renderDiff() {
         repositoriesReady: true,
         repositoryGeneration: 1,
         reviewPanels: [{ id: "diff", label: "Files changed", order: 20 }],
-        inlineAnchor,
-        selectInlineAnchor: setInlineAnchor,
+        inlineAnchors,
         navigate: () => {},
       },
       route,

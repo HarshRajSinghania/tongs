@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import test, { afterEach } from "node:test";
+import { InlineAnchorStore } from "../../../desktop/dist/src/renderer/core/navigation.js";
 import { QueryCoordinator } from "../../../desktop/dist/src/renderer/core/query.js";
 import { encodeReadFailure } from "../../../desktop/dist/src/shared/bridge.js";
 import { createDiffFeature } from "../../../desktop/dist/src/renderer/features/diff/index.js";
@@ -312,16 +313,17 @@ test("diff anchor selection keeps full immutable identity across layouts", async
   };
   let observed = null;
   function Harness() {
-    const [inlineAnchor, setInlineAnchor] = React.useState(null);
-    const selectInlineAnchor = (next) => {
-      observed = next;
-      setInlineAnchor(next);
-    };
+    const inlineAnchors = React.useMemo(() => {
+      const store = new InlineAnchorStore();
+      store.subscribe(() => {
+        observed = store.current();
+      });
+      return store;
+    }, []);
     return feature.render(
       {
         ...featureContext(bridge),
-        inlineAnchor,
-        selectInlineAnchor,
+        inlineAnchors,
       },
       route,
     );
@@ -396,16 +398,17 @@ test("Shift+Enter extends a keyboard diff selection across new-side source lines
   const feature = createDiffFeature();
   let observed = null;
   function Harness() {
-    const [inlineAnchor, setInlineAnchor] = React.useState(null);
-    const selectInlineAnchor = (next) => {
-      observed = next;
-      setInlineAnchor(next);
-    };
+    const inlineAnchors = React.useMemo(() => {
+      const store = new InlineAnchorStore();
+      store.subscribe(() => {
+        observed = store.current();
+      });
+      return store;
+    }, []);
     return feature.render(
       {
         ...featureContext(bridge),
-        inlineAnchor,
-        selectInlineAnchor,
+        inlineAnchors,
       },
       { kind: "review", item: reviewItem(), panel: "diff" },
     );
@@ -467,16 +470,15 @@ for (const code of ["snapshot_expired", "revision_changed"]) {
     const feature = createDiffFeature();
     const context = featureContext(bridge);
     function Harness() {
-      const [inlineAnchor, setInlineAnchor] = React.useState(null);
-      const selectInlineAnchor = React.useCallback((next) => {
-        observed.push(next);
-        setInlineAnchor(next);
+      const inlineAnchors = React.useMemo(() => {
+        const store = new InlineAnchorStore();
+        store.subscribe(() => observed.push(store.current()));
+        return store;
       }, []);
       return feature.render(
         {
           ...context,
-          inlineAnchor,
-          selectInlineAnchor,
+          inlineAnchors,
         },
         {
           kind: "review",
@@ -601,8 +603,7 @@ function featureContext(bridge, navigate = () => {}) {
       { id: "diff", label: "Files changed", order: 20 },
       { id: "commits", label: "Commits", order: 30 },
     ],
-    inlineAnchor: null,
-    selectInlineAnchor: () => {},
+    inlineAnchors: new InlineAnchorStore(),
     navigate,
   };
 }

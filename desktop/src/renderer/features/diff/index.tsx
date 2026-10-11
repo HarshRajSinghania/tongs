@@ -5,6 +5,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type KeyboardEvent,
   type ReactNode,
 } from "react";
@@ -25,6 +26,7 @@ import type {
   DiscussionDiffTarget,
   FeatureContribution,
   InlineAnchorSelection,
+  InlineAnchorStore,
   InlineSelectedLine,
 } from "../../core/navigation.js";
 import {
@@ -186,8 +188,7 @@ export function createDiffFeature(): FeatureContribution {
           navigate={context.navigate}
           panels={context.reviewPanels}
           repositories={context.repositories}
-          inlineAnchor={context.inlineAnchor}
-          selectInlineAnchor={context.selectInlineAnchor}
+          anchors={context.inlineAnchors}
         />
       ) : null,
   };
@@ -200,8 +201,7 @@ function DiffView({
   navigate,
   panels,
   repositories,
-  inlineAnchor,
-  selectInlineAnchor,
+  anchors,
 }: {
   readonly bridge: DesktopBridge;
   readonly queries: QueryCoordinator;
@@ -209,10 +209,11 @@ function DiffView({
   readonly navigate: (route: AppRoute) => void;
   readonly panels: FeatureContributionParameters["reviewPanels"];
   readonly repositories: readonly RepositoryDto[];
-  readonly inlineAnchor: InlineAnchorSelection | null;
-  readonly selectInlineAnchor: (
-    selection: InlineAnchorSelection | null,
-  ) => void;
+  /**
+   * The line selection. This view only writes it; the workspace below reads
+   * it, so a line click re-renders the workspace and not this view.
+   */
+  readonly anchors: InlineAnchorStore;
 }): ReactNode {
   // The suggestion block syntax is the forge's, so the composer needs to know
   // which forge this review lives on.
@@ -280,7 +281,7 @@ function DiffView({
       })
       .catch((reason: unknown) => {
         if (current) {
-          if (invalidatesSelection(reason)) selectInlineAnchor(null);
+          if (invalidatesSelection(reason)) anchors.select(null);
           // A layout switch can stop the previous layout mid-paging; its
           // drawn pages are then still on screen waiting for the rest.
           const drawn =
@@ -319,13 +320,13 @@ function DiffView({
     if (target) {
       setJumpError(null);
       revealJumpTarget(route.item.handle, loaded, route.diffTarget, target);
-      selectInlineAnchor(target);
+      anchors.select(target);
     } else if (!loaded.loadingMore) {
       setJumpError(
         "This discussion location is unavailable in the displayed revision. Refresh the diff or open the discussion on the forge.",
       );
     }
-  }, [loaded, route.diffTarget, route.item.handle, selectInlineAnchor]);
+  }, [anchors, loaded, route.diffTarget, route.item.handle]);
   const files = useMemo(
     () =>
       loaded === null
@@ -422,8 +423,7 @@ function DiffView({
           files={files}
           viewed={viewed}
           reloadToken={reload}
-          selection={inlineAnchor}
-          selectAnchor={selectInlineAnchor}
+          anchors={anchors}
         />
       )}
     </>
@@ -595,8 +595,7 @@ function DiffWorkspace({
   files,
   viewed,
   reloadToken,
-  selection,
-  selectAnchor,
+  anchors,
 }: {
   readonly bridge: DesktopBridge;
   readonly review: string;
@@ -608,9 +607,10 @@ function DiffWorkspace({
   readonly viewed: ViewedFiles;
   /** Bumped by the toolbar's Refresh, so the published threads are reread too. */
   readonly reloadToken: number;
-  readonly selection: InlineAnchorSelection | null;
-  readonly selectAnchor: (selection: InlineAnchorSelection | null) => void;
+  readonly anchors: InlineAnchorStore;
 }): ReactNode {
+  const selection = useSyncExternalStore(anchors.subscribe, anchors.current);
+  const selectAnchor = anchors.select;
   // Each file's rows and hunk rows, read once per loaded diff. The changed-file
   // list and the rows view take their slice from here instead of filtering all
   // rows per file on every render, which made a click cost files times rows.
@@ -665,14 +665,18 @@ function DiffWorkspace({
     setSelected(files[0]?.file_index ?? 0);
     setTarget(0);
   }, [loaded.snapshotId]);
+  // A selection made in this diff already names a row of it, so only a new
+  // diff (a Refresh, a layout switch, another page) rebinds it. Reading it from
+  // the store keeps a line click from scanning every loaded row again.
   useEffect(() => {
-    if (!selection) return;
-    const rebound = rebindInlineAnchor(selection, review, loaded);
+    const current = anchors.current();
+    if (!current) return;
+    const rebound = rebindInlineAnchor(current, review, loaded);
     if (!rebound) {
       // The row may be on a page that has not arrived yet.
-      if (!loaded.loadingMore) selectAnchor(null);
-    } else if (!sameAnchorIdentity(selection, rebound)) selectAnchor(rebound);
-  }, [loaded, review, selectAnchor, selection]);
+      if (!loaded.loadingMore) anchors.select(null);
+    } else if (!sameAnchorIdentity(current, rebound)) anchors.select(rebound);
+  }, [anchors, loaded, review]);
   useEffect(() => {
     if (!selection || selection.review !== review) return;
     const matchingFile = files.find(

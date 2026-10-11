@@ -27,6 +27,9 @@ const { cleanup, fireEvent, render, waitFor } = desktopRequire(
   "@testing-library/react",
 );
 const React = desktopRequire("react");
+const { InlineAnchorStore } = await import(
+  "../../../desktop/dist/src/renderer/core/navigation.js"
+);
 const { QueryCoordinator } = await import(
   "../../../desktop/dist/src/renderer/core/query.js"
 );
@@ -496,7 +499,7 @@ function renderDiff(bridge) {
     panel: "diff",
   };
   function Harness() {
-    const [inlineAnchor, setInlineAnchor] = React.useState(null);
+    const inlineAnchors = React.useMemo(() => new InlineAnchorStore(), []);
     const queries = React.useMemo(() => new QueryCoordinator(bridge), []);
     return feature.render(
       {
@@ -508,8 +511,7 @@ function renderDiff(bridge) {
         repositoriesReady: true,
         repositoryGeneration: 1,
         reviewPanels: [{ id: "diff", label: "Files changed", order: 20 }],
-        inlineAnchor,
-        selectInlineAnchor: setInlineAnchor,
+        inlineAnchors,
         navigate: () => {},
       },
       route,
