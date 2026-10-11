@@ -28,6 +28,7 @@ done
 [[ -n "$output_dir" ]] || { usage; exit 2; }
 command -v git >/dev/null || { printf 'git is required\n' >&2; exit 2; }
 command -v podman >/dev/null || { printf 'podman is required\n' >&2; exit 2; }
+command -v python3 >/dev/null || { printf 'python3 is required\n' >&2; exit 2; }
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(git -C "$script_dir" rev-parse --show-toplevel)
@@ -57,7 +58,18 @@ fi
 
 source_sha=$(git -C "$repo_root" rev-parse HEAD)
 head_sha=${TONGS_HEAD_SHA:-unknown}
-image_ref=registry.fedoraproject.org/fedora:44
+# The probe shares the RPM harness's Fedora 44 base: the digest the builder
+# pin records, refreshed by the weekly builder pin pull request.
+pin_file="$repo_root/packaging/rpm/builder/image.json"
+python3 -I "$repo_root/scripts/pin_rpm_builder.py" --pin "$pin_file" \
+    --check --require-published
+base_digest=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_digest"])' \
+    "$pin_file")
+[[ "$base_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    printf 'invalid Fedora base digest: %s\n' "$base_digest" >&2
+    exit 1
+}
+image_ref="registry.fedoraproject.org/fedora@$base_digest"
 image_iid_file="$output_dir/harness-image.id"
 
 printf '%q ' "$0" --output-dir "$output_dir" "${inject_failure[@]}" >"$output_dir/invocation.txt"
@@ -84,6 +96,7 @@ podman info --format json >"$output_dir/podman-info.json"
 podman pull --quiet "$image_ref" >"$output_dir/base-image.pull.txt"
 podman image inspect "$image_ref" >"$output_dir/base-image.inspect.json"
 podman build \
+    --build-arg "BASE_IMAGE=$image_ref" \
     --iidfile "$image_iid_file" \
     --label "org.opencontainers.image.revision=$source_sha" \
     --pull=never \

@@ -47,7 +47,19 @@ case "$output_dir/" in
         ;;
 esac
 
-base_image=registry.fedoraproject.org/fedora:44
+# This manual workflow builds on plain Fedora, not the builder image, so a
+# spec that forgets a BuildRequires still fails here.  The base is the Fedora
+# digest the builder pin records; no image comes from a moving tag.
+pin_file="$repo_root/packaging/rpm/builder/image.json"
+python3 -I "$repo_root/scripts/pin_rpm_builder.py" --pin "$pin_file" \
+    --check --require-published
+base_digest=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_digest"])' \
+    "$pin_file")
+[[ "$base_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    printf 'invalid Fedora base digest: %s\n' "$base_digest" >&2
+    exit 1
+}
+base_image="registry.fedoraproject.org/fedora@$base_digest"
 builder_image=localhost/tongs-python-rpms:issue-85
 prepared="$output_dir/prepared"
 srpms="$output_dir/srpms"
@@ -62,11 +74,13 @@ mkdir -p -- "$prepared" "$srpms" "$rpms" "$install_evidence"
     printf 'RUNNER_ENVIRONMENT=%s\n' "${RUNNER_ENVIRONMENT:-unknown}"
     printf 'source_sha=%s\n' "$source_sha"
 } >"$output_dir/runner.env"
+cp -- "$pin_file" "$output_dir/builder-pin.json"
 podman version --format json >"$output_dir/podman-version.json"
 podman info --format json >"$output_dir/podman-info.json"
 podman pull --quiet "$base_image" >"$output_dir/base-image.pull.txt"
 podman image inspect "$base_image" >"$output_dir/base-image.inspect.json"
 podman build \
+    --build-arg "BASE_IMAGE=$base_image" \
     --label "org.opencontainers.image.revision=$source_sha" \
     --pull=never \
     --tag "$builder_image" \

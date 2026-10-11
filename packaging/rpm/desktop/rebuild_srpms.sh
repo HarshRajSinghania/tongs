@@ -59,8 +59,8 @@ EOF
         fi
         podman run --rm --network=none --cap-drop=all \
             --security-opt=no-new-privileges \
-            --volume "$checkout:/checkout:ro" \
-            --volume "$output_dir/$variant:/output:rw" \
+            --volume "$checkout:/checkout:ro,z" \
+            --volume "$output_dir/$variant:/output:rw,z" \
             "$image" "$script" --source-rpm /source.src.rpm --output-dir /output \
                 --dist "$dist" "${rebuild_arguments[@]}"
         podman image inspect "$image" >"$output_dir/buildenv-${source_name}-${variant}.inspect.json"

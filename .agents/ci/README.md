@@ -236,9 +236,41 @@ list; after changing a spec, a Containerfile or a rebuild script, run
 `python3 packaging/rpm/builder/build_requires.py --write` and commit
 `packages.txt`. `tests/packaging/rpm/builder/test_builder_image.py` fails when
 the list drifts, and `python3 scripts/pin_rpm_builder.py --check` validates
-the pin (`tests/ci/test_pin_rpm_builder.py`). Until the first image is
-published, `image.json` holds `null` for every field but `image`, and nothing
-uses the builder yet.
+the pin (`tests/ci/test_pin_rpm_builder.py`). Before the first image is
+published, `image.json` holds `null` for every field but `image`, and every
+consumer below refuses that state.
+
+The pin has three consumers, each of which refuses an unpublished pin with
+`scripts/pin_rpm_builder.py --check --require-published`:
+
+- `packaging/rpm/desktop/run_hosted.sh`, run by the production gate's
+  `rpm-lifecycle` job and the release's `release-rpm` job, runs
+  `gh attestation verify` on the pinned digest (this repository,
+  `rpm-builder-image.yml` as signer workflow, `refs/heads/main` as source ref,
+  the pin's `source_commit` as source digest, hosted runners only) before it
+  pulls the builder by digest or builds anything, and builds the source
+  builder, the companion builder and every rebuild layer on it. The clean
+  install container is plain Fedora at the pin's `base_digest`. Both jobs
+  hold `attestations: read` for the check, and the `ci.yml` call of
+  `desktop-production.yml` grants it, because a called job gets no scope its
+  caller does not. The pin, the verification output and the builder's
+  `podman image inspect` are in the evidence `ALL-SHA256SUMS` hashes. A
+  release tag therefore builds its RPMs from the image its own commit pins.
+- `packaging/rpm/python-dependencies/run_hosted.sh` (the manual companion RPM
+  workflow) builds on plain Fedora at the pin's `base_digest`, never on the
+  builder, so a companion spec that forgets a `BuildRequires` still fails
+  there.
+- `tests/containers/run-fedora-44.sh` (the Fedora 44 Podman probe) builds its
+  harness image on the same base digest.
+
+None of them pulls the moving `fedora:44` tag, so the weekly pin pull request
+is also what moves the RPM gate and the probe to a newer Fedora 44 base, and
+it runs the full graph before it lands. For a local Podman loop,
+`packaging/rpm/desktop/run_hosted.sh --local-builder localhost/<image>` uses a
+builder image built on your machine; it refuses to run when `GITHUB_ACTIONS`
+or `RUNNER_ENVIRONMENT` is set, and `tests/ci/test_workflow_hygiene.py` keeps
+every workflow away from it. `packaging/rpm/desktop/README.md` has the
+commands.
 
 Run it by hand from `main`:
 `gh workflow run rpm-builder-image.yml --ref main`. Scheduled workflows pause
@@ -426,6 +458,9 @@ The Fedora harness interface is:
 ```bash
 tests/containers/run-fedora-44.sh --output-dir <empty-directory-outside-checkout>
 ```
+
+It builds on the Fedora 44 base digest that `packaging/rpm/builder/image.json`
+records and refuses an unpublished pin.
 
 The production desktop release assembly gate is still separate from the
 `CI aggregate`. Do not describe a fixture, Podman, or headless Node run as

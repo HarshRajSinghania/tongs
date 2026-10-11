@@ -34,7 +34,7 @@ for source_rpm in "${source_rpms[@]}"; do
     rpm_name=$(basename -- "$source_rpm")
     podman run --rm --network=none --cap-drop=all \
         --security-opt=no-new-privileges \
-        --volume "$srpm_dir:/srpms:ro" \
+        --volume "$srpm_dir:/srpms:ro,z" \
         --entrypoint rpm \
         "$base_image" \
         -qp --queryformat '%{NAME}|%{VERSION}|%{RELEASE}|%{ARCH}' \
@@ -65,8 +65,8 @@ EOF
     podman image inspect "$image" >"$output_dir/buildenv-${distribution}.inspect.json"
     podman run --rm --network=none --cap-drop=all \
         --security-opt=no-new-privileges \
-        --volume "$checkout:/checkout:ro" \
-        --volume "$output_dir:/output:rw" \
+        --volume "$checkout:/checkout:ro,z" \
+        --volume "$output_dir:/output:rw,z" \
         "$image" \
         /checkout/packaging/rpm/python-dependencies/rebuild_one_srpm.sh \
             --distribution "$distribution" \

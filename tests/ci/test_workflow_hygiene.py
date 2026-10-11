@@ -29,6 +29,10 @@ that apply to every file, not only to the release workflows:
   job attests the pushed digest with the release's ``actions/attest`` pin, and
   the pin job holds only ``contents: write`` and ``pull-requests: write``.
 
+* no workflow can reach the RPM harness's local builder mode: none passes
+  ``--local-builder`` or sets, overrides or clears ``GITHUB_ACTIONS`` or
+  ``RUNNER_ENVIRONMENT``, the variables the harness refuses that mode on.
+
 ``test_release_lock.py`` holds every install under a write token to the
 hash-locked release lock.
 """
@@ -750,3 +754,58 @@ def test_the_builder_pin_job_only_proposes_a_pull_request(
     assert "-- packaging/rpm/builder/image.json" in script
     assert "gh pr edit" in script and "gh pr create" in script
     assert "--base main" in script
+
+
+#: Shell that would set or clear the variables the RPM harness reads to tell a
+#: hosted runner from a developer's machine.
+_RUNNER_IDENTITY_OVERRIDE = re.compile(
+    r"\b(GITHUB_ACTIONS|RUNNER_ENVIRONMENT)=|"
+    r"\bunset\b[^\n;&|]*\b(GITHUB_ACTIONS|RUNNER_ENVIRONMENT)\b|"
+    r"(^|\s)(-u|--unset)[\s=]*(GITHUB_ACTIONS|RUNNER_ENVIRONMENT)\b"
+)
+
+
+def _env_maps(document: dict[str, Any]) -> list[dict[str, Any]]:
+    maps = [document.get("env") or {}]
+    for job in document["jobs"].values():
+        maps.append(job.get("env") or {})
+        maps.extend(step.get("env") or {} for step in job.get("steps", []))
+    return maps
+
+
+def test_no_workflow_can_reach_the_local_rpm_builder_mode(
+    workflows: dict[str, dict[str, Any]],
+) -> None:
+    """``run_hosted.sh --local-builder`` is for local Podman loops only.
+
+    The harness refuses it whenever ``GITHUB_ACTIONS`` or
+    ``RUNNER_ENVIRONMENT`` is set, so no workflow may pass the option or set,
+    override or clear either variable.
+    """
+
+    for path in _workflow_paths():
+        assert "--local-builder" not in path.read_text(), path.name
+    for name, document in workflows.items():
+        for environment in _env_maps(document):
+            assert not {"GITHUB_ACTIONS", "RUNNER_ENVIRONMENT"} & set(environment), name
+        for job_id, job in document["jobs"].items():
+            for step in job.get("steps", []):
+                script = step.get("run") or ""
+                assert not _RUNNER_IDENTITY_OVERRIDE.search(script), (
+                    f"{name}:{job_id}:{step.get('name')}"
+                )
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "GITHUB_ACTIONS= packaging/rpm/desktop/run_hosted.sh",
+        "env -u GITHUB_ACTIONS packaging/rpm/desktop/run_hosted.sh",
+        "env --unset=RUNNER_ENVIRONMENT run_hosted.sh",
+        "unset GITHUB_ACTIONS",
+        "unset FOO RUNNER_ENVIRONMENT",
+        "echo 'RUNNER_ENVIRONMENT=self-hosted' >> \"$GITHUB_ENV\"",
+    ],
+)
+def test_the_runner_identity_check_finds_every_override(script: str) -> None:
+    assert _RUNNER_IDENTITY_OVERRIDE.search(script)

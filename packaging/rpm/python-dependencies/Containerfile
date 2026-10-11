@@ -1,4 +1,8 @@
-FROM registry.fedoraproject.org/fedora:44
+# BASE_IMAGE is required and always digest-pinned: the desktop harness passes
+# the builder image from packaging/rpm/builder/image.json, and this
+# directory's run_hosted.sh passes the plain Fedora base that pin records.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
 
 LABEL org.opencontainers.image.title="Tongs Python companion RPM builder"
 LABEL org.opencontainers.image.description="Disposable Fedora 44 source RPM build environment for issue 85"
