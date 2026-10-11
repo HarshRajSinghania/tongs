@@ -12,6 +12,11 @@ class LineType(Enum):
     DELETION = "deletion"
     HUNK_HEADER = "hunk_header"
     NO_NEWLINE = "no_newline"
+    # An unchanged line the terminal reads from the file at the review's head
+    # to fill a gap between hunks.  It never appears in ``DiffFile.hunks``, and
+    # every comment anchor whitelist accepts only CONTEXT, ADDITION and
+    # DELETION, so an expanded line can never become a comment anchor.
+    EXPANDED = "expanded"
 
 
 class FileStatus(Enum):
@@ -76,6 +81,10 @@ class DiffFile:
     # is always the case for GitHub's files endpoint.
     old_mode: str | None = None
     new_mode: str | None = None
+    # The hunks were computed by tongs from the two file versions because the
+    # forge withheld the patch.  Appended last so positional construction,
+    # the parser, the converter and MCP output are unchanged.
+    generated_locally: bool = False
 
     @property
     def mode_change(self) -> str:

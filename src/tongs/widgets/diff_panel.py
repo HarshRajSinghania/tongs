@@ -21,6 +21,15 @@ from textual.widget import Widget
 from textual.widgets import Markdown, OptionList, Static, Tree
 from textual.widgets.option_list import Option
 
+from tongs.diff.context import (
+    DiffGap,
+    ExpandedBlock,
+    FileContextModel,
+    FileExpansion,
+    GapPosition,
+    GapRow,
+)
+from tongs.diff.context import segments as file_segments
 from tongs.diff.models import DiffFile, DiffHunk, DiffLine, LineType
 from tongs.forges.models import Discussion
 from tongs.helpers import relative_time
@@ -51,6 +60,29 @@ _TOKEN_SPLIT = re.compile(r"(\s+)")
 
 _TAB_SIZE = 4
 """Tab stop the lexers expand tabs to: Rich's ``Syntax`` default."""
+
+READ_ONLY_LINE_MESSAGE = (
+    "Expanded lines are read-only. Comment on a line inside a hunk."
+)
+"""Shown when a comment key is pressed on a gap row or an expanded line."""
+
+RANGE_CROSSES_GAP_MESSAGE = "A comment range must stay inside one hunk."
+"""Shown when a J/K range includes a gap row or an expanded line."""
+
+MOVE_TO_GAP_MESSAGE = 'Move to a "... unchanged lines ..." row to expand it.'
+"""Shown when ``e`` is pressed away from a gap row."""
+
+NO_MORE_LINES_MESSAGE = "No more lines below."
+"""Shown when the file turns out to end where the last hunk ends."""
+
+SPLIT_EXPAND_MESSAGE = "Expanding lines works in the unified view. Press v to switch."
+"""Shown when ``e`` is pressed in the split view, which has no gap rows yet."""
+
+CONTEXT_LOADING_MESSAGE = "Still loading this file."
+"""Shown when ``e`` is pressed again while the file is being read."""
+
+_GAP_INDENT = "         "
+"""Gap rows line up with the in-hunk fold markers."""
 
 
 class CommentMode(Enum):
@@ -145,6 +177,30 @@ class _ThreadToggled(Message):
     """Internal message: discussion expansion state changed, re-render needed."""
 
 
+class ContextRequested(Message):
+    """Posted when a file's unchanged lines are needed to fill its gaps.
+
+    ``gap_index`` names the gap the reader asked for; None asks for the whole
+    file. The screen reads the file and answers with
+    :meth:`DiffPanel.apply_file_context` or :meth:`DiffPanel.file_context_failed`.
+    """
+
+    def __init__(self, file: DiffFile, gap_index: int | None) -> None:
+        super().__init__()
+        self.file = file
+        self.gap_index = gap_index
+
+
+def gap_label(gap: DiffGap, *, loading: bool = False) -> str:
+    """Return the ASCII text of a collapsed gap row."""
+    if loading:
+        return f"{_GAP_INDENT}... loading ..."
+    if gap.length is None:
+        return f"{_GAP_INDENT}... more lines below (e to expand) ..."
+    noun = "line" if gap.length == 1 else "lines"
+    return f"{_GAP_INDENT}... {gap.length} unchanged {noun} (e to expand) ..."
+
+
 class DiffOptionList(TintedOptionList):
     """Per-line interactive diff list with cursor navigation."""
 
@@ -209,6 +265,86 @@ class DiffOptionList(TintedOptionList):
         self._comment_indices: list[int] = []
         self._resolve_confirm = TwoPressConfirm()
         self._explicit_selection_side: DiffSide | None = None
+        # Rows that show unchanged lines outside the hunks: collapsed gaps and
+        # expanded lines. They take the cursor but never enter _line_map, so
+        # they can never form a DiffSelection or a comment anchor.
+        self._gap_rows: dict[int, DiffGap] = {}
+        self._readonly_rows: dict[int, DiffLine] = {}
+
+    def _on_read_only_row(self) -> bool:
+        """Whether the cursor is on a gap row or an expanded line."""
+        highlighted = self.highlighted
+        return highlighted is not None and (
+            highlighted in self._gap_rows or highlighted in self._readonly_rows
+        )
+
+    def _range_crosses_read_only_row(self) -> bool:
+        """Whether the J/K range includes a gap row or an expanded line."""
+        if self._selection_anchor is None or self.highlighted is None:
+            return False
+        lo = min(self._selection_anchor, self.highlighted)
+        hi = max(self._selection_anchor, self.highlighted)
+        return any(
+            lo <= index <= hi
+            for rows in (self._gap_rows, self._readonly_rows)
+            for index in rows
+        )
+
+    def _refuse_read_only(self, *, commenting: bool = False) -> bool:
+        """Notify and return True when the cursor or range cannot take a comment."""
+        if self._on_read_only_row():
+            self.app.notify(READ_ONLY_LINE_MESSAGE)
+            return True
+        if commenting and self._range_crosses_read_only_row():
+            self.app.notify(RANGE_CROSSES_GAP_MESSAGE)
+            return True
+        return False
+
+    def cursor_gap(self) -> DiffGap | None:
+        """Return the gap under the cursor, if the cursor is on a gap row."""
+        if self.highlighted is None:
+            return None
+        return self._gap_rows.get(self.highlighted)
+
+    def _cursor_mark(self) -> tuple[str, object] | None:
+        """Identify a gap row or expanded line under the cursor across redraws."""
+        highlighted = self.highlighted
+        if highlighted is None:
+            return None
+        if (gap := self._gap_rows.get(highlighted)) is not None:
+            return ("gap", gap.index)
+        if (line := self._readonly_rows.get(highlighted)) is not None:
+            return ("line", line)
+        return None
+
+    def _restore_cursor_mark(self, mark: tuple[str, object]) -> bool:
+        kind, value = mark
+        if kind == "gap":
+            index = next(
+                (i for i, gap in self._gap_rows.items() if gap.index == value), None
+            )
+        else:
+            index = self._find_read_only(value)
+        if index is None:
+            return False
+        self.highlighted = index
+        self.scroll_to_highlight()
+        return True
+
+    def _find_read_only(self, target: object) -> int | None:
+        return next(
+            (index for index, line in self._readonly_rows.items() if line is target),
+            None,
+        )
+
+    def _reset_rows(self) -> None:
+        """Forget every per-row map before the options are rebuilt."""
+        self._line_map.clear()
+        self._line_types.clear()
+        self._comment_map.clear()
+        self._comment_indices.clear()
+        self._gap_rows.clear()
+        self._readonly_rows.clear()
 
     @property
     def selection(self) -> DiffSelection | None:
@@ -303,7 +439,7 @@ class DiffOptionList(TintedOptionList):
 
     def action_toggle_discussion(self) -> None:
         """Expand or collapse discussion threads on the current line."""
-        if self.highlighted is None:
+        if self.highlighted is None or self._refuse_read_only():
             return
         discussions = self._comment_map.get(self.highlighted)
         if not discussions:
@@ -329,6 +465,8 @@ class DiffOptionList(TintedOptionList):
 
     def action_reply_discussion(self) -> None:
         """Open reply editor for the discussion on the current line."""
+        if self._refuse_read_only():
+            return
         disc = self._get_target_discussion()
         if disc is None:
             self.app.notify("No discussion on this line")
@@ -347,6 +485,8 @@ class DiffOptionList(TintedOptionList):
 
     def action_resolve_discussion(self) -> None:
         """Resolve or unresolve the discussion on the current line."""
+        if self._refuse_read_only():
+            return
         disc = self._get_target_discussion()
         if disc is None:
             self.app.notify("No discussion on this line")
@@ -365,7 +505,7 @@ class DiffOptionList(TintedOptionList):
 
     def action_comment(self) -> None:
         """Post a CommentRequested message for the highlighted line."""
-        if self.highlighted is None:
+        if self.highlighted is None or self._refuse_read_only(commenting=True):
             return
         dl = self._line_map.get(self.highlighted)
         if dl is None:
@@ -390,7 +530,7 @@ class DiffOptionList(TintedOptionList):
 
     def action_suggest(self) -> None:
         """Post a CommentRequested message with SUGGEST mode."""
-        if self.highlighted is None:
+        if self.highlighted is None or self._refuse_read_only(commenting=True):
             return
         dl = self._line_map.get(self.highlighted)
         if dl is None:
@@ -531,6 +671,12 @@ class DiffContent(Widget):
         self._highlight_cache: OrderedDict[int, tuple[DiffFile, HighlightMap]] = (
             OrderedDict()
         )
+        # Per-file expand-in-place state by id(file), holding the file so a
+        # reused id misses: the new file's lines once read, which gaps are
+        # open, and a read in flight with the gap that asked for it.
+        self._context_models: dict[int, tuple[DiffFile, FileContextModel]] = {}
+        self._expansions: dict[int, tuple[DiffFile, FileExpansion]] = {}
+        self._context_pending: dict[int, tuple[DiffFile, int | None]] = {}
 
     def compose(self) -> ComposeResult:
         yield DiffOptionList(id="diff-option-list")
@@ -645,6 +791,106 @@ class DiffContent(Widget):
         """Forget highlighted files, for example when a new diff is loaded."""
         self._highlight_cache.clear()
 
+    # -- expand in place ----------------------------------------------------
+
+    def clear_file_context(self) -> None:
+        """Forget read files, open gaps and pending reads for every file."""
+        self._context_models.clear()
+        self._expansions.clear()
+        self._context_pending.clear()
+
+    def context_model(self, file: DiffFile) -> FileContextModel | None:
+        """Return the file's read lines, when they have been loaded."""
+        entry = self._context_models.get(id(file))
+        return entry[1] if entry is not None and entry[0] is file else None
+
+    def file_expansion(self, file: DiffFile) -> FileExpansion:
+        """Return which of the file's gaps are open."""
+        entry = self._expansions.get(id(file))
+        return entry[1] if entry is not None and entry[0] is file else FileExpansion()
+
+    def context_pending(self, file: DiffFile) -> bool:
+        """Whether a read of this file is in flight."""
+        entry = self._context_pending.get(id(file))
+        return entry is not None and entry[0] is file
+
+    def _pending_gap(self, file: DiffFile) -> int | None:
+        entry = self._context_pending.get(id(file))
+        return entry[1] if entry is not None and entry[0] is file else None
+
+    def cursor_gap(self) -> DiffGap | None:
+        """Return the gap row under the unified cursor, if any."""
+        if (
+            self._showing_preview
+            or self._current_file is None
+            or self._effective_mode is not DiffViewMode.UNIFIED
+        ):
+            return None
+        return self.query_one(DiffOptionList).cursor_gap()
+
+    def mark_context_pending(self, file: DiffFile, gap_index: int | None) -> None:
+        """Record a read in flight and show its gap row as loading."""
+        self._context_pending[id(file)] = (file, gap_index)
+        self._rerender_if_current(file)
+
+    def expand_gap(self, file: DiffFile, gap_index: int) -> bool:
+        """Open one gap of a file whose lines are loaded.
+
+        The cursor lands on the first newly shown line. Returns False when the
+        gap has no lines, which happens when the file ends at the last hunk.
+        """
+        model = self.context_model(file)
+        if model is None:
+            return False
+        lines = model.expanded_lines(gap_index)
+        if not lines:
+            self._rerender_if_current(file)
+            return False
+        self._expansions[id(file)] = (
+            file,
+            self.file_expansion(file).expand(gap_index),
+        )
+        if self._current_file is file:
+            self._render_current_file()
+            option_list = self.query_one(DiffOptionList)
+            index = option_list._find_read_only(lines[0])
+            if index is not None:
+                option_list.highlighted = index
+                option_list.scroll_to_highlight()
+            self.post_message(DiffSelectionChanged(self.selection))
+        return True
+
+    def apply_file_context(
+        self,
+        file: DiffFile,
+        lines: tuple[str, ...],
+        ends_with_newline: bool,
+        gap_index: int | None,
+    ) -> bool:
+        """Store a file's lines and open the gap that asked for them.
+
+        Returns False when the requested gap turned out to hold no lines.
+        """
+        self._context_pending.pop(id(file), None)
+        self._context_models[id(file)] = (
+            file,
+            FileContextModel(file, lines, ends_with_newline),
+        )
+        if gap_index is None:
+            self._rerender_if_current(file)
+            return True
+        return self.expand_gap(file, gap_index)
+
+    def file_context_failed(self, file: DiffFile) -> None:
+        """Drop a failed read so the gap row reads as before."""
+        if self.context_pending(file):
+            del self._context_pending[id(file)]
+        self._rerender_if_current(file)
+
+    def _rerender_if_current(self, file: DiffFile) -> None:
+        if self._current_file is file and not self._showing_preview:
+            self._render_current_file(self.selection)
+
     def _highlight_map(self, file: DiffFile) -> HighlightMap:
         """Return the file's highlight map, running Pygments only once per file."""
         cached = self._highlight_cache.get(id(file))
@@ -691,11 +937,11 @@ class DiffContent(Widget):
         self, file: DiffFile, selection: DiffSelection | None = None
     ) -> None:
         option_list = self.query_one(DiffOptionList)
+        cursor_mark = (
+            option_list._cursor_mark() if option_list._current_file is file else None
+        )
         option_list.clear_options()
-        option_list._line_map.clear()
-        option_list._line_types.clear()
-        option_list._comment_map.clear()
-        option_list._comment_indices.clear()
+        option_list._reset_rows()
         option_list._current_file = file
         option_list._selection_anchor = None
         option_list._explicit_selection_side = None
@@ -728,8 +974,32 @@ class DiffContent(Widget):
         all_options: list[Option] = []
         option_idx = 0
         first_changed_idx: int | None = None
+        pending_gap = self._pending_gap(file)
+        pending = self.context_pending(file)
 
-        for hunk in file.hunks:
+        for segment in file_segments(
+            file, self.context_model(file), self.file_expansion(file)
+        ):
+            if isinstance(segment, GapRow):
+                gap = segment.gap
+                loading = pending and (
+                    pending_gap == gap.index
+                    or (pending_gap is None and gap.position is GapPosition.AFTER)
+                )
+                all_options.append(
+                    Option(Text(gap_label(gap, loading=loading), style=Style(dim=True)))
+                )
+                option_list._gap_rows[option_idx] = gap
+                option_idx += 1
+                continue
+            if isinstance(segment, ExpandedBlock):
+                for dl in segment.lines:
+                    all_options.append(Option(renderer._render_line(dl)))
+                    option_list._readonly_rows[option_idx] = dl
+                    option_list._line_types[option_idx] = dl.line_type
+                    option_idx += 1
+                continue
+            hunk = segment.hunk
             header_text = Text(f"  {hunk.header}", style=Style(bold=True, dim=True))
             all_options.append(Option(header_text, disabled=True))
             option_idx += 1
@@ -770,8 +1040,9 @@ class DiffContent(Widget):
 
         if first_changed_idx is not None:
             option_list.highlighted = first_changed_idx
-        if selection is not None:
-            option_list.restore_selection(selection)
+        restored = selection is not None and option_list.restore_selection(selection)
+        if not restored and cursor_mark is not None:
+            option_list._restore_cursor_mark(cursor_mark)
 
     def on__thread_toggled(self, event: _ThreadToggled) -> None:
         """Re-render the diff when a thread is expanded or collapsed."""
@@ -833,10 +1104,7 @@ class DiffContent(Widget):
     def show_placeholder(self, message: str) -> None:
         option_list = self.query_one(DiffOptionList)
         option_list.clear_options()
-        option_list._line_map.clear()
-        option_list._line_types.clear()
-        option_list._comment_map.clear()
-        option_list._comment_indices.clear()
+        option_list._reset_rows()
         option_list._expanded_threads.clear()
         option_list._current_file = None
         option_list._selection_anchor = None
@@ -852,6 +1120,7 @@ class DiffContent(Widget):
         self._file_discussions = []
         self._draft_markers = ()
         self._highlight_cache.clear()
+        self.clear_file_context()
         self._show_active_diff()
         self.post_message(DiffSelectionChanged(None))
 
@@ -1512,6 +1781,7 @@ class DiffPanel(Widget):
         Binding("N", "prev_file", "Prev file", show=False, key_display="N"),
         Binding("m", "preview_markdown", "Preview MD", show=False),
         Binding("v", "toggle_diff_mode", "Unified/Split", show=True),
+        Binding("e", "expand_context", "Expand", show=True),
     ]
 
     def __init__(self, **kwargs) -> None:
@@ -1555,7 +1825,9 @@ class DiffPanel(Widget):
             self.show_placeholder("No changes")
             return
         self._files = files
-        self.query_one("#diff-content", DiffContent).clear_highlight_cache()
+        content = self.query_one("#diff-content", DiffContent)
+        content.clear_highlight_cache()
+        content.clear_file_context()
         self.set_changes_overflow(changes_overflow)
         self._discussions_by_file = {}
         for d in discussions or []:
@@ -1705,6 +1977,66 @@ class DiffPanel(Widget):
                 content = self.query_one("#diff-content", DiffContent)
                 content.jump_to(line, side, discussion_id)
                 return
+
+    def _shown_file(self) -> DiffFile | None:
+        if self._files and 0 <= self._current_index < len(self._files):
+            return self._files[self._current_index]
+        return None
+
+    def _owns(self, file: DiffFile) -> bool:
+        """Whether a file object belongs to the files on screen now."""
+        return any(candidate is file for candidate in self._files)
+
+    def action_expand_context(self) -> None:
+        """Open the gap under the cursor, reading the file the first time."""
+        file = self._shown_file()
+        if file is None:
+            return
+        content = self.query_one("#diff-content", DiffContent)
+        gap = content.cursor_gap()
+        if gap is None:
+            split = content.mode_state.effective is DiffViewMode.SPLIT
+            self.app.notify(SPLIT_EXPAND_MESSAGE if split else MOVE_TO_GAP_MESSAGE)
+            return
+        if content.context_model(file) is not None:
+            if not content.expand_gap(file, gap.index):
+                self.app.notify(NO_MORE_LINES_MESSAGE)
+            return
+        if content.context_pending(file):
+            self.app.notify(CONTEXT_LOADING_MESSAGE)
+            return
+        content.mark_context_pending(file, gap.index)
+        self.post_message(ContextRequested(file, gap.index))
+
+    def apply_file_context(
+        self,
+        file: DiffFile,
+        lines: tuple[str, ...],
+        ends_with_newline: bool,
+        gap_index: int | None,
+    ) -> None:
+        """Show a file's unchanged lines read at the displayed revision.
+
+        A reply for a file that is no longer on screen, for example after a
+        refresh, is dropped.
+        """
+        if not self._owns(file):
+            return
+        content = self.query_one("#diff-content", DiffContent)
+        if not content.apply_file_context(file, lines, ends_with_newline, gap_index):
+            self.app.notify(NO_MORE_LINES_MESSAGE)
+
+    def file_context_failed(self, file: DiffFile, message: str) -> None:
+        """Report why a file's unchanged lines could not be shown."""
+        if not self._owns(file):
+            return
+        self.query_one("#diff-content", DiffContent).file_context_failed(file)
+        self.app.notify(message, severity="warning", markup=False)
+
+    def drop_file_context_request(self, file: DiffFile) -> None:
+        """Forget a read whose reply is stale, so its gap row reads as before."""
+        if self._owns(file):
+            self.query_one("#diff-content", DiffContent).file_context_failed(file)
 
     def action_preview_markdown(self) -> None:
         if self._files and 0 <= self._current_index < len(self._files):
