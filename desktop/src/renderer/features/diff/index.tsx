@@ -1,4 +1,5 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -551,6 +552,10 @@ function DiffWorkspace({
     () => loaded.rows.filter((row): row is DiffFileRow => row.kind === "file"),
     [loaded.rows],
   );
+  // Each file's rows and hunk rows, read once per loaded diff. The changed-file
+  // list and the rows view take their slice from here instead of filtering all
+  // rows per file on every render, which made a click cost files times rows.
+  const slices = useMemo(() => fileSlices(loaded.rows), [loaded.rows]);
   const [selected, setSelected] = useState(files[0]?.file_index ?? 0);
   const [target, setTarget] = useState(0);
   const [composerAnchor, setComposerAnchor] =
@@ -615,9 +620,7 @@ function DiffWorkspace({
       (file) => file.file_index === selection.fileIndex,
     );
     if (!matchingFile) return;
-    const fileRows = loaded.rows.filter(
-      (row) => row.file_index === matchingFile.file_index,
-    );
+    const fileRows = sliceOf(slices, matchingFile.file_index).rows;
     const rowIndex = fileRows.findIndex((row) =>
       loaded.layout === "split"
         ? row.kind === "split" && row.row_index === selection.rowIndex
@@ -628,8 +631,8 @@ function DiffWorkspace({
     );
     setSelected(matchingFile.file_index);
     if (rowIndex >= 0) setTarget(rowIndex);
-  }, [files, loaded, review, selection]);
-  const visible = loaded.rows.filter((row) => row.file_index === selected);
+  }, [files, loaded, review, selection, slices]);
+  const visible = sliceOf(slices, selected).rows;
   const selectedFile =
     files.find((file) => file.file_index === selected) ?? null;
   // The entry the composer is editing is re-read from the controller on every
@@ -824,6 +827,23 @@ function DiffWorkspace({
     // stands down for is offered there.
     { standDown: reviewDrawerIsOpen },
   );
+  // The changed-file list gets one handler for the life of the workspace, so a
+  // memoised entry re-renders only when its own file, slice or active state
+  // changes. The handler reads the current file and the anchor setter through
+  // refs instead of closing over one render's values.
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
+  const selectAnchorRef = useRef(selectAnchor);
+  selectAnchorRef.current = selectAnchor;
+  const selectFile = useCallback((fileIndex: number, rowIndex: number) => {
+    const moved = fileIndex !== selectedRef.current;
+    setSelected(fileIndex);
+    setTarget(rowIndex);
+    if (moved) {
+      setComposerAnchor(null);
+      selectAnchorRef.current(null);
+    }
+  }, []);
   const moveFocus = (event: KeyboardEvent<HTMLElement>): void => {
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
     const buttons = [
@@ -855,16 +875,9 @@ function DiffWorkspace({
           <FileNavigation
             key={file.file_index}
             file={file}
-            rows={loaded.rows}
-            selected={selected}
-            select={(fileIndex, rowIndex) => {
-              setSelected(fileIndex);
-              setTarget(rowIndex);
-              if (fileIndex !== selected) {
-                setComposerAnchor(null);
-                selectAnchor(null);
-              }
-            }}
+            slice={sliceOf(slices, file.file_index)}
+            active={selected === file.file_index}
+            select={selectFile}
           />
         ))}
         {files.length === 0 && (
@@ -1038,25 +1051,54 @@ function DiffRowsWindow({
   );
 }
 
-function FileNavigation({
+/** One file's rows in diff order, and the hunk rows among them. */
+interface FileSlice {
+  readonly rows: readonly DiffRow[];
+  readonly hunks: readonly DiffHunkRow[];
+}
+
+const EMPTY_SLICE: FileSlice = Object.freeze({
+  rows: Object.freeze([]),
+  hunks: Object.freeze([]),
+});
+
+/** Groups the loaded rows by file in one pass, keeping their order. */
+function fileSlices(rows: readonly DiffRow[]): ReadonlyMap<number, FileSlice> {
+  const slices = new Map<number, { rows: DiffRow[]; hunks: DiffHunkRow[] }>();
+  for (const row of rows) {
+    let slice = slices.get(row.file_index);
+    if (!slice) {
+      slice = { rows: [], hunks: [] };
+      slices.set(row.file_index, slice);
+    }
+    slice.rows.push(row);
+    if (row.kind === "hunk") slice.hunks.push(row);
+  }
+  return slices;
+}
+
+function sliceOf(
+  slices: ReadonlyMap<number, FileSlice>,
+  fileIndex: number,
+): FileSlice {
+  return slices.get(fileIndex) ?? EMPTY_SLICE;
+}
+
+const FileNavigation = memo(function FileNavigation({
   file,
-  rows,
-  selected,
+  slice,
+  active,
   select,
 }: {
   readonly file: DiffFileRow;
-  readonly rows: readonly DiffRow[];
-  readonly selected: number;
+  readonly slice: FileSlice;
+  readonly active: boolean;
   readonly select: (fileIndex: number, rowIndex: number) => void;
 }): ReactNode {
-  const visible = rows.filter((row) => row.file_index === file.file_index);
-  const hunks = visible.filter(
-    (row): row is DiffHunkRow => row.kind === "hunk",
-  );
   return (
     <>
       <button
-        className={`file-item ${selected === file.file_index ? "nav-item-active" : ""}`}
+        className={`file-item ${active ? "nav-item-active" : ""}`}
         onClick={() => select(file.file_index, 0)}
       >
         <span>{file.new_path || file.old_path}</span>
@@ -1064,18 +1106,18 @@ function FileNavigation({
           +{file.additions} −{file.deletions}
         </span>
       </button>
-      {hunks.map((hunk) => (
+      {slice.hunks.map((hunk) => (
         <button
           key={hunk.hunk_index}
           className="file-item hunk-item"
-          onClick={() => select(file.file_index, visible.indexOf(hunk))}
+          onClick={() => select(file.file_index, slice.rows.indexOf(hunk))}
         >
           {hunk.context_text || hunk.header}
         </button>
       ))}
     </>
   );
-}
+});
 
 function DiffRowView({
   review,
