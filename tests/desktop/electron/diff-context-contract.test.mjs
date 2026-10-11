@@ -74,6 +74,10 @@ test("diff.context takes exactly a review, snapshot, file index, start and count
   const valid = { review: "review", snapshot, file_index: 0, new_start: 1, count: MAX_DIFF_CONTEXT_LINES };
   assertParams("diff.context", valid);
   assertParams("diff.context", { ...valid, file_index: 100_000, new_start: 1_000_000, count: 1 });
+  // A gap deep in a long file starts past any line count the service reads;
+  // the sidecar answers too_large instead of the bridge refusing the request.
+  assertParams("diff.context", { ...valid, new_start: 1_400_005 });
+  assertParams("diff.context", { ...valid, new_start: Number.MAX_SAFE_INTEGER });
   for (const key of Object.keys(valid)) {
     const missing = { ...valid };
     delete missing[key];
@@ -85,7 +89,7 @@ test("diff.context takes exactly a review, snapshot, file index, start and count
   const bad = [
     { count: 0 }, { count: 1001 }, { count: 1.5 }, { count: "10" }, { count: true },
     { file_index: -1 }, { file_index: 100_001 }, { file_index: null },
-    { new_start: 0 }, { new_start: -4 }, { new_start: 1_000_001 }, { new_start: Number.MAX_SAFE_INTEGER + 2 },
+    { new_start: 0 }, { new_start: -4 }, { new_start: 1.5 }, { new_start: Number.MAX_SAFE_INTEGER + 2 },
   ];
   for (const change of bad) {
     assert.throws(() => assertParams("diff.context", { ...valid, ...change }), /Invalid desktop numeric parameter/, JSON.stringify(change));
@@ -118,6 +122,11 @@ test("diff rows accept gap rows with exact keys and bounded numbers", () => {
   for (const method of ["diff.open", "diff.page"]) {
     assertResult(method, page([{ ...fileRow, file_index: 0 }, before, hunkRow, gapRow, after]));
   }
+  // A small patch deep in a long file: gap numbers have no upper bound, as
+  // hunk and line numbers have none.
+  const deepBefore = { ...gapRow, gap_index: 0, position: "before", old_start: 1, new_start: 1, count: 1_399_999 };
+  const deepAfter = { ...gapRow, gap_index: 1, position: "after", old_start: 1_400_005, new_start: 1_400_005, count: null };
+  assertResult("diff.open", page([{ ...fileRow, file_index: 0 }, deepBefore, { ...hunkRow, old_start: 1_400_000, new_start: 1_400_000 }, deepAfter]));
   const bad = [
     { ...gapRow, extra: 1 },
     (({ count, ...rest }) => rest)(gapRow),
@@ -127,7 +136,9 @@ test("diff rows accept gap rows with exact keys and bounded numbers", () => {
     { ...gapRow, count: 0 },
     { ...gapRow, count: -2 },
     { ...gapRow, old_start: 0 },
-    { ...gapRow, new_start: 1_000_001 },
+    { ...gapRow, new_start: 0 },
+    { ...gapRow, new_start: Number.MAX_SAFE_INTEGER + 2 },
+    { ...gapRow, count: 2.5 },
     { ...gapRow, gap_index: -1 },
     { ...gapRow, file_index: 1.5 },
     { ...gapRow, count: "13" },
@@ -138,6 +149,8 @@ test("diff rows accept gap rows with exact keys and bounded numbers", () => {
 test("diff.context results are validated by status", () => {
   assertResult("diff.context", contextResult());
   assertResult("diff.context", contextResult({ rows: [] }));
+  // The old side has no line cap: only the new side is bounded by the read.
+  assertResult("diff.context", contextResult({ rows: [{ ...contextRow, old_line: 1_500_000 }] }));
   assertResult("diff.context", contextResult({
     rows: [contextRow, { ...contextRow, old_line: 15, new_line: 16, content: "line 15" }],
   }));

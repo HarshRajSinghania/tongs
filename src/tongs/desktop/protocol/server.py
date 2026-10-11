@@ -142,9 +142,11 @@ MAX_CONTEXT_LINES = 1000
 #: The most encoded row bytes one ``diff.context`` response carries.
 MAX_CONTEXT_BYTES = 4 * 1024 * 1024
 # Bounds on the integers a renderer may send: a diff snapshot holds at most
-# 100,000 rows, and no file the service reads has a million lines.
+# 100,000 rows. A gap may start past any line count the service reads, so a
+# line number is bounded only by the largest integer JSON carries exactly; a
+# read of such a file comes back as too_large.
 _MAX_FILE_INDEX = 100_000
-_MAX_LINE_NUMBER = 1_000_000
+_MAX_LINE_NUMBER = 2**53 - 1
 _MAX_SNAPSHOT_ID_LENGTH = 100
 # JSON values in one context row: the object and its five members.
 _CONTEXT_ROW_VALUES = 6

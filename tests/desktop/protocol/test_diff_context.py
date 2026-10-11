@@ -123,6 +123,7 @@ class _GitLab:
     """A mocked GitLab serving two merge requests and raw files at commits."""
 
     files: dict[tuple[str, str], httpx.Response] = field(default_factory=dict)
+    changes: list[dict[str, object]] = field(default_factory=_changes)
     requests: list[str] = field(default_factory=list)
     file_reads: list[tuple[str, str]] = field(default_factory=list)
     block: asyncio.Event | None = None
@@ -139,7 +140,7 @@ class _GitLab:
             if raw_path == f"{_PREFIX}/{number}":
                 return httpx.Response(200, json=_merge_request(number))
             if raw_path == f"{_PREFIX}/{number}/diffs":
-                return httpx.Response(200, json=_changes())
+                return httpx.Response(200, json=self.changes)
         if raw_path.startswith(f"{_FILES}/") and raw_path.endswith("/raw"):
             path = unquote(raw_path[len(_FILES) + 1 : -len("/raw")])
             ref = request.url.params["ref"]
@@ -460,6 +461,47 @@ def test_flatten_file_matches_the_file_in_a_whole_diff() -> None:
         assert [entry["kind"] for entry in single][:2] == ["file", "gap"]
 
 
+@pytest.mark.asyncio
+async def test_gap_rows_carry_line_numbers_past_any_read_cap(tmp_path: Path) -> None:
+    """A small patch deep in a long file still opens and refuses to expand."""
+
+    def configure(forge: _GitLab, _server: DesktopSidecarServer) -> None:
+        forge.changes = [
+            {
+                "old_path": "app.py",
+                "new_path": "app.py",
+                "diff": "@@ -1400000,5 +1400000,5 @@\n a\n-b\n+B\n c\n d\n e\n",
+            }
+        ]
+        forge.files[("app.py", HEAD)] = _body(b"x\n" * 20_001)
+
+    async for wired in _start(tmp_path, configure):
+        page = await wired.open(gaps=True)
+        assert _gaps(page) == [
+            {
+                "kind": "gap",
+                "file_index": 0,
+                "gap_index": 0,
+                "position": "before",
+                "old_start": 1,
+                "new_start": 1,
+                "count": 1_399_999,
+            },
+            {
+                "kind": "gap",
+                "file_index": 0,
+                "gap_index": 1,
+                "position": "after",
+                "old_start": 1_400_005,
+                "new_start": 1_400_005,
+                "count": None,
+            },
+        ]
+        result = await wired.context(page["snapshot_id"], new_start=1_400_005)
+        assert result["status"] == "too_large"
+        assert result["rows"] == []
+
+
 # -- diff.context -----------------------------------------------------------
 
 
@@ -607,7 +649,7 @@ async def test_context_stops_before_the_byte_cap(
         {"file_index": "0"},
         {"new_start": 0},
         {"new_start": -3},
-        {"new_start": 1_000_001},
+        {"new_start": 2**53},
         {"surprise": 1},
         {"snapshot": ""},
         {"snapshot": 7},

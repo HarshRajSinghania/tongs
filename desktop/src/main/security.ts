@@ -32,10 +32,12 @@ const MAX_IPC_BYTES = 256 * 1024;
 const MAX_TEXT = 2048;
 // The longest rate-limit wait a CI lookup may name (a day, in seconds).
 const MAX_RATE_LIMIT_WAIT_SECONDS = 86_400;
-// Bounds the service applies to a file index and a line number, and the most
-// encoded bytes of unchanged lines one context read returns.
+// Bounds the service applies to a file index and to the line count of a file
+// it reads, and the most encoded bytes of unchanged lines one context read
+// returns. Line numbers in a diff have no upper bound: a small patch to a long
+// file still opens, and a read past the cap comes back as too_large.
 const MAX_FILE_INDEX = 100_000;
-const MAX_LINE_NUMBER = 1_000_000;
+const MAX_LINE_COUNT = 1_000_000;
 const MAX_CONTEXT_BYTES = 4 * 1024 * 1024;
 const SNAPSHOT_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -85,7 +87,7 @@ export function assertParams(method: string, value: unknown): asserts value is J
     } else if (method === "diff.open" && key === "gaps") {
       if (typeof item !== "boolean") throw new Error("Invalid desktop boolean parameter");
     } else if ((method === "diff.context" || method === "diff.generate") && ["file_index", "new_start", "count"].includes(key)) {
-      const [minimum, maximum] = key === "file_index" ? [0, MAX_FILE_INDEX] : key === "new_start" ? [1, MAX_LINE_NUMBER] : [1, MAX_DIFF_CONTEXT_LINES];
+      const [minimum, maximum] = key === "file_index" ? [0, MAX_FILE_INDEX] : key === "new_start" ? [1, Number.MAX_SAFE_INTEGER] : [1, MAX_DIFF_CONTEXT_LINES];
       if (!Number.isSafeInteger(item) || Number(item) < minimum || Number(item) > maximum) throw new Error("Invalid desktop numeric parameter");
     } else if ((method === "reviews.list" || method === "reviews.ci_status") && key === "fresh") {
       // An explicit refresh that reads past the service's list cache.
@@ -264,11 +266,11 @@ function assertDiffRow(value: unknown): void {
   if (value.kind === "gap") {
     assertKeys(value, [...common, "gap_index", "position", "old_start", "new_start", "count"]);
     integer(value.file_index, 0, "file_index"); integer(value.gap_index, 0, "gap_index");
-    lineNumber(value.old_start, "old_start"); lineNumber(value.new_start, "new_start");
+    integer(value.old_start, 1, "old_start"); integer(value.new_start, 1, "new_start");
     if (!(DIFF_GAP_POSITIONS as readonly unknown[]).includes(value.position)) fail("position", "must be before, between or after");
     // Only the gap after the last hunk has an unknown length.
     if (value.count === null) { if (value.position !== "after") fail("count", "must be a line count before or between hunks"); }
-    else lineNumber(value.count, "count");
+    else integer(value.count, 1, "count");
     return;
   }
   if (value.kind === "split") {
@@ -280,10 +282,6 @@ function assertDiffRow(value: unknown): void {
     return;
   }
   throw new Error("Invalid diff row kind");
-}
-function lineNumber(value: unknown, field: string): void {
-  integer(value, 1, field);
-  if (Number(value) > MAX_LINE_NUMBER) fail(field, `must be at most ${MAX_LINE_NUMBER}`);
 }
 function assertDiffContext(value: unknown): void {
   assertKeys(value, ["status", "message", "line_count", "rows"]);
@@ -297,14 +295,14 @@ function assertDiffContext(value: unknown): void {
   }
   if (value.message !== null) fail("message", "must be null when the read succeeded");
   integer(value.line_count, 0, "line_count");
-  if (Number(value.line_count) > MAX_LINE_NUMBER) fail("line_count", `must be at most ${MAX_LINE_NUMBER}`);
+  if (Number(value.line_count) > MAX_LINE_COUNT) fail("line_count", `must be at most ${MAX_LINE_COUNT}`);
   let bytes = 0;
   let previous: number | null = null;
   assertArray(value.rows, (row) => {
     assertKeys(row, ["kind", "file_index", "old_line", "new_line", "content"]);
     if (row.kind !== "context") fail("kind", "must be context");
     integer(row.file_index, 0, "file_index");
-    lineNumber(row.old_line, "old_line"); lineNumber(row.new_line, "new_line");
+    integer(row.old_line, 1, "old_line"); integer(row.new_line, 1, "new_line");
     if (Number(row.new_line) > Number(value.line_count)) fail("new_line", "must be inside the file");
     // Rows are one consecutive run of lines inside a single file.
     if (previous !== null && Number(row.new_line) !== previous + 1) fail("new_line", "must follow the previous row");
