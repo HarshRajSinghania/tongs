@@ -8,13 +8,18 @@ from enum import Enum
 from tongs.errors import (
     AuthError,
     ConfigError,
+    ConfigFileError,
     ConflictError,
     ForgePermissionError,
     NetworkError,
     NotFoundError,
     RateLimitError,
     ValidationError,
+    redact_credentials,
 )
+
+#: The longest configuration message copied to the service boundary.
+MAX_CONFIGURATION_MESSAGE = 1000
 
 
 class ServiceErrorCode(str, Enum):
@@ -59,7 +64,12 @@ def translate_error(
     operation: str,
     hostname: str | None = None,
 ) -> ServiceError:
-    """Map an internal failure without copying its text or response body."""
+    """Map an internal failure without copying its text or response body.
+
+    The one exception is ``ConfigFileError``: tongs writes its message itself,
+    naming the config file, section and key but never a value, so the message
+    is kept and both apps can say what to fix.
+    """
     if isinstance(error, ServiceError):
         return error
 
@@ -112,6 +122,13 @@ def translate_error(
             ServiceErrorCode.NETWORK_UNAVAILABLE,
             "The forge could not be reached.",
             retryable=True,
+            details=details,
+        )
+    if isinstance(error, ConfigFileError):
+        message = redact_credentials(str(error))[:MAX_CONFIGURATION_MESSAGE]
+        return ServiceError(
+            ServiceErrorCode.CONFIGURATION_INVALID,
+            message,
             details=details,
         )
     if isinstance(error, ConfigError):

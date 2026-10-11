@@ -2,13 +2,6 @@
 
 from __future__ import annotations
 
-import os
-import platform
-import shlex
-import shutil
-import subprocess
-import tempfile
-from contextlib import suppress
 from dataclasses import replace
 from typing import ClassVar
 from uuid import UUID
@@ -20,9 +13,15 @@ from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import Static, TextArea
 
+from tongs.config import app_config
 from tongs.diff.models import DiffFile, DiffLine
 from tongs.diff.position import DiffPosition, position_from_diff_line
 from tongs.state.drafts import DiffSide
+from tongs.widgets.external_editor import (
+    EditorUnavailableError,
+    edit_text,
+    editor_argv,
+)
 
 
 class CommentSubmitted(Message):
@@ -322,49 +321,25 @@ class CommentEditor(Widget):
         self._close()
 
     def action_external_editor(self) -> None:
-        if platform.system() == "Windows":
-            self.app.notify("External editor not supported on Windows")
-            return
-
-        editor = self._find_editor()
-        if not editor:
-            self.app.notify("No external editor found. Set $EDITOR.")
+        try:
+            argv = editor_argv(app_config(self.app))
+        except EditorUnavailableError as error:
+            self.app.notify(error.message, markup=False)
             return
 
         text_area = self.query_one("#comment-input", TextArea)
-        current_text = text_area.text
-        tmp_path = None
-
         try:
-            fd, tmp_path = tempfile.mkstemp(suffix=".md", prefix="tongs-comment-")
-            os.chmod(tmp_path, 0o600)
-            with os.fdopen(fd, "w") as f:
-                f.write(current_text)
-
-            with self.app.suspend():
-                subprocess.run([*shlex.split(editor), tmp_path], check=False)
-
-            with open(tmp_path) as f:
-                new_text = f.read()
-
+            new_text = edit_text(
+                self.app,
+                argv,
+                text_area.text,
+                suffix=".md",
+                prefix="tongs-comment-",
+            )
             text_area.clear()
             text_area.insert(new_text)
         except Exception as exc:  # noqa: BLE001 - Report background/action failures without terminating the TUI.
             self.app.notify(f"Editor failed: {exc}", markup=False)
-        finally:
-            if tmp_path:
-                with suppress(OSError):
-                    os.unlink(tmp_path)
-
-    def _find_editor(self) -> str | None:
-        for var in ("VISUAL", "EDITOR"):
-            editor = os.environ.get(var)
-            if editor:
-                return editor
-        for cmd in ("nvim", "vim", "vi", "nano"):
-            if shutil.which(cmd):
-                return cmd
-        return None
 
     def _configure_submission(self, defer_close: bool) -> None:
         self._defer_close = defer_close

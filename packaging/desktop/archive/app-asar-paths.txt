@@ -2,6 +2,7 @@ dist/shell/app.js
 dist/shell/icon.png
 dist/shell/index.html
 dist/shell/styles.css
+dist/src/main/appearance.js
 dist/src/main/assets.js
 dist/src/main/ci.js
 dist/src/main/index.js

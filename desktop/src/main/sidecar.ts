@@ -3,9 +3,11 @@ import { spawn, type ChildProcessWithoutNullStreams, type SpawnOptions } from "n
 import { TextDecoder } from "node:util";
 
 import {
+  isColorScheme,
   PROTOCOL_MAJOR,
   REQUIRED_CAPABILITIES,
   RESPONSE_TOO_LARGE,
+  type ColorScheme,
   type DesktopEvent,
   type JsonObject,
   type JsonValue,
@@ -50,6 +52,28 @@ export class SidecarError extends Error {
     super(message);
     this.name = "SidecarError";
   }
+}
+
+/** The longest configuration message the desktop shows at startup. */
+export const MAX_CONFIGURATION_MESSAGE = 1000;
+
+/**
+ * The message to show when the service refused to start because config.toml
+ * is invalid, or null for any other failure. The service writes this text
+ * itself: it names the file, section and key, never a value. Control
+ * characters become spaces and the text is cut to a fixed length.
+ */
+export function configurationFailureMessage(error: unknown): string | null {
+  if (!(error instanceof SidecarError) || error.code !== "configuration_invalid") {
+    return null;
+  }
+  const text = Array.from(error.message, (character) => {
+    const point = character.codePointAt(0) ?? 0;
+    return point < 0x20 || (point >= 0x7f && point < 0xa0) ? " " : character;
+  })
+    .join("")
+    .trim();
+  return text.length === 0 ? null : text.slice(0, MAX_CONFIGURATION_MESSAGE);
 }
 
 export interface SidecarCrash {
@@ -215,6 +239,7 @@ export class SidecarTransport extends EventEmitter {
   private recovery: ServiceRecoveryState = "idle";
   private notRunningReported = false;
   private notices: readonly string[] = NO_NOTICES;
+  private colorScheme: ColorScheme = "system";
 
   constructor(
     launch: DesktopLaunchConfig,
@@ -254,6 +279,15 @@ export class SidecarTransport extends EventEmitter {
    */
   get serviceNotices(): readonly string[] {
     return this.notices;
+  }
+
+  /**
+   * The `[ui] color_scheme` the latest handshake reported (#226). A service
+   * that restarts reads config.toml again, so it can change; each change
+   * emits `color-scheme`.
+   */
+  get configuredColorScheme(): ColorScheme {
+    return this.colorScheme;
   }
 
   /** Whether the app's crash recovery is restarting the service or gave up. */
@@ -387,9 +421,11 @@ export class SidecarTransport extends EventEmitter {
       this.startupTimeoutMs,
       startupTimeout,
     );
+    let colorScheme: ColorScheme;
     try {
       const result = await handshake.result;
       this.jsonLimits = validateHandshake(result, this.launch.coreVersion);
+      colorScheme = handshakeColorScheme(result);
       this.notices = mergeNotices(this.notices, handshakeNotices(result));
     } catch (error) {
       // Only this session failed: a later start or restart may still succeed.
@@ -399,6 +435,10 @@ export class SidecarTransport extends EventEmitter {
     }
     if (this.child === child && this.generation === generation && !this.failureReported) {
       this.notRunningReported = false;
+      if (colorScheme !== this.colorScheme) {
+        this.colorScheme = colorScheme;
+        this.emit("color-scheme", colorScheme);
+      }
       this.setState("connected");
     }
   }
@@ -829,6 +869,19 @@ function handshakeNotices(value: JsonValue): readonly string[] {
     .slice(0, MAX_SERVICE_NOTICES)
     .map(truncateNotice);
   return notices.length === 0 ? NO_NOTICES : Object.freeze(notices);
+}
+
+/**
+ * Reads the optional configured colour scheme of a handshake. A service that
+ * predates the setting omits it and the window follows the OS; any value but
+ * one of the three scheme names means an incompatible service.
+ */
+function handshakeColorScheme(value: JsonValue): ColorScheme {
+  if (!isRecord(value) || value.color_scheme === undefined) return "system";
+  if (!isColorScheme(value.color_scheme)) {
+    throw new SidecarError("incompatible_handshake", "The desktop service is incompatible.");
+  }
+  return value.color_scheme;
 }
 
 /** Adds the new notices after the kept ones, without repeats, up to the bound. */

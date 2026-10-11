@@ -1,7 +1,21 @@
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { app, BrowserWindow, clipboard, protocol, session } from "electron";
+import {
+  app,
+  BrowserWindow,
+  clipboard,
+  dialog,
+  nativeTheme,
+  protocol,
+  session,
+} from "electron";
+import {
+  AppearanceController,
+  DESKTOP_SETTINGS_FILE,
+  DesktopSettingsStore,
+  windowBackground,
+} from "./appearance.js";
 import { AssetCatalog } from "./assets.js";
 import { DesktopIpcController } from "./ipc.js";
 import { parseLaunchArguments } from "./launch.js";
@@ -15,7 +29,7 @@ import {
   ServiceRecoveryPolicy,
   watchServiceLoss,
 } from "./renderer_lifecycle.js";
-import { SidecarTransport } from "./sidecar.js";
+import { configurationFailureMessage, SidecarTransport } from "./sidecar.js";
 import { resolveEditorExportRoot, WorkspaceUtilities } from "./utilities.js";
 
 protocol.registerSchemesAsPrivileged([APP_SCHEME_REGISTRATION]);
@@ -68,10 +82,20 @@ async function run(): Promise<void> {
     process.env,
     app.getPath("temp"),
   );
+  // The saved scheme applies before the service starts, so even a startup
+  // error dialog matches it; the configured one arrives with the handshake.
+  const appearance = new AppearanceController(
+    new DesktopSettingsStore(
+      path.join(app.getPath("userData"), DESKTOP_SETTINGS_FILE),
+    ),
+    nativeTheme,
+  );
+  await appearance.load();
   transport = new SidecarTransport({
     ...launch,
     utilityExportRoot: editorExportRoot,
   });
+  transport.on("color-scheme", (scheme) => appearance.setConfigured(scheme));
   await transport.start();
   const assets = new AssetCatalog(transport, path.join(desktopRoot, "shell"));
   await assets.refresh();
@@ -82,7 +106,7 @@ async function run(): Promise<void> {
     width: 1180,
     height: 780,
     show: false,
-    backgroundColor: "#101418",
+    backgroundColor: windowBackground(appearance.dark),
     icon: path.join(desktopRoot, "icon.png"),
     webPreferences: {
       session: desktopSession,
@@ -100,9 +124,22 @@ async function run(): Promise<void> {
     clipboard,
     editorExportRoot,
   );
-  controller = new DesktopIpcController(window, transport, assets, utilities);
+  controller = new DesktopIpcController(
+    window,
+    transport,
+    assets,
+    utilities,
+    appearance,
+  );
   controller.register();
   const owner = window;
+  const updateBackground = (): void => {
+    if (!owner.isDestroyed()) {
+      owner.setBackgroundColor(windowBackground(appearance.dark));
+    }
+  };
+  nativeTheme.on("updated", updateBackground);
+  owner.once("closed", () => nativeTheme.off("updated", updateBackground));
   const sidecar = transport;
   rendererRecovery = new RendererRecoveryCoordinator({
     resetBindings: () => controller?.reset(),
@@ -404,6 +441,10 @@ app
     console.error(
       error instanceof Error ? error.message : "Desktop startup failed",
     );
+    const configuration = configurationFailureMessage(error);
+    if (configuration !== null) {
+      dialog.showErrorBox("tongs could not start", configuration);
+    }
     app.exit(1);
   });
 app.on("before-quit", () => {

@@ -65,7 +65,7 @@ async def test_editor_export_strips_ansi_sequences(
 
     monkeypatch.setenv("EDITOR", "editor")
     monkeypatch.setattr(app, "suspend", lambda: nullcontext())
-    monkeypatch.setattr("tongs.widgets.pipeline_panel.subprocess.run", capture)
+    monkeypatch.setattr("tongs.widgets.external_editor.subprocess.run", capture)
 
     async with app.run_test():
         panel = app.query_one("#pipeline-panel", PipelinePanel)
@@ -93,9 +93,9 @@ async def test_editor_export_works_for_any_job_name(
         exported.append((path, path.read_text()))
 
     monkeypatch.setenv("EDITOR", "editor")
-    monkeypatch.setattr("tongs.widgets.pipeline_panel.tempfile.tempdir", str(tmp_path))
+    monkeypatch.setattr("tongs.widgets.external_editor.tempfile.tempdir", str(tmp_path))
     monkeypatch.setattr(app, "suspend", lambda: nullcontext())
-    monkeypatch.setattr("tongs.widgets.pipeline_panel.subprocess.run", capture)
+    monkeypatch.setattr("tongs.widgets.external_editor.subprocess.run", capture)
     notices: list[str] = []
     monkeypatch.setattr(app, "notify", lambda message, **_: notices.append(message))
 

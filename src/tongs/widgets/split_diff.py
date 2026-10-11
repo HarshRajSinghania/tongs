@@ -8,8 +8,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, ClassVar, Self
 
-from rich.console import Console
-from rich.markdown import Markdown as RichMarkdown
 from rich.style import Style
 from rich.text import Text
 from textual import events
@@ -21,6 +19,7 @@ from textual.widget import Widget
 from textual.widgets import OptionList
 from textual.widgets.option_list import Option
 
+from tongs.config import DEFAULT_SYNTAX_THEME, app_config
 from tongs.diff.alignment import align_hunk
 from tongs.diff.context import (
     DiffGap,
@@ -34,7 +33,7 @@ from tongs.diff.context import (
 )
 from tongs.diff.models import DiffFile, DiffHunk, DiffLine, LineType, SplitDiffRow
 from tongs.forges.models import Discussion
-from tongs.helpers import relative_time
+from tongs.helpers import markdown_lines, relative_time
 from tongs.state.drafts import DiffSide
 from tongs.widgets.tinted_option_list import TintedOptionList
 from tongs.widgets.two_press import TwoPressConfirm
@@ -1098,7 +1097,10 @@ class SplitDiffView(Widget):
             for discussion in row_discussions
             if discussion.id in self._expanded_threads
         ]
-        for thread_line in _thread_lines(expanded):
+        config = app_config(self.app)
+        for thread_line in _thread_lines(
+            expanded, ascii_mode=config.ascii_mode, code_theme=config.syntax_theme
+        ):
             old_options.append(Option(_single_line(""), disabled=True))
             new_options.append(Option(thread_line, disabled=True))
             option_index += 1
@@ -1345,9 +1347,13 @@ def _line_discussions(
     return []
 
 
-def _thread_lines(discussions: list[Discussion]) -> list[Text]:
+def _thread_lines(
+    discussions: list[Discussion],
+    *,
+    ascii_mode: bool = False,
+    code_theme: str = DEFAULT_SYNTAX_THEME,
+) -> list[Text]:
     lines: list[Text] = []
-    console = Console(width=80)
     for discussion in discussions:
         root = discussion.root_comment
         state = "resolved" if discussion.is_resolved else "open"
@@ -1357,8 +1363,8 @@ def _thread_lines(discussions: list[Discussion]) -> list[Text]:
                 Style(dim=discussion.is_resolved, bold=not discussion.is_resolved),
             )
         )
-        for segments in console.render_lines(
-            RichMarkdown(root.body or ""), console.options.update_width(60)
+        for segments in markdown_lines(
+            root.body or "", 60, ascii_mode=ascii_mode, code_theme=code_theme
         ):
             text = _single_line("   ")
             for segment in segments:
@@ -1367,8 +1373,8 @@ def _thread_lines(discussions: list[Discussion]) -> list[Text]:
             lines.append(text)
         for reply in root.replies:
             lines.append(_single_line(f"   @{reply.author.username}", Style(dim=True)))
-            for segments in console.render_lines(
-                RichMarkdown(reply.body or ""), console.options.update_width(57)
+            for segments in markdown_lines(
+                reply.body or "", 57, ascii_mode=ascii_mode, code_theme=code_theme
             ):
                 text = _single_line("     ")
                 for segment in segments:

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
+
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class ForgeError(Exception):
@@ -73,6 +76,22 @@ class UnsupportedFileReadError(ForgeError):
 
 class ConfigError(ForgeError):
     """Configuration error (malformed config, invalid scan root, etc.)."""
+
+
+class ConfigFileError(ConfigError):
+    """``config.toml`` cannot be used as written.
+
+    The message names the file and the problem, such as the section and key
+    or the line and column of a syntax error. It never holds a value from the
+    file, so the apps may show it as it is.
+    """
+
+    def __init__(self, path: Path, problem: str) -> None:
+        # Quoted TOML keys may hold control characters; keep the message one line.
+        message = _CONTROL_CHARACTERS.sub("?", f"Invalid config file {path}: {problem}")
+        super().__init__(message)
+        self.path = path
+        self.problem = problem
 
 
 class PartialResultsError(ForgeError):

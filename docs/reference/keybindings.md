@@ -93,9 +93,9 @@ Collapsing with ++e++ reads nothing, and neither does expanding the same lines
 again. Expanded lines are read-only. See
 [Expanding context](/guides/diffs/#expanding-context).
 
-++f3++ works on the new side only, and not on deleted lines. It opens
-`$VISUAL`, then `$EDITOR`, then the first of `nvim`, `vim`, `vi` or `nano` on
-your `PATH`.
+++f3++ works on the new side only, and not on deleted lines. It opens the
+[`[editor]`](/reference/configuration/#editor) `command`, then `$VISUAL`, then
+`$EDITOR`, then the first of `nvim`, `vim`, `vi` or `nano` on your `PATH`.
 
 ### Comment editor
 

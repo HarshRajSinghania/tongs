@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from rich.console import Console
-from rich.markdown import Markdown as RichMarkdown
 from rich.style import Style
 from rich.text import Text
 from textual.app import ComposeResult
@@ -17,9 +15,10 @@ from textual.reactive import reactive
 from textual.widget import Widget
 from textual.widgets import Static
 
+from tongs.config import DEFAULT_SYNTAX_THEME, app_config
 from tongs.diff.models import DiffFile, DiffLine
 from tongs.forges.models import Discussion
-from tongs.helpers import relative_time
+from tongs.helpers import markdown_lines, relative_time
 from tongs.widgets.two_press import TwoPressConfirm
 
 
@@ -131,7 +130,10 @@ class DiscussionCard(Static):
                 content.append("\n")
 
         content.append("\n")
-        thread_lines = _render_thread(disc)
+        config = app_config(self.app)
+        thread_lines = _render_thread(
+            disc, ascii_mode=config.ascii_mode, code_theme=config.syntax_theme
+        )
         for line in thread_lines:
             content.append_text(line)
             content.append("\n")
@@ -241,7 +243,11 @@ class DiscussionPanel(Widget):
                 diff_file = diff_by_path.get(rc.file_path)
                 if diff_file:
                     target_line = rc.new_line or rc.old_line
-                    snippet = render_diff_snippet(diff_file, target_line)
+                    snippet = render_diff_snippet(
+                        diff_file,
+                        target_line,
+                        syntax_theme=app_config(self.app).syntax_theme,
+                    )
 
             card = DiscussionCard(disc, snippet_lines=snippet)
             card.id = f"disc-card-{i}"
@@ -385,7 +391,11 @@ class DiscussionPanel(Widget):
 
 
 def render_diff_snippet(
-    file: DiffFile, target_line: int | None, context: int = 2
+    file: DiffFile,
+    target_line: int | None,
+    context: int = 2,
+    *,
+    syntax_theme: str = DEFAULT_SYNTAX_THEME,
 ) -> list[Text]:
     """Extract and render diff lines around a target line number."""
     if target_line is None or not file.hunks:
@@ -393,7 +403,7 @@ def render_diff_snippet(
 
     from tongs.widgets.diff_panel import DiffRenderer
 
-    renderer = DiffRenderer(file.language)
+    renderer = DiffRenderer(file.language, syntax_theme=syntax_theme)
     matching_lines: list[tuple[int, DiffLine]] = []
 
     for hunk in file.hunks:
@@ -431,7 +441,12 @@ def render_diff_snippet(
     return result
 
 
-def _render_thread(disc: Discussion) -> list[Text]:
+def _render_thread(
+    disc: Discussion,
+    *,
+    ascii_mode: bool = False,
+    code_theme: str = DEFAULT_SYNTAX_THEME,
+) -> list[Text]:
     """Render a full discussion thread with Rich Markdown."""
     lines: list[Text] = []
     rc = disc.root_comment
@@ -451,9 +466,9 @@ def _render_thread(disc: Discussion) -> list[Text]:
         lines.append(author_line)
 
         if comment.body:
-            console = Console(width=80)
-            md = RichMarkdown(comment.body)
-            for segments in console.render_lines(md, console.options.update_width(70)):
+            for segments in markdown_lines(
+                comment.body, 70, ascii_mode=ascii_mode, code_theme=code_theme
+            ):
                 line = Text()
                 if is_reply:
                     line.append("  ")

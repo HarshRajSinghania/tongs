@@ -55,3 +55,14 @@ test("the preload exposes the diff context and generation channels", () => {
   assert.match(preload, /getDiffContext: \(params: DiffContextParams\): DesktopRead<DiffContextResult> => read\(IPC_CHANNELS\.getDiffContext, params\)/);
   assert.match(preload, /generateDiff: \(params: GenerateDiffParams\): DesktopRead<GenerateDiffResult> => read\(IPC_CHANNELS\.generateDiff, params\)/);
 });
+
+test("the preload exposes the colour scheme channels and nothing broader", () => {
+  const channels = preloadGroup("IPC_CHANNELS");
+  assert.equal(channels.getAppearance, "tongs:appearance.get");
+  assert.equal(channels.setColorScheme, "tongs:appearance.set-color-scheme");
+  assert.equal(channels.appearance, "tongs:appearance");
+  assert.match(preload, /getAppearance: async \(\): Promise<AppearanceDto> => ipcRenderer\.invoke\(IPC_CHANNELS\.getAppearance\) as Promise<AppearanceDto>/);
+  assert.match(preload, /setColorScheme: async \(choice: ColorScheme\): Promise<AppearanceDto> => ipcRenderer\.invoke\(IPC_CHANNELS\.setColorScheme, choice\) as Promise<AppearanceDto>/);
+  assert.match(preload, /ipcRenderer\.on\(IPC_CHANNELS\.appearance, wrapped\)/);
+  assert.match(preload, /ipcRenderer\.removeListener\(IPC_CHANNELS\.appearance, wrapped\)/);
+});

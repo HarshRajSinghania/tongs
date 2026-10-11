@@ -19,6 +19,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Protocol, cast
 
+from tongs.config import COLOR_SCHEMES
 from tongs.desktop.assets import (
     ASSET_CHUNK_BYTES,
     AssetCatalog,
@@ -586,8 +587,8 @@ class DesktopSidecarServer:
                 getattr(cast(object, self._session), "recovery_warnings", ())
             )
             _report_recovery_warnings(recovery_warnings)
+            config = getattr(cast(object, self._session), "config", None)
             if self._plugin_registry is None:
-                config = cast(object, self._session.config)
                 plugin_config = getattr(config, "plugin_config", {})
                 self._plugin_registry = DesktopPluginRegistry(plugin_config)
             self._plugin_registry.discover()
@@ -607,6 +608,7 @@ class DesktopSidecarServer:
                     "accepted_capabilities": sorted(requested),
                     "methods": [*sorted(self._operations), "shutdown"],
                     "recovery_warnings": _recovery_notices(recovery_warnings),
+                    "color_scheme": _color_scheme(config),
                     "limits": {
                         "request_frame_bytes": MAX_REQUEST_FRAME_BYTES,
                         "response_frame_bytes": MAX_RESPONSE_FRAME_BYTES,
@@ -2397,6 +2399,18 @@ def _consume_task(task: asyncio.Task[object]) -> None:
     if not task.cancelled():
         with suppress(BaseException):
             task.exception()
+
+
+def _color_scheme(config: object) -> str:
+    """The ``[ui] color_scheme`` the desktop window starts from (#226).
+
+    The loader already turns an unknown name into the default; a session
+    without the setting, such as a test double, also gets the default.
+    """
+    value = getattr(config, "color_scheme", COLOR_SCHEMES[0])
+    return (
+        value if isinstance(value, str) and value in COLOR_SCHEMES else COLOR_SCHEMES[0]
+    )
 
 
 #: Bounds of the handshake's ``recovery_warnings``, matched by the desktop shell.

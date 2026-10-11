@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import suppress
 from dataclasses import dataclass, replace
+from pathlib import PurePosixPath
 from typing import ClassVar
 from uuid import UUID
 
@@ -19,17 +19,16 @@ from textual.css.query import NoMatches
 from textual.screen import Screen
 from textual.widgets import (
     Footer,
-    Header,
-    Markdown,
     Static,
     TabbedContent,
     TabPane,
     TextArea,
 )
 
+from tongs.config import app_config
 from tongs.diff.context import verify_new_side
 from tongs.diff.models import DiffFile
-from tongs.diff.position import DiffPosition
+from tongs.diff.position import DiffPosition, position_from_diff_line
 from tongs.forges.models import (
     CIStatus,
     Discussion,
@@ -73,6 +72,7 @@ from tongs.views.suggestion import (
     parse_suggestion_template,
     resolve_suggestion_position,
 )
+from tongs.widgets.ascii import TongsMarkdown, tongs_header
 from tongs.widgets.comment_editor import (
     CommentEditor,
     CommentSubmitted,
@@ -95,6 +95,11 @@ from tongs.widgets.discussion_list import (
     DiscussionReplyRequested,
     JumpToDiffDiscussion,
     is_unresolved,
+)
+from tongs.widgets.external_editor import (
+    EditorUnavailableError,
+    edit_text,
+    editor_argv,
 )
 from tongs.widgets.pipeline_panel import (
     CancelJobRequested,
@@ -290,12 +295,12 @@ class MRDetailScreen(Screen):
         self._two_press = TwoPressConfirm()
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield tongs_header(self.app)
         yield ReviewDraftBar(id="review-draft-bar")
         with TabbedContent(initial="overview"):
             with TabPane("Overview", id="overview"), VerticalScroll():
                 yield MROverview(id="mr-overview")
-                yield Markdown(id="mr-description")
+                yield TongsMarkdown(id="mr-description")
             with TabPane("Diff", id="diff"):
                 yield DiffPanel(id="diff-panel")
             with TabPane("Commits", id="commits"), VerticalScroll(id="commits-scroll"):
@@ -325,7 +330,7 @@ class MRDetailScreen(Screen):
             self._supports_batched_review = snapshot.capabilities.batched_review
             overview = self.query_one("#mr-overview", MROverview)
             overview.set_mr(self.mr_detail)
-            description_widget = self.query_one("#mr-description", Markdown)
+            description_widget = self.query_one("#mr-description", TongsMarkdown)
             description_widget.update(self.mr_detail.description or "")
             # The detail and the diff load independently, so whichever lands
             # second leaves the truncated file list banner in its final state.
@@ -1881,14 +1886,14 @@ class MRDetailScreen(Screen):
 
     def _open_suggestion(self, event: CommentRequested) -> None:
         """Open external editor for suggesting changes."""
-        import os
-        import shlex
-        import shutil
-        import subprocess
-        import tempfile
-
         if event.side is DiffSide.OLD:
             self.notify("Suggestions are available on the new side only")
+            return
+
+        try:
+            argv = editor_argv(app_config(self.app))
+        except EditorUnavailableError as error:
+            self.notify(error.message, markup=False)
             return
 
         revision = self._displayed_diff_revision
@@ -1905,21 +1910,6 @@ class MRDetailScreen(Screen):
             if draft_capture is None:
                 return
 
-        editor_cmd = None
-        for var in ("VISUAL", "EDITOR"):
-            v = os.environ.get(var)
-            if v:
-                editor_cmd = v
-                break
-        if not editor_cmd:
-            for cmd in ("nvim", "vim", "vi", "nano"):
-                if shutil.which(cmd):
-                    editor_cmd = cmd
-                    break
-        if not editor_cmd:
-            self.notify("No external editor found. Set $EDITOR.")
-            return
-
         lines = event.context_lines or ([event.line] if event.line else [])
         new_side_lines = extract_new_side_lines(lines)
         if not new_side_lines:
@@ -1931,20 +1921,11 @@ class MRDetailScreen(Screen):
         template = build_suggestion_template(original_code)
         n_original = len(new_side_lines)
 
-        ext = os.path.splitext(file_path)[1] or ".txt"
-        tmp_path = None
+        ext = PurePosixPath(file_path).suffix or ".txt"
         try:
-            fd, tmp_path = tempfile.mkstemp(suffix=ext, prefix="tongs-suggest-")
-            os.chmod(tmp_path, 0o600)
-            with os.fdopen(fd, "w") as f:
-                f.write(template)
-
-            with self.app.suspend():
-                subprocess.run([*shlex.split(editor_cmd), tmp_path], check=False)
-
-            with open(tmp_path) as f:
-                edited = f.read()
-
+            edited = edit_text(
+                self.app, argv, template, suffix=ext, prefix="tongs-suggest-"
+            )
             comment_text, suggested_code = parse_suggestion_template(edited)
 
             if not suggested_code or suggested_code == original_code.strip():
@@ -1955,8 +1936,6 @@ class MRDetailScreen(Screen):
             body = format_suggestion_block(
                 suggested_code, n_original, forge_type, comment_text
             )
-
-            from tongs.diff.position import position_from_diff_line
 
             pos_line, start_line, start_side = resolve_suggestion_position(
                 new_side_lines, forge_type
@@ -1997,10 +1976,6 @@ class MRDetailScreen(Screen):
             )
         except Exception as exc:  # noqa: BLE001 - Report background/action failures without terminating the TUI.
             self.notify(f"Suggestion failed: {exc}", severity="error", markup=False)
-        finally:
-            if tmp_path:
-                with suppress(OSError):
-                    os.unlink(tmp_path)
 
     def on_comment_submitted(self, event: CommentSubmitted) -> None:
         """Handle inline comment submission from CommentEditor."""

@@ -18,8 +18,9 @@ from textual.dom import NoScreen
 from textual.reactive import reactive
 from textual.screen import Screen
 from textual.timer import Timer
-from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, TabPane
+from textual.widgets import DataTable, Footer, Static, TabbedContent, TabPane
 
+from tongs.config import app_config
 from tongs.forges.models import CIStatus, MRSummary
 from tongs.scanner.repo import Repo
 from tongs.services.errors import ServiceError, ServiceErrorCode
@@ -30,6 +31,7 @@ from tongs.services.models import (
     ReviewScope,
 )
 from tongs.tui_services import TUIRepositoryProgress
+from tongs.widgets.ascii import tongs_header
 from tongs.widgets.mr_table import MRTable, mr_row_key
 
 # Each inbox tab and the table that shows it.
@@ -145,7 +147,7 @@ class InboxScreen(Screen):
         self._rate_limit_timers: dict[str, Timer] = {}
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield tongs_header(self.app)
         with TabbedContent(initial="reviews"):
             with TabPane("My Reviews", id="reviews"):
                 yield MRTable(id="reviews-table")
@@ -532,10 +534,9 @@ class InboxScreen(Screen):
             if load == self._all_open_load:
                 # Rows that already arrived replaced the earlier list, so say
                 # the list is incomplete rather than clearing the status.
+                shown = len(self._shown(items))
                 self._set_all_open_status(
-                    f"List incomplete: {_open_count(len(items))} loaded"
-                    if items
-                    else ""
+                    f"List incomplete: {_open_count(shown)} loaded" if shown else ""
                 )
                 self.notify(
                     f"All Open: {error.message}", severity="warning", markup=False
@@ -591,11 +592,17 @@ class InboxScreen(Screen):
                 self._all_open_cursors.pop(step.repository, None)
         if not step.page.items:
             return
-        summaries = [item.summary for item in step.page.items]
+        summaries = self._shown([item.summary for item in step.page.items])
         table.merge_mrs(
             summaries, self.app.config.ascii_mode, replace=replace, ci_pending=True
         )
         self._want_ci("all-open", summaries, fresh=fresh)
+
+    def _shown(self, summaries: list[MRSummary]) -> list[MRSummary]:
+        """Drop draft MRs when ``[ui] show_draft_mrs`` is false."""
+        if app_config(self.app).show_draft_mrs:
+            return summaries
+        return [summary for summary in summaries if not summary.is_draft]
 
     def _all_open_summary(self, table: MRTable) -> str:
         """Count the loaded rows and say whether more can be loaded.
@@ -933,7 +940,7 @@ class InboxScreen(Screen):
         if page.items or not page.failures:
             # The new rows replace the old ones, so lookups for those stop.
             self._stop_ci_lookups(tab_id)
-            summaries = [item.summary for item in page.items]
+            summaries = self._shown([item.summary for item in page.items])
             table.merge_mrs(
                 summaries, self.app.config.ascii_mode, replace=True, ci_pending=True
             )

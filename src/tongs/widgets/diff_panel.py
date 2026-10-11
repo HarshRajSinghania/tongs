@@ -23,6 +23,7 @@ from textual.widget import Widget
 from textual.widgets import Markdown, OptionList, Static, Tree
 from textual.widgets.option_list import Option
 
+from tongs.config import DEFAULT_SYNTAX_THEME, app_config
 from tongs.diff.context import (
     DiffGap,
     ExpandedBlock,
@@ -39,8 +40,9 @@ from tongs.diff.context import segments as file_segments
 from tongs.diff.generate import FileLines
 from tongs.diff.models import DiffFile, DiffHunk, DiffLine, FileStatus, LineType
 from tongs.forges.models import Discussion
-from tongs.helpers import relative_time
+from tongs.helpers import markdown_lines, relative_time
 from tongs.state.drafts import DiffSide
+from tongs.widgets.ascii import TREE_ICONS, TREE_LINES, TongsMarkdown
 from tongs.widgets.review_draft import DraftMarker
 from tongs.widgets.split_diff import (
     FOLD_READ_ONLY_MESSAGE,
@@ -66,9 +68,6 @@ from tongs.widgets.split_diff import (
 )
 from tongs.widgets.tinted_option_list import TintedOptionList
 from tongs.widgets.two_press import TwoPressConfirm
-
-SYNTAX_THEME = "monokai"
-"""Pygments theme for diff code; only token colours and weights are used."""
 
 _TOKEN_SPLIT = re.compile(r"(\s+)")
 """Word diff tokens: runs of non-space text and the whitespace between them."""
@@ -157,6 +156,11 @@ class CommentRequested(Message):
 
 class DiffFileTree(Tree):
     """File tree showing changed files with status and stats."""
+
+    def on_mount(self) -> None:
+        if app_config(self.app).ascii_mode:
+            self.ICON_NODE, self.ICON_NODE_EXPANDED = TREE_ICONS
+            self.LINES = dict(TREE_LINES)
 
     def set_files(
         self,
@@ -815,6 +819,8 @@ class DiffContent(Widget):
         self._file_discussions: list[Discussion] = []
         self._requested_mode = DiffViewMode.UNIFIED
         self._effective_mode = DiffViewMode.UNIFIED
+        # The Pygments style for code, from ``[ui] syntax_theme`` once mounted.
+        self._syntax_theme = DEFAULT_SYNTAX_THEME
         self._preview_selection: DiffSelection | None = None
         self._draft_markers: tuple[DraftMarker, ...] = ()
         # Highlight maps by id(file), holding the file so a reused id misses,
@@ -839,11 +845,17 @@ class DiffContent(Widget):
     def compose(self) -> ComposeResult:
         yield DiffOptionList(id="diff-option-list")
         yield SplitDiffView(id="split-diff-view")
-        yield Markdown(id="diff-markdown-preview")
+        yield TongsMarkdown(id="diff-markdown-preview")
 
     def on_mount(self) -> None:
         self.query_one(SplitDiffView).display = False
         self.query_one("#diff-markdown-preview", Markdown).display = False
+        config = app_config(self.app)
+        self._syntax_theme = config.syntax_theme
+        # ``[ui] diff_style`` picks the layout a new diff view starts in; the
+        # config loader already turned an invalid value into "unified".
+        if config.diff_style == DiffViewMode.SPLIT.value:
+            self._requested_mode = DiffViewMode.SPLIT
 
     @property
     def mode_state(self) -> DiffModeState:
@@ -1175,6 +1187,7 @@ class DiffContent(Widget):
             comment_lines=_build_comment_lines(self._file_discussions),
             protected_lines=self._draft_line_keys(file),
             revealed=expansion.reveals,
+            syntax_theme=self._syntax_theme,
         )
         return renderer.folds_line(hunk, line)
 
@@ -1254,7 +1267,9 @@ class DiffContent(Widget):
         language = file.language or "text"
         if language == "text" or not model.gaps:
             return
-        highlighted = await asyncio.to_thread(_highlight_new_file, language, model)
+        highlighted = await asyncio.to_thread(
+            _highlight_new_file, language, model, self._syntax_theme
+        )
         if not highlighted or self.context_model(file) is not model:
             return
         # Unchanged lines read the same on both sides, so both get the colours.
@@ -1298,7 +1313,7 @@ class DiffContent(Widget):
         if cached is not None and cached[0] is file:
             self._highlight_cache.move_to_end(id(file))
             return cached[1]
-        highlight_map = _build_highlight_map(file)
+        highlight_map = _build_highlight_map(file, self._syntax_theme)
         self._highlight_cache[id(file)] = (file, highlight_map)
         self._highlight_cache.move_to_end(id(file))
         while len(self._highlight_cache) > self.HIGHLIGHT_CACHE_FILES:
@@ -1339,6 +1354,7 @@ class DiffContent(Widget):
         self, file: DiffFile, selection: DiffSelection | None = None
     ) -> None:
         option_list = self.query_one(DiffOptionList)
+        ascii_mode = app_config(self.app).ascii_mode
         cursor_mark = (
             option_list._cursor_mark() if option_list._current_file is file else None
         )
@@ -1374,6 +1390,7 @@ class DiffContent(Widget):
             protected_lines=self._draft_line_keys(file),
             revealed=layout.expansion.reveals,
             expanded_fallback=_expanded_rows(layout) <= EXPANDED_FALLBACK_MAX_LINES,
+            syntax_theme=self._syntax_theme,
         )
 
         # A file the forge sent only in part says so above its hunks.
@@ -1430,7 +1447,11 @@ class DiffContent(Widget):
                         first_changed_idx = option_idx
                     option_idx += 1
                     expanded_discs = [d for d in line_discs if d.id in expanded]
-                    for block_line in _render_thread_block(expanded_discs):
+                    for block_line in _render_thread_block(
+                        expanded_discs,
+                        ascii_mode=ascii_mode,
+                        code_theme=self._syntax_theme,
+                    ):
                         all_options.append(Option(block_line, disabled=True))
                         option_idx += 1
                     for marker in self._markers_for_line(file, dl):
@@ -1585,8 +1606,11 @@ class DiffRenderer:
         protected_lines: set[tuple[int | None, int | None]] | None = None,
         revealed: Callable[[DiffLine], bool] | None = None,
         expanded_fallback: bool = True,
+        syntax_theme: str = DEFAULT_SYNTAX_THEME,
     ):
         self._language = language or "text"
+        # The Pygments style for code; only token colours and weights are used.
+        self._syntax_theme = syntax_theme
         self._comment_lines = comment_lines or {}
         self._highlight_map = highlight_map or HighlightMap()
         self._protected_lines = protected_lines or set()
@@ -1808,7 +1832,7 @@ class DiffRenderer:
             syntax = Syntax(
                 content,
                 self._language,
-                theme=SYNTAX_THEME,
+                theme=self._syntax_theme,
                 line_numbers=False,
                 word_wrap=False,
             )
@@ -1885,21 +1909,23 @@ def _reconstruct_new_content(file: DiffFile) -> str:
 _GUTTER_PREFIX = "            | "
 
 
-def _render_thread_block(discussions: list[Discussion]) -> list[Text]:
+def _render_thread_block(
+    discussions: list[Discussion],
+    *,
+    ascii_mode: bool = False,
+    code_theme: str = DEFAULT_SYNTAX_THEME,
+) -> list[Text]:
     """Render expanded discussion threads as Text lines for disabled Options."""
     if not discussions:
         return []
 
     def _render_body_as_markdown(body: str, indent: str = "") -> list[Text]:
-        from rich.console import Console
-        from rich.markdown import Markdown as RichMarkdown
-
         if not body:
             return []
-        console = Console(width=80)
-        md = RichMarkdown(body)
         lines: list[Text] = []
-        for segments in console.render_lines(md, console.options.update_width(60)):
+        for segments in markdown_lines(
+            body, 60, ascii_mode=ascii_mode, code_theme=code_theme
+        ):
             line = Text()
             line.append(_GUTTER_PREFIX, Style(dim=True))
             if indent:
@@ -2066,7 +2092,11 @@ def _highlight_stream(
         into[id(dl)] = _without_backgrounds(part)
 
 
-def _highlight_new_file(language: str, model: FileContextModel) -> dict[int, Text]:
+def _highlight_new_file(
+    language: str,
+    model: FileContextModel,
+    syntax_theme: str = DEFAULT_SYNTAX_THEME,
+) -> dict[int, Text]:
     """Lex the whole new file once and return the colours of its expanded lines.
 
     One stream over every line lets a string or comment that opens in a hunk
@@ -2084,26 +2114,28 @@ def _highlight_new_file(language: str, model: FileContextModel) -> dict[int, Tex
     ]
     colours: dict[int, Text] = {}
     try:
-        _highlight_stream(_syntax_for(language), stream, colours)
+        _highlight_stream(_syntax_for(language, syntax_theme), stream, colours)
     except Exception:  # noqa: BLE001 - Third-party lexer failures must leave the diff readable.
         return {}
     return {id(line): colours[id(line)] for line in expanded if id(line) in colours}
 
 
-def _syntax_for(language: str) -> Syntax:
+def _syntax_for(language: str, syntax_theme: str = DEFAULT_SYNTAX_THEME) -> Syntax:
     """Return a Syntax with its lexer resolved once, for many streams."""
     syntax = Syntax(
-        "", language, theme=SYNTAX_THEME, line_numbers=False, word_wrap=False
+        "", language, theme=syntax_theme, line_numbers=False, word_wrap=False
     )
     lexer = syntax.lexer
     if lexer is not None:
         syntax = Syntax(
-            "", lexer, theme=SYNTAX_THEME, line_numbers=False, word_wrap=False
+            "", lexer, theme=syntax_theme, line_numbers=False, word_wrap=False
         )
     return syntax
 
 
-def _build_highlight_map(file: DiffFile) -> HighlightMap:
+def _build_highlight_map(
+    file: DiffFile, syntax_theme: str = DEFAULT_SYNTAX_THEME
+) -> HighlightMap:
     """Highlight a file once, lexing each hunk's old and new side separately.
 
     The old stream is context plus deletions and the new stream is context
@@ -2117,7 +2149,7 @@ def _build_highlight_map(file: DiffFile) -> HighlightMap:
     old: dict[int, Text] = {}
     new: dict[int, Text] = {}
     try:
-        syntax = _syntax_for(language)
+        syntax = _syntax_for(language, syntax_theme)
         for hunk in file.hunks:
             _highlight_stream(
                 syntax,

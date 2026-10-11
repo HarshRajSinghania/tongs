@@ -17,6 +17,26 @@ tongs finds its configuration directory with
 
 The terminal app, the desktop app and the MCP server all read the same file.
 
+## How tongs checks the file
+
+tongs checks the whole file when it loads it.
+
+- **Mistakes stop tongs.** A TOML syntax error, a value of the wrong type, a
+  number out of range or a malformed `[hosts.<name>]` table gives one message
+  that names the file and the section and key, or the line and column of a
+  syntax error. The terminal app prints it and exits with status 2. The
+  desktop app shows it in a dialog and does not start. The MCP server returns
+  it as the error of each tool call until you fix the file.
+- **Unknown names are skipped.** A section or key tongs does not know, such as
+  a misspelled key, logs one warning and is ignored, so its default applies.
+- **Some values fall back.** An invalid `file_content_ttl` or
+  `submitted_retention`, or an unknown `theme`, `syntax_theme`, `diff_style`
+  or `color_scheme` name, logs a warning and the default applies, as described
+  in their sections.
+
+Quote text values: `scan_root = "~/git"`, not `scan_root = ~/git`. Write
+numbers without quotes (`mr_list_ttl = 60`) and booleans as `true` or `false`.
+
 ## Example
 
 ```toml title="~/.config/tongs/config.toml"
@@ -29,7 +49,12 @@ command = "code --wait"
 external_editor_enabled = true
 
 [ui]
+theme = "textual-dark"
+syntax_theme = "monokai"
+diff_style = "unified"
+show_draft_mrs = true
 ascii_mode = false
+color_scheme = "system"
 
 [cache]
 mr_list_ttl = 60
@@ -54,26 +79,31 @@ forge_type = "gitlab"
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `scan_root` | string | `"~/git"` | Directory to scan for git repositories. `~` is expanded. |
-| `scan_depth` | integer | `5` | How many directory levels to walk below `scan_root`. |
+| `scan_depth` | integer | `5` | How many directory levels to walk below `scan_root`. Zero or more. |
 
 `tongs --scan-root DIR` (or `-d DIR`) overrides `scan_root` for one run.
 
 ## `[editor]`
 
-:::note[Desktop only]
-The `[editor]` keys apply to the desktop app, which is a beta. The terminal
-app does not read them.
-:::
-
-In the terminal, ++f2++ opens `$VISUAL`, then `$EDITOR`, then the first of
-`nvim`, `vim`, `vi` or `nano` found on your `PATH`. The pipeline log viewer
-also accepts `less`. Setting `command` does not change what ++f2++ opens in
-the terminal.
+Both apps read the `[editor]` keys.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `command` | string | `""` | The editor command the desktop app starts for external editing. When empty, it uses `$VISUAL`, then `$EDITOR`. |
-| `external_editor_enabled` | boolean | `true` | Whether the desktop app offers external editing. When `false`, it reports external editor access as disabled. |
+| `command` | string | `""` | The editor command to start for external editing. When empty, tongs uses `$VISUAL`, then `$EDITOR`. |
+| `external_editor_enabled` | boolean | `true` | Whether tongs offers external editing. When `false`, the terminal shows a short notice instead of opening an editor, and the desktop app reports external editor access as disabled. |
+
+### In the terminal
+
+++f2++ in the comment editor and in the job log viewer, and ++f3++ for a
+suggestion, start `command`. When it is empty they use `$VISUAL`, then
+`$EDITOR`, then the first of `nvim`, `vim`, `vi` or `nano` found on your
+`PATH`. The job log viewer also accepts `less`. tongs splits the command like
+a shell would, without starting a shell, and appends the path of a private
+temporary file. The terminal app pauses while the editor runs, so a terminal
+editor such as `vim` works here. External editing is not available on
+Windows.
+
+### In the desktop app
 
 The desktop app appends the path of a private log export to the command and
 starts it without a shell. Use an editor that opens a window and waits, such as
@@ -92,20 +122,48 @@ desktop app never closes the editor.
 
 ## `[ui]`
 
+`color_scheme` applies to the desktop app. The other `[ui]` keys apply to
+the terminal app, and the desktop app does not read them.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `ascii_mode` | boolean | `false` | Show the inbox's CI status as ASCII labels, such as `OK` and `FAIL`, instead of Unicode symbols. Turn it on for terminals that do not render those symbols. |
+| `theme` | string | `"textual-dark"` | The colour theme of the terminal app, by Textual theme name, such as `textual-light`, `dracula`, `nord` or `monokai`. |
+| `syntax_theme` | string | `"monokai"` | The [Pygments style](https://pygments.org/styles/) that colours code in diffs and in the code shown with review threads, such as `friendly`, `github-dark` or `solarized-light`. |
+| `diff_style` | string | `"unified"` | The layout a diff opens in: `"unified"` or `"split"`. |
+| `show_draft_mrs` | boolean | `true` | Whether draft MRs appear in the inbox. When `false`, the Reviews, My MRs and All Open lists leave them out. |
+| `ascii_mode` | boolean | `false` | Draw every screen of the terminal app with ASCII characters only. Turn it on for terminals and fonts that show Unicode symbols as boxes. |
+| `color_scheme` | string | `"system"` | The desktop app's colour scheme: `"system"` follows the operating system, `"light"` and `"dark"` force one. |
 
-### Keys that are read but have no effect
-
-`theme`, `diff_style` and `show_draft_mrs` are still accepted, so a file that
-sets them keeps loading without an error. Nothing uses their values.
-
-| Key | Type | Default | What happens today |
-|-----|------|---------|--------------------|
-| `theme` | string | `"monokai"` | Nothing. Diff syntax highlighting always uses the `monokai` style. |
-| `diff_style` | string | `"unified"` | Nothing. Press ++v++ in the diff viewer to switch between unified and split. The choice is not saved. |
-| `show_draft_mrs` | boolean | `true` | Nothing. Draft MRs are always listed. The inbox marks them `D` and MR detail shows `DRAFT`. |
+- **`theme`.** To see the built-in themes, press ++ctrl+p++ and choose
+  **Theme**; the choice there lasts until you quit. An unknown name logs a
+  warning, shows a notice and uses `textual-dark`. Before tongs 1.1, `theme`
+  had no effect and its default was `"monokai"`. A file that still says
+  `theme = "monokai"` now gets Textual's Monokai theme; remove the line to
+  keep the previous look.
+- **`syntax_theme`.** Only the style's token colours and weights are used, so
+  the added and removed line backgrounds stay the same. An unknown name logs a
+  warning and uses `monokai`.
+- **`diff_style`.** Press ++v++ in the diff viewer to switch layouts for that
+  review. When the terminal is too narrow for split view, tongs uses unified
+  view until it is wide enough. Any other value logs a warning and uses
+  `"unified"`.
+- **`show_draft_mrs`.** With the default, draft MRs are listed and the inbox
+  marks them `D`.
+- **`ascii_mode`.** It applies to every screen, dialog and panel. CI statuses
+  read `OK`, `FAIL`, `RUN`, `PEND`, `CANC` and `SKIP`. Borders, rules, the
+  file tree and list bullets use characters such as `+`, `-`, `|` and `*`,
+  Markdown tables have no lines between cells, and the active tab is bold and
+  underlined instead of having a bar under it. Keys read `enter` and `up`
+  instead of arrows, and loading reads `Loading...`. A title too long for the
+  header is cut off without an ellipsis. Text from the forge, such as titles
+  and comments, is shown as written.
+- **`color_scheme`.** The desktop app's **System**, **Light** and **Dark**
+  toggle overrides this value, and the app remembers the choice in its own
+  settings, never in this file. Choosing **System** there clears the choice,
+  so this value applies again. See
+  [Colour scheme](/desktop/workspace/#colour-scheme). Any other name logs a
+  warning and uses `"system"`. It does not change the terminal app; use
+  `theme` for that.
 
 ## `[cache]`
 
@@ -114,10 +172,10 @@ screen does not wait on the network.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `mr_list_ttl` | integer | `60` | How long, in seconds, a cached list of MRs stays fresh. |
-| `diff_ttl` | integer | `300` | How long, in seconds, a cached diff stays fresh. |
+| `mr_list_ttl` | integer | `60` | How long, in seconds, a cached list of MRs stays fresh. Zero or more. |
+| `diff_ttl` | integer | `300` | How long, in seconds, a cached diff stays fresh. Zero or more. |
 | `file_content_ttl` | string | `"1d"` | How long a file read at a commit, to expand diff context, stays in the cache. |
-| `max_size_mb` | integer | `100` | The size limit of the cache database, in megabytes. |
+| `max_size_mb` | integer | `100` | The size limit of the cache database, in megabytes. It must be greater than zero. |
 
 Write `file_content_ttl` as a whole number followed by `h` for hours or `d`
 for days, for example `"12h"` or `"7d"`. The unit is lowercase, and the value
@@ -148,7 +206,7 @@ default of one day applies.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_parallel` | integer | `8` | The most requests tongs sends to each forge host at once, counting list, CI, GraphQL and job log requests. Each host has its own limit. The terminal inbox also runs at most this many per-row CI lookups per host at once, except while GitHub combines them into GraphQL queries, when one query's worth (about 50) may run together as one request. It must be greater than zero. |
-| `request_timeout` | integer | `30` | The HTTP request timeout, in seconds. |
+| `request_timeout` | integer | `30` | The HTTP request timeout, in seconds. It must be greater than zero. |
 
 ## `[drafts]`
 
@@ -177,8 +235,12 @@ repositories. The table name is your own label.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `hostname` | string | (required) | The instance's hostname, for example `gitlab.example.com`. |
-| `forge_type` | string | `""` | `"gitlab"` or `"github"`. A host with any other value is ignored. |
+| `hostname` | string | (required) | The instance's hostname, for example `gitlab.example.com`. Lowercase, with no scheme, port or path. |
+| `forge_type` | string | (required) | `"gitlab"` or `"github"`. |
+
+A missing key, any other `forge_type`, or a hostname such as
+`https://gitlab.example.com` or `gitlab.example.com:8443` stops tongs with a
+message naming the table and key.
 
 ```toml
 [hosts.work-gitlab]
@@ -224,6 +286,7 @@ monitor_interval = 30
 ```
 
 tongs passes the table to the plugin as a dictionary. One key is reserved:
-`enabled = false` stops tongs from loading that plugin at all. See
+`enabled = false` stops tongs from loading that plugin at all. `enabled` must
+be `true` or `false`; tongs does not check the plugin's other keys. See
 [Terminal plugins](/extend/terminal-plugins/) and
 [Desktop plugin providers](/extend/desktop-providers/).

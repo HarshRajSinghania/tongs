@@ -228,6 +228,29 @@ test("the header warns about updates only on a resync and a route change clears 
   assert.equal(title(), "Repo B");
 });
 
+test("the app bar's colour scheme toggle marks the document root", async () => {
+  await mountApp();
+  await waitFor(() =>
+    assert.equal(document.documentElement.dataset.colorScheme, "system"),
+  );
+  const choices = () =>
+    [...document.querySelectorAll(".app-bar [data-color-scheme-choice]")].map(
+      (item) => `${item.textContent}:${item.getAttribute("aria-pressed")}`,
+    );
+  assert.deepEqual(choices(), ["System:true", "Light:false", "Dark:false"]);
+  fireEvent.click(document.querySelector('[data-color-scheme-choice="light"]'));
+  await waitFor(() =>
+    assert.equal(document.documentElement.dataset.colorScheme, "light"),
+  );
+  assert.deepEqual(choices(), ["System:false", "Light:true", "Dark:false"]);
+  assert.deepEqual(fixture.colorSchemes, ["light"]);
+  fireEvent.click(document.querySelector('[data-color-scheme-choice="system"]'));
+  await waitFor(() =>
+    assert.equal(document.documentElement.dataset.colorScheme, "system"),
+  );
+  assert.deepEqual(fixture.colorSchemes, ["light", "system"]);
+});
+
 test("the view error fallback offers Try again, which mounts the view afresh", async () => {
   const { ErrorBoundary } = await mountApp();
   let failing = true;
@@ -336,6 +359,9 @@ function bridgeFixture() {
   const writes = [];
   const serviceListeners = new Set();
   const eventListeners = new Set();
+  const appearanceListeners = new Set();
+  let appearance = { configured: "system", saved: null, effective: "system", revision: 0 };
+  const colorSchemes = [];
   let eventSequence = 0;
   const read = (value) => ({
     requestToken: `request-${++sequence}`,
@@ -405,6 +431,23 @@ function bridgeFixture() {
       return () => serviceListeners.delete(listener);
     },
     openExternal: async () => true,
+    getAppearance: async () => appearance,
+    setColorScheme: async (scheme) => {
+      colorSchemes.push(scheme);
+      const saved = scheme === "system" ? null : scheme;
+      appearance = {
+        ...appearance,
+        saved,
+        effective: saved ?? appearance.configured,
+        revision: appearance.revision + 1,
+      };
+      for (const listener of appearanceListeners) listener(appearance);
+      return appearance;
+    },
+    onAppearance: (listener) => {
+      appearanceListeners.add(listener);
+      return () => appearanceListeners.delete(listener);
+    },
   };
   const publishServiceStatus = (status) => {
     for (const listener of serviceListeners) listener(status);
@@ -413,7 +456,15 @@ function bridgeFixture() {
     const event = { sequence: ++eventSequence, name, data };
     for (const listener of [...eventListeners]) listener(event);
   };
-  return { bridge, discoveries, reviewReads, writes, publishServiceStatus, emit };
+  return {
+    bridge,
+    discoveries,
+    reviewReads,
+    writes,
+    colorSchemes,
+    publishServiceStatus,
+    emit,
+  };
 }
 
 function repositoryA(displayName = "Repo A") {

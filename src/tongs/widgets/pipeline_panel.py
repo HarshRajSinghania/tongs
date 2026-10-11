@@ -2,13 +2,7 @@
 
 from __future__ import annotations
 
-import os
 import re
-import shlex
-import shutil
-import subprocess
-import tempfile
-from contextlib import suppress
 from typing import ClassVar
 
 from rich.style import Style
@@ -23,8 +17,21 @@ from textual.reactive import reactive
 from textual.widget import Widget
 from textual.widgets import Input, RichLog, Static
 
+from tongs.config import app_config
 from tongs.forges.models import CIStatus, Pipeline, PipelineJob
-from tongs.helpers import ci_icon_markup, ci_icon_text, format_duration, relative_time
+from tongs.helpers import (
+    CI_ASCII_WIDTH,
+    ci_icon_markup,
+    ci_icon_text,
+    format_duration,
+    relative_time,
+)
+from tongs.widgets.external_editor import (
+    FALLBACK_EDITORS,
+    EditorUnavailableError,
+    editor_argv,
+    view_text,
+)
 from tongs.widgets.two_press import TwoPressConfirm
 
 LOG_MAX_LINES = 50000
@@ -107,7 +114,7 @@ class PipelineCard(Static):
 
     def on_mount(self) -> None:
         p = self.pipeline
-        icon_char, icon_style = ci_icon_text(p.status)
+        icon_char, icon_style = ci_icon_text(p.status, app_config(self.app).ascii_mode)
         content = Text()
         content.append(f"{icon_char} ", icon_style)
         content.append(f"Pipeline #{p.id}", Style(bold=True))
@@ -150,7 +157,11 @@ class JobCard(Static):
 
     def on_mount(self) -> None:
         j = self.job
-        icon_char, icon_style = ci_icon_text(j.status)
+        ascii_mode = app_config(self.app).ascii_mode
+        icon_char, icon_style = ci_icon_text(j.status, ascii_mode)
+        if ascii_mode:
+            # Labels differ in length; pad them so the job names line up.
+            icon_char = icon_char.ljust(CI_ASCII_WIDTH)
         content = Text()
         content.append(f"  {icon_char} ", icon_style)
         content.append(f"{j.name:<30}", Style(bold=j.status == CIStatus.FAILED))
@@ -303,7 +314,9 @@ class PipelinePanel(Widget, can_focus=True):
         if self._current_pipeline:
             p = self._current_pipeline
             header = Static(
-                f"Pipeline #{p.id}  {ci_icon_markup(p.status)} {p.status.value}  "
+                f"Pipeline #{p.id}  "
+                f"{ci_icon_markup(p.status, app_config(self.app).ascii_mode)} "
+                f"{p.status.value}  "
                 f"{format_duration(p.duration_seconds)}"
             )
             scroll.mount(header)
@@ -347,7 +360,9 @@ class PipelinePanel(Widget, can_focus=True):
         job = self._current_job
         if job:
             header = self.query_one("#job-log-header", Static)
-            icon_char, icon_style = ci_icon_text(job.status)
+            icon_char, icon_style = ci_icon_text(
+                job.status, app_config(self.app).ascii_mode
+            )
             # Built as Text, not markup: the job name and stage come from the
             # forge and brackets in them would otherwise be parsed as tags.
             header_text = Text()
@@ -531,38 +546,25 @@ class PipelinePanel(Widget, can_focus=True):
     def action_open_in_editor(self) -> None:
         if self._view_level != 2 or not self._job_log_text:
             return
-        editor_cmd = None
-        for var in ("VISUAL", "EDITOR"):
-            v = os.environ.get(var)
-            if v:
-                editor_cmd = v
-                break
-        if not editor_cmd:
-            for cmd in ("nvim", "vim", "vi", "nano", "less"):
-                if shutil.which(cmd):
-                    editor_cmd = cmd
-                    break
-        if not editor_cmd:
-            self.app.notify("No editor found. Set $EDITOR.")
+        try:
+            # A log is only read, so a pager will do when no editor is found.
+            argv = editor_argv(
+                app_config(self.app), fallbacks=(*FALLBACK_EDITORS, "less")
+            )
+        except EditorUnavailableError as error:
+            self.app.notify(error.message, markup=False)
             return
-
-        tmp_path = None
         try:
             job_name = self._current_job.name if self._current_job else "job"
-            fd, tmp_path = tempfile.mkstemp(
-                suffix=".log", prefix=f"tongs-joblog-{_safe_file_label(job_name)}-"
+            view_text(
+                self.app,
+                argv,
+                Text.from_ansi(self._job_log_text).plain,
+                suffix=".log",
+                prefix=f"tongs-joblog-{_safe_file_label(job_name)}-",
             )
-            os.chmod(tmp_path, 0o600)
-            with os.fdopen(fd, "w") as f:
-                f.write(Text.from_ansi(self._job_log_text).plain)
-            with self.app.suspend():
-                subprocess.run([*shlex.split(editor_cmd), tmp_path], check=False)
         except Exception as exc:  # noqa: BLE001 - Report background/action failures without terminating the TUI.
             self.app.notify(f"Editor failed: {exc}", markup=False)
-        finally:
-            if tmp_path:
-                with suppress(OSError):
-                    os.unlink(tmp_path)
 
     def action_search_log(self) -> None:
         if self._view_level != 2:
