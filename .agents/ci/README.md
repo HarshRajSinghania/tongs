@@ -203,7 +203,9 @@ Node setup identical to the deploy's.
 `packaging/rpm/builder/Containerfile` and publishes it as the public package
 `ghcr.io/andre-motta/tongs-rpm-builder`. It runs weekly on a schedule (Sunday
 04:37 UTC), on `workflow_dispatch`, and on pushes to `main` that change
-`packaging/rpm/builder/**` or the workflow itself. It never runs on pull
+`packaging/rpm/builder/**` or the workflow itself. The push filter excludes
+the pin, `packaging/rpm/builder/image.json`, so merging a pin pull request
+does not rebuild the image and open another pin. It never runs on pull
 requests, and every job requires `refs/heads/main`, so a dispatch from another
 branch does nothing.
 

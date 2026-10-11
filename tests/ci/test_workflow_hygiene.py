@@ -35,6 +35,7 @@ hash-locked release lock.
 
 from __future__ import annotations
 
+import fnmatch
 import re
 import tomllib
 from pathlib import Path
@@ -569,8 +570,10 @@ def test_dependabot_proposes_grouped_monthly_updates() -> None:
 #: The workflow that builds, publishes and pins the RPM builder image.
 BUILDER_WORKFLOW = "rpm-builder-image.yml"
 BUILDER_IMAGE = "ghcr.io/andre-motta/tongs-rpm-builder"
+BUILDER_PIN = "packaging/rpm/builder/image.json"
 BUILDER_PATHS = [
     "packaging/rpm/builder/**",
+    f"!{BUILDER_PIN}",
     ".github/workflows/rpm-builder-image.yml",
 ]
 MAIN_GUARD = "github.ref == 'refs/heads/main'"
@@ -624,6 +627,32 @@ def test_the_builder_runs_weekly_on_dispatch_and_on_builder_pushes_to_main(
     assert hour.isdigit()
     assert triggers["workflow_dispatch"] is None
     assert triggers["push"] == {"branches": ["main"], "paths": BUILDER_PATHS}
+
+
+def _push_paths_match(patterns: list[str], path: str) -> bool:
+    """Evaluate GitHub push path filters in order: the last match decides."""
+    matched = False
+    for pattern in patterns:
+        negated = pattern.startswith("!")
+        glob = pattern[1:] if negated else pattern
+        if fnmatch.fnmatchcase(path, glob):
+            matched = not negated
+    return matched
+
+
+def test_merging_a_pin_pull_request_cannot_rebuild_the_image(
+    workflows: dict[str, dict[str, Any]],
+) -> None:
+    paths = _triggers(_builder(workflows))["push"]["paths"]
+    # The pin job's pull request only changes the pin file; a rebuild on its
+    # merge would publish a new digest and open another pin pull request.
+    assert not _push_paths_match(paths, BUILDER_PIN)
+    # The exclusion must follow the directory glob, or the glob re-includes it.
+    assert paths.index(f"!{BUILDER_PIN}") > paths.index("packaging/rpm/builder/**")
+    assert _push_paths_match(paths, "packaging/rpm/builder/Containerfile")
+    assert _push_paths_match(paths, "packaging/rpm/builder/packages.txt")
+    assert _push_paths_match(paths, ".github/workflows/rpm-builder-image.yml")
+    assert not _push_paths_match(paths, "packaging/rpm/desktop/tongs-desktop.spec")
 
 
 def test_the_builder_holds_no_token_by_default_and_every_job_needs_main(

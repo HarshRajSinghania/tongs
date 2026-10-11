@@ -12,8 +12,11 @@ on:
   push:
     branches:
       - main
+    # The pin file is excluded: merging a pin pull request must not rebuild
+    # the image, or every pin would publish a new digest and open another pin.
     paths:
       - packaging/rpm/builder/**
+      - "!packaging/rpm/builder/image.json"
       - .github/workflows/rpm-builder-image.yml
 
 permissions: {}
