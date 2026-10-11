@@ -48,3 +48,10 @@ test("the preload's tongs: literals are exactly the shared channel names", () =>
   assert.equal(new Set(shared).size, shared.length);
   assert.deepEqual([...literals].sort(), [...shared].sort());
 });
+
+test("the preload exposes the diff context and generation channels", () => {
+  assert.equal(preloadGroup("IPC_CHANNELS").getDiffContext, "tongs:diff.context");
+  assert.equal(preloadGroup("IPC_CHANNELS").generateDiff, "tongs:diff.generate");
+  assert.match(preload, /getDiffContext: \(params: DiffContextParams\): DesktopRead<DiffContextResult> => read\(IPC_CHANNELS\.getDiffContext, params\)/);
+  assert.match(preload, /generateDiff: \(params: GenerateDiffParams\): DesktopRead<GenerateDiffResult> => read\(IPC_CHANNELS\.generateDiff, params\)/);
+});

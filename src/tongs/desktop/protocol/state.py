@@ -261,6 +261,23 @@ class SnapshotStore:
         self._retained_rows += row_count
         return snapshot_id
 
+    def can_retain(self, rows: int, byte_count: int) -> bool:
+        """Whether a new snapshot of this size fits without evicting another.
+
+        ``create`` evicts the oldest snapshot when the snapshot count, the
+        retained bytes or the retained rows would pass their limit, so a
+        caller that must not crowd out a snapshot still being paged asks
+        first. Expired snapshots are pruned before the check.
+        """
+        self.prune()
+        return (
+            rows >= 0
+            and byte_count >= 0
+            and len(self._snapshots) < self._max_snapshots
+            and self._retained_bytes + byte_count <= self._max_retained_bytes
+            and self._retained_rows + rows <= self._max_retained_rows
+        )
+
     def page(
         self,
         snapshot_id: object,
@@ -390,6 +407,15 @@ class SnapshotStore:
                 return token
 
 
+def retained_size(
+    revision: Mapping[str, JsonValue], entries: Sequence[Mapping[str, JsonValue]]
+) -> int:
+    """Return the bytes ``SnapshotStore.create`` would retain for these values."""
+    return len(_encode_object(revision)) + sum(
+        len(_encode_object(entry)) for entry in entries
+    )
+
+
 def _encode_object(value: Mapping[str, JsonValue]) -> bytes:
     try:
         return json.dumps(
@@ -427,4 +453,5 @@ __all__ = [
     "HandleRegistry",
     "SnapshotPage",
     "SnapshotStore",
+    "retained_size",
 ]
