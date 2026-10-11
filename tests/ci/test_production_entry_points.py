@@ -197,6 +197,11 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         command_requires=frozenset({"tongs", "sigstore", "packaging"}),
         note="adapters load lazily per subcommand, so importing it stays stdlib only",
     ),
+    EntryPoint(
+        program="scripts/pin_rpm_builder.py",
+        jobs=("rpm-builder-image.yml:pin",),
+        note="the pin job installs nothing and runs the runner's python3",
+    ),
 )
 
 _MINIMAL_ENVIRONMENT_PROBE = """
