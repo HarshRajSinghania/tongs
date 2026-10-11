@@ -1274,9 +1274,13 @@ class MRDetailScreen(Screen):
         self._generate_file_diff(event.file, revision)
 
     def on_generate_cancel_requested(self, event: GenerateCancelRequested) -> None:
-        """Stop the running generation; the panel already shows it cancelled."""
+        """Stop the running download; the panel already shows it cancelled.
+
+        Only the worker is cancelled. The panel's state may already belong
+        to a newer generation the reader started after this cancel.
+        """
         event.stop()
-        self._cancel_generation()
+        self.app.workers.cancel_group(self, _GENERATE_GROUP)
 
     def _cancel_generation(self) -> None:
         """Stop a running generation and show it as cancelled."""
@@ -1310,17 +1314,18 @@ class MRDetailScreen(Screen):
             # The service words every outcome; the panel has a fallback.
             panel.generation_failed(file, result.message)
             return
-        files = self._cached_diff_files or []
-        index = next(
-            (position for position, shown in enumerate(files) if shown is file), None
-        )
+        # The panel's own list is the one on screen: the screen's copy may
+        # have been rebuilt from another diff read since.
+        index = panel.index_of(file)
         if index is None:
             panel.drop_generation(file)
             return
         if panel.replace_file(index, generated, result.new_text):
-            # The panel shows the same list; keep the screen's copy in step
-            # when they differ.
-            files[index] = generated
+            # Keep the screen's copy in step when it is a separate list that
+            # still holds the same file.
+            files = self._cached_diff_files
+            if files is not None and index < len(files) and files[index] is file:
+                files[index] = generated
 
     @work(exclusive=True, group="mr-pipelines")
     async def _load_pipelines(self) -> None:

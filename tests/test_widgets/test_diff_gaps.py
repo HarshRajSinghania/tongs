@@ -411,3 +411,75 @@ async def test_e_away_from_a_gap_row_in_split_view_explains_where_to_go() -> Non
 
         assert MOVE_TO_GAP_MESSAGE in _messages(app)
         assert app.requests == []
+
+
+@pytest.mark.asyncio
+async def test_an_expanded_line_never_shows_a_thread_marker() -> None:
+    app = _GapApp()
+    async with app.run_test(size=(100, 60), notifications=True) as pilot:
+        file = _file()
+        # An outdated thread on line 2, which is unchanged now, and one on a
+        # context line inside the first hunk.
+        outdated = InlineComment("c1", User("bob"), "Old note", NOW, "f.txt", 2, 2)
+        current = InlineComment("c2", User("bob"), "New note", NOW, "f.txt", 8, 8)
+        discussions = [
+            Discussion("d1", True, outdated),
+            Discussion("d2", True, current),
+        ]
+        panel = await _open(app, pilot, file, discussions=discussions)
+
+        await _press_e_on_gap(app, pilot, 0)
+        panel.apply_file_context(file, NEW_LINES, NEW_EOL, 0)
+        await pilot.pause()
+
+        rows = _rows(app)
+        assert "   2    2    line 2" in rows
+        assert not any(row.startswith("   2    2 *") for row in rows)
+        # A hunk line keeps its marker.
+        assert "   8    8 *  line 8" in rows
+
+
+@pytest.mark.asyncio
+async def test_a_slow_read_keeps_the_cursor_and_range_the_reader_moved_to() -> None:
+    app = _GapApp()
+    async with app.run_test(size=(100, 60), notifications=True) as pilot:
+        file = _file()
+        panel = await _open(app, pilot, file)
+        option_list = _option_list(app)
+
+        await _press_e_on_gap(app, pilot, 0)
+        # While the file is read, the reader selects two lines of a hunk.
+        first = min(option_list._line_map)
+        option_list.highlighted = first
+        await pilot.press("J")
+        await pilot.pause()
+        before = panel.selection
+        assert before is not None and len(before.lines) == 2
+
+        panel.apply_file_context(file, NEW_LINES, NEW_EOL, 0)
+        await pilot.pause()
+
+        assert "   1    1    line 1" in _rows(app)
+        after = panel.selection
+        assert after is not None
+        assert after.line is before.line
+        assert after.lines == before.lines
+
+
+@pytest.mark.asyncio
+async def test_a_read_lands_on_the_new_lines_when_the_cursor_waited_on_the_gap() -> (
+    None
+):
+    app = _GapApp()
+    async with app.run_test(size=(100, 60), notifications=True) as pilot:
+        file = _file()
+        panel = await _open(app, pilot, file)
+        option_list = _option_list(app)
+        await _press_e_on_gap(app, pilot, 0)
+        assert option_list.cursor_gap() is not None
+
+        panel.apply_file_context(file, NEW_LINES, NEW_EOL, 0)
+        await pilot.pause()
+
+        cursor = option_list._readonly_rows[option_list.highlighted]
+        assert cursor.new_lineno == 1

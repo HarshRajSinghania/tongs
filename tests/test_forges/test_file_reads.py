@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import random
 from collections.abc import AsyncIterator, Callable
 
 import httpx
@@ -235,6 +236,49 @@ class TestRequestBytes:
                 await request_bytes(client, "/file", max_bytes=1000)
             # The same body within the limit decodes in full.
             assert await request_bytes(client, "/file", max_bytes=5000) == (b"a" * 5000)
+
+    @pytest.mark.asyncio
+    async def test_read_asks_for_an_identity_body(self) -> None:
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(200, content=b"body")
+
+        async with make_http(handler) as client:
+            await request_bytes(
+                client, "/file", max_bytes=100, headers={"Accept": "text/plain"}
+            )
+            forge = GitHubClient(GITHUB_HOST, client)
+            await forge.get_file_at_ref("acme/widgets", "a.py", SHA, max_bytes=100)
+        assert [r.headers.get_list("Accept-Encoding") for r in seen] == [
+            ["identity"],
+            ["identity"],
+        ]
+        assert seen[0].headers["Accept"] == "text/plain"
+        assert seen[1].headers["Accept"] == "application/vnd.github.raw"
+
+    @pytest.mark.asyncio
+    async def test_encoded_length_over_the_limit_is_not_refused_early(
+        self,
+    ) -> None:
+        raw = random.Random(0).randbytes(90)
+        compressed = gzip.compress(raw)
+        # Incompressible bytes grow under gzip, past the decoded-byte limit.
+        assert len(compressed) > 100
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={
+                    "Content-Encoding": "gzip",
+                    "Content-Length": str(len(compressed)),
+                },
+                content=compressed,
+            )
+
+        async with make_http(handler) as client:
+            assert await request_bytes(client, "/file", max_bytes=100) == raw
 
     @pytest.mark.asyncio
     async def test_redirect_is_not_followed(self) -> None:

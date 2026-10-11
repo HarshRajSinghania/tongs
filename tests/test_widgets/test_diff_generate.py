@@ -13,6 +13,8 @@ import pytest
 from textual.app import App, ComposeResult
 
 from tests.test_diff.test_context import FIXTURES
+from tests.test_widgets.test_diff_context_split import WIDE_CONTEXT
+from tongs.diff.context import GapPosition
 from tongs.diff.generate import generate_file_diff
 from tongs.diff.models import DiffFile, DiffLine, FileStatus, LineType
 from tongs.diff.parser import parse_diff
@@ -200,6 +202,53 @@ async def test_partial_file_shows_the_notice_above_its_hunks_in_both_layouts() -
         await pilot.pause()
         assert len(app.generate) == 1
         assert app.context == []
+
+
+@pytest.mark.parametrize("mode", [DiffViewMode.UNIFIED, DiffViewMode.SPLIT])
+@pytest.mark.asyncio
+async def test_e_on_a_fold_of_a_partial_file_opens_it_and_elsewhere_generates(
+    mode: DiffViewMode,
+) -> None:
+    (wide,) = parse_diff(
+        f"--- a/{PATH}\n+++ b/{PATH}\n{WIDE_CONTEXT}", detect_language=False
+    )
+    file = replace(wide, is_truncated=True)
+    app = _GenApp()
+    async with app.run_test(size=(200, 40), notifications=True) as pilot:
+        panel = await _open(app, pilot, file)
+        if mode is DiffViewMode.SPLIT:
+            await _split(app, pilot, panel)
+        column = (
+            app.query_one("#split-new", SplitDiffColumn)
+            if mode is DiffViewMode.SPLIT
+            else _option_list(app)
+        )
+        folds = sorted(
+            index
+            for index, gap in column._gap_rows.items()
+            if gap.position is GapPosition.INSIDE
+        )
+        assert len(folds) == 3
+
+        column.highlighted = folds[1]
+        await pilot.pause()
+        await pilot.press("e")
+        await pilot.pause()
+
+        assert app.generate == []
+        assert app.context == []
+        assert column._line_map[column.highlighted].new_lineno == 14
+        remaining = [
+            gap
+            for gap in column._gap_rows.values()
+            if gap.position is GapPosition.INSIDE
+        ]
+        assert len(remaining) == 2
+
+        # Away from a fold, e still generates the whole diff.
+        await pilot.press("e")
+        await pilot.pause()
+        assert [event.file is file for event in app.generate] == [True]
 
 
 @pytest.mark.asyncio

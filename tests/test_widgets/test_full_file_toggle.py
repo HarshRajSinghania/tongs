@@ -27,6 +27,7 @@ from tongs.widgets.diff_panel import (
     CONTEXT_LOADING_MESSAGE,
     FULL_FILE_LABEL,
     ContextRequested,
+    DiffContent,
     DiffOptionList,
     DiffPanel,
 )
@@ -379,6 +380,72 @@ async def test_f_keeps_the_selected_line_and_lands_on_a_gap_it_opens() -> None:
         await pilot.pause()
         assert option_list.cursor_gap() is not None
         assert option_list.cursor_gap().new_start == 14
+
+
+@pytest.mark.parametrize("mode", [DiffViewMode.UNIFIED, DiffViewMode.SPLIT])
+@pytest.mark.asyncio
+async def test_f_off_on_a_line_that_folds_again_lands_on_its_fold(
+    mode: DiffViewMode,
+) -> None:
+    app = _FullApp()
+    async with app.run_test(size=(200, 60), notifications=True) as pilot:
+        file = _file(WIDE_CONTEXT)
+        panel = await _open(app, pilot, file)
+        panel.request_mode(mode)
+        await pilot.pause()
+        column = (
+            app.query_one("#split-new", SplitDiffColumn)
+            if mode is DiffViewMode.SPLIT
+            else _option_list(app)
+        )
+        column.focus()
+        await pilot.pause()
+        lines = tuple(
+            f"changed {n}" if n in (10, 25) else f"line {n}" for n in range(1, 41)
+        )
+        await pilot.press("F")
+        await pilot.pause()
+        panel.apply_file_context(file, lines, True, None)
+        await pilot.pause()
+        assert FULL_FILE_LABEL in _header(app)
+        content = app.query_one(DiffContent)
+        assert content._land_on(18)
+        await pilot.pause()
+        selection = panel.selection
+        assert selection is not None and selection.line.new_lineno == 18
+
+        await pilot.press("F")
+        await pilot.pause()
+
+        assert FULL_FILE_LABEL not in _header(app)
+        gap = content.cursor_gap()
+        assert gap is not None
+        assert gap.position is GapPosition.INSIDE
+        assert gap.covers(18)
+
+
+@pytest.mark.asyncio
+async def test_f_on_a_hunk_that_covers_the_file_still_checks_the_row_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(diff_panel_module, "FULL_FILE_MAX_ROWS", 21)
+    app = _FullApp()
+    async with app.run_test(size=(200, 60), notifications=True) as pilot:
+        await _open(app, pilot, _file(WHOLE_FILE_HUNK))
+
+        await pilot.press("F")
+        await pilot.pause()
+
+        # 18 unchanged lines, 2 deleted and 2 added.
+        assert (
+            "File too large to show in full (22 lines). Press e on a gap to expand it."
+            in _messages(app)
+        )
+        assert app.requests == []
+        assert FULL_FILE_LABEL not in _header(app)
+        assert [gap.position for gap in _option_list(app)._gap_rows.values()] == [
+            GapPosition.INSIDE
+        ]
 
 
 @pytest.mark.asyncio
