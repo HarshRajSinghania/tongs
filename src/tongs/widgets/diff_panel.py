@@ -33,16 +33,20 @@ from tongs.diff.context import (
     file_gaps,
     inside_gap,
     is_expandable,
+    verify_new_side,
 )
 from tongs.diff.context import segments as file_segments
+from tongs.diff.generate import FileLines
 from tongs.diff.models import DiffFile, DiffHunk, DiffLine, FileStatus, LineType
 from tongs.forges.models import Discussion
 from tongs.helpers import relative_time
 from tongs.state.drafts import DiffSide
 from tongs.widgets.review_draft import DraftMarker
 from tongs.widgets.split_diff import (
+    GENERATED_COMMENT_MESSAGE,
     RANGE_CROSSES_GAP_MESSAGE,
     READ_ONLY_LINE_MESSAGE,
+    TRUNCATED_NOTICE,
     DiffModeChanged,
     DiffModeState,
     DiffSelection,
@@ -97,6 +101,23 @@ expansion shows plain text for the moment the worker thread needs instead.
 
 FULL_FILE_LABEL = "Full file"
 """Shown in the file header while the whole-file view is on."""
+
+GENERATED_LABEL = "Generated locally"
+"""Shown in the file header of a diff tongs computed from the two versions."""
+
+GENERATING_NOTICE = (
+    "Generating diff locally (downloading {count}). Press e again to cancel."
+)
+"""Replaces the truncation notice while a generation runs."""
+
+GENERATION_CANCELLED_MESSAGE = "Cancelled. Press e to try again."
+"""Shown under the truncation notice after a generation is cancelled."""
+
+GENERATION_FAILED_MESSAGE = "Could not generate the diff."
+"""Shown under the truncation notice when a generation fails with no reason."""
+
+_NOTICE_STYLE = Style(dim=True, italic=True)
+"""Style of the truncation notice rows."""
 
 _GAP_INDENT = "         "
 """Gap rows line up with the in-hunk fold markers."""
@@ -208,6 +229,32 @@ class ContextRequested(Message):
         self.gap_index = gap_index
 
 
+class GenerateRequested(Message):
+    """Posted when the reader asks to generate a truncated file's diff locally.
+
+    The screen downloads both versions and answers with
+    :meth:`DiffPanel.replace_file` or :meth:`DiffPanel.generation_failed`.
+    """
+
+    def __init__(self, file: DiffFile) -> None:
+        super().__init__()
+        self.file = file
+
+
+class GenerateCancelRequested(Message):
+    """Posted when the reader cancels a running generation with a second ``e``."""
+
+    def __init__(self, file: DiffFile) -> None:
+        super().__init__()
+        self.file = file
+
+
+def generating_notice(file: DiffFile) -> str:
+    """Return the notice shown while a file's diff is being generated."""
+    one_side = file.status in (FileStatus.ADDED, FileStatus.DELETED)
+    return GENERATING_NOTICE.format(count="1 file" if one_side else "2 files")
+
+
 def gap_label(gap: DiffGap, *, loading: bool = False) -> str:
     """Return the ASCII text of a collapsed gap row."""
     return f"{_GAP_INDENT}{gap_message(gap, loading=loading)}"
@@ -232,7 +279,7 @@ def full_file_refusal(file: DiffFile) -> str | None:
     if file.is_binary:
         return "Binary file, there are no lines to show."
     if file.is_truncated:
-        return "The forge did not send this diff. Press o to view it in the browser."
+        return "The forge did not send this whole diff. Press e to generate it locally."
     if not file.hunks or file.is_metadata_only:
         return "This file has no changed lines to show around."
     if file.old_mode in _LINK_MODES or file.new_mode in _LINK_MODES:
@@ -340,6 +387,13 @@ class DiffOptionList(TintedOptionList):
             return True
         if commenting and self._range_crosses_read_only_row():
             self.app.notify(RANGE_CROSSES_GAP_MESSAGE)
+            return True
+        return False
+
+    def _refuse_generated(self) -> bool:
+        """Notify and return True when the file's diff was generated locally."""
+        if self._current_file is not None and self._current_file.generated_locally:
+            self.app.notify(GENERATED_COMMENT_MESSAGE)
             return True
         return False
 
@@ -544,7 +598,7 @@ class DiffOptionList(TintedOptionList):
 
     def action_reply_discussion(self) -> None:
         """Open reply editor for the discussion on the current line."""
-        if self._refuse_read_only():
+        if self._refuse_generated() or self._refuse_read_only():
             return
         disc = self._get_target_discussion()
         if disc is None:
@@ -584,7 +638,9 @@ class DiffOptionList(TintedOptionList):
 
     def action_comment(self) -> None:
         """Post a CommentRequested message for the highlighted line."""
-        if self.highlighted is None or self._refuse_read_only(commenting=True):
+        if self.highlighted is None or self._refuse_generated():
+            return
+        if self._refuse_read_only(commenting=True):
             return
         dl = self._line_map.get(self.highlighted)
         if dl is None:
@@ -609,7 +665,9 @@ class DiffOptionList(TintedOptionList):
 
     def action_suggest(self) -> None:
         """Post a CommentRequested message with SUGGEST mode."""
-        if self.highlighted is None or self._refuse_read_only(commenting=True):
+        if self.highlighted is None or self._refuse_generated():
+            return
+        if self._refuse_read_only(commenting=True):
             return
         dl = self._line_map.get(self.highlighted)
         if dl is None:
@@ -759,6 +817,10 @@ class DiffContent(Widget):
         # Per-file highlight maps with the whole-file colours of expanded
         # lines merged over the per-hunk ones, once the lexer has run.
         self._context_highlights: dict[int, tuple[DiffFile, HighlightMap]] = {}
+        # Local generation state of truncated files by id(file), holding the
+        # file so a reused id misses: None while it runs, otherwise the line
+        # shown under the truncation notice (a cancel or a failure).
+        self._generation: dict[int, tuple[DiffFile, str | None]] = {}
 
     def compose(self) -> ComposeResult:
         yield DiffOptionList(id="diff-option-list")
@@ -880,11 +942,56 @@ class DiffContent(Widget):
     # -- expand in place ----------------------------------------------------
 
     def clear_file_context(self) -> None:
-        """Forget read files, open gaps and pending reads for every file."""
+        """Forget read files, open gaps, pending reads and generations."""
         self._context_models.clear()
         self._expansions.clear()
         self._context_pending.clear()
         self._context_highlights.clear()
+        self._generation.clear()
+
+    # -- local generation ---------------------------------------------------
+
+    def generation_running(self, file: DiffFile) -> bool:
+        """Whether this file's diff is being generated locally."""
+        entry = self._generation.get(id(file))
+        return entry is not None and entry[0] is file and entry[1] is None
+
+    def set_generation(self, file: DiffFile, status: str | None) -> None:
+        """Mark a generation as running (None) or record the line it left."""
+        self._generation[id(file)] = (file, status)
+        self._rerender_if_current(file)
+
+    def clear_generation(self, file: DiffFile, *, rerender: bool = True) -> None:
+        """Forget a file's generation state so its notice reads as at first."""
+        entry = self._generation.get(id(file))
+        if entry is not None and entry[0] is file:
+            del self._generation[id(file)]
+            if rerender:
+                self._rerender_if_current(file)
+
+    def truncation_notice(self, file: DiffFile) -> tuple[str, ...]:
+        """Return the notice rows of a truncated file, or ``()`` for any other."""
+        if not file.is_truncated or file.is_binary:
+            return ()
+        entry = self._generation.get(id(file))
+        if entry is None or entry[0] is not file:
+            return (TRUNCATED_NOTICE,)
+        note = entry[1]
+        if note is None:
+            return (generating_notice(file),)
+        return (TRUNCATED_NOTICE, note)
+
+    def seed_file_context(
+        self, file: DiffFile, lines: tuple[str, ...], ends_with_newline: bool
+    ) -> None:
+        """Store a file's new version, already in hand, without opening a gap.
+
+        A generated diff comes with its new version, so its gaps show their
+        lengths at once and open with no further read.
+        """
+        model = FileContextModel(file, lines, ends_with_newline)
+        self._context_models[id(file)] = (file, model)
+        self._highlight_context(file, model)
 
     def context_model(self, file: DiffFile) -> FileContextModel | None:
         """Return the file's read lines, when they have been loaded."""
@@ -1076,7 +1183,12 @@ class DiffContent(Widget):
                 for gap in gaps
                 if pending_gap is None or gap.index == pending_gap
             )
-        return FileLayout(file_segments(file, model, expansion), loading, expansion)
+        return FileLayout(
+            file_segments(file, model, expansion),
+            loading,
+            expansion,
+            self.truncation_notice(file),
+        )
 
     def _highlight_map(self, file: DiffFile) -> HighlightMap:
         """Return the file's highlight map, running Pygments only once per file."""
@@ -1139,11 +1251,12 @@ class DiffContent(Widget):
             # One shared line with the split view, so a binary, empty, mode
             # only, rename only or forge-withheld file reads the same in both
             # layouts instead of claiming the diff was too large for the API.
-            option_list.add_option(
-                Option(
-                    Text(placeholder_message(file), style=Style(dim=True)),
-                    disabled=True,
-                )
+            messages = self.truncation_notice(file) or (placeholder_message(file),)
+            option_list.add_options(
+                [
+                    Option(Text(message, style=Style(dim=True)), disabled=True)
+                    for message in messages
+                ]
             )
             return
 
@@ -1161,8 +1274,12 @@ class DiffContent(Widget):
             expanded_fallback=_expanded_rows(layout) <= EXPANDED_FALLBACK_MAX_LINES,
         )
 
-        all_options: list[Option] = []
-        option_idx = 0
+        # A file the forge sent only in part says so above its hunks.
+        all_options: list[Option] = [
+            Option(Text(f"  {message}", style=_NOTICE_STYLE), disabled=True)
+            for message in layout.notice
+        ]
+        option_idx = len(all_options)
         first_changed_idx: int | None = None
 
         for segment in layout.segments:
@@ -2028,6 +2145,8 @@ class DiffPanel(Widget):
         self._discussions_by_file: dict[str, list[Discussion]] = {}
         self._draft_markers: tuple[DraftMarker, ...] = ()
         self._changes_overflow = False
+        # The truncated file whose diff is being generated; one at a time.
+        self._generating: DiffFile | None = None
 
     def compose(self) -> ComposeResult:
         yield Static(CHANGES_OVERFLOW_BANNER, id="diff-overflow-banner", markup=False)
@@ -2062,6 +2181,7 @@ class DiffPanel(Widget):
             self.show_placeholder("No changes")
             return
         self._files = files
+        self._generating = None
         content = self.query_one("#diff-content", DiffContent)
         content.clear_highlight_cache()
         content.clear_file_context()
@@ -2111,6 +2231,7 @@ class DiffPanel(Widget):
         """Replace all source-backed panel state with an authoritative message."""
         self._files = []
         self._current_index = 0
+        self._generating = None
         self._discussions_by_file = {}
         self._sync_overflow_banner()
         self.query_one("#diff-file-tree", DiffFileTree).set_files([])
@@ -2132,7 +2253,7 @@ class DiffPanel(Widget):
             self._update_header(file)
 
     def _update_header(self, file: DiffFile) -> None:
-        """Show the file's path, counts, mode change and whole-file state."""
+        """Show the file's path, counts, mode change and view state."""
         header = self.query_one("#diff-file-header", Static)
         mode_change = file.mode_change
         full = self.query_one("#diff-content", DiffContent).file_expansion(file).full
@@ -2140,12 +2261,14 @@ class DiffPanel(Widget):
             Content.from_markup(
                 "[bold]$path[/]  [green]+$additions[/] [red]-$deletions[/]  "
                 + ("[yellow]$mode[/]  " if mode_change else "")
+                + ("[reverse] $generated [/]  " if file.generated_locally else "")
                 + ("[reverse] $full [/]  " if full else "")
                 + "[dim]$language[/]",
                 path=file.new_path,
                 additions=file.additions,
                 deletions=file.deletions,
                 mode=mode_change,
+                generated=GENERATED_LABEL,
                 full=FULL_FILE_LABEL,
                 language=file.language or "",
             )
@@ -2168,6 +2291,9 @@ class DiffPanel(Widget):
         """Fallback comment action when DiffOptionList does not have focus."""
         if self._files and 0 <= self._current_index < len(self._files):
             file = self._files[self._current_index]
+            if file.generated_locally:
+                self.app.notify(GENERATED_COMMENT_MESSAGE)
+                return
             line = self._find_first_changed_line(file)
             if line:
                 side = (
@@ -2234,9 +2360,14 @@ class DiffPanel(Widget):
         """Open the gap under the cursor, reading the file the first time.
 
         A fold inside a hunk opens at once: the forge already sent its lines.
+        On a file the forge truncated, ``e`` on any row generates its diff
+        locally instead, and pressing it again cancels that.
         """
         file = self._shown_file()
         if file is None:
+            return
+        if file.is_truncated and not file.is_binary:
+            self._toggle_generation(file)
             return
         content = self.query_one("#diff-content", DiffContent)
         gap = content.cursor_gap()
@@ -2330,6 +2461,89 @@ class DiffPanel(Widget):
         """Forget a read whose reply is stale, so its gap row reads as before."""
         if self._owns(file):
             self.query_one("#diff-content", DiffContent).file_context_failed(file)
+
+    # -- local generation ---------------------------------------------------
+
+    def _toggle_generation(self, file: DiffFile) -> None:
+        """Start generating a truncated file's diff, or cancel the running one."""
+        content = self.query_one("#diff-content", DiffContent)
+        if content.generation_running(file):
+            self.cancel_generation()
+            self.post_message(GenerateCancelRequested(file))
+            return
+        # One generation at a time: starting another one cancels it.
+        self.cancel_generation()
+        self._generating = file
+        content.set_generation(file, None)
+        self.post_message(GenerateRequested(file))
+
+    def cancel_generation(self) -> None:
+        """Show the running generation, if any, as cancelled.
+
+        The screen stops its download; this only restores the file's notice
+        with a line saying it was cancelled.
+        """
+        file = self._generating
+        self._generating = None
+        if file is not None and self.is_generating(file):
+            content = self.query_one("#diff-content", DiffContent)
+            content.set_generation(file, GENERATION_CANCELLED_MESSAGE)
+
+    def is_generating(self, file: DiffFile) -> bool:
+        """Whether a generation of this file is running and still wanted."""
+        return self._owns(file) and self.query_one(
+            "#diff-content", DiffContent
+        ).generation_running(file)
+
+    def replace_file(
+        self, file_index: int, generated: DiffFile, new_text: FileLines | None
+    ) -> bool:
+        """Show a generated diff in place of the truncated file at ``file_index``.
+
+        The tree entry stays. When ``new_text`` holds the new version, the
+        file's gaps and whole-file view use it with no further read. A reply
+        for a generation that was cancelled, or for files that are no longer
+        loaded, is dropped and False is returned.
+        """
+        if not 0 <= file_index < len(self._files):
+            return False
+        original = self._files[file_index]
+        content = self.query_one("#diff-content", DiffContent)
+        if not content.generation_running(original):
+            return False
+        if self._generating is original:
+            self._generating = None
+        content.clear_generation(original, rerender=False)
+        self._files[file_index] = generated
+        if (
+            new_text is not None
+            and is_expandable(generated)
+            and verify_new_side(generated, new_text.lines, new_text.ends_with_newline)
+        ):
+            content.seed_file_context(
+                generated, tuple(new_text.lines), new_text.ends_with_newline
+            )
+        if self._current_index == file_index:
+            self._show_file(file_index)
+        return True
+
+    def generation_failed(self, file: DiffFile, message: str) -> None:
+        """Restore a truncated file's notice with the reason generation failed."""
+        if not self.is_generating(file):
+            return
+        if self._generating is file:
+            self._generating = None
+        reason = message or GENERATION_FAILED_MESSAGE
+        self.query_one("#diff-content", DiffContent).set_generation(file, reason)
+        self.app.notify(reason, severity="warning", markup=False)
+
+    def drop_generation(self, file: DiffFile) -> None:
+        """Forget a generation whose reply is stale, restoring the plain notice."""
+        if not self.is_generating(file):
+            return
+        if self._generating is file:
+            self._generating = None
+        self.query_one("#diff-content", DiffContent).clear_generation(file)
 
     def action_preview_markdown(self) -> None:
         if self._files and 0 <= self._current_index < len(self._files):

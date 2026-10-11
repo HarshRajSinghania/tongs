@@ -51,6 +51,19 @@ READ_ONLY_LINE_MESSAGE = (
 RANGE_CROSSES_GAP_MESSAGE = "A comment range must stay inside one hunk."
 """Shown when a J/K range includes a gap row or an expanded line."""
 
+GENERATED_COMMENT_MESSAGE = "Comments are not available on a diff generated locally."
+"""Shown when a comment, suggest or reply key is pressed on a generated diff.
+
+The forge has no diff for the file to anchor a comment to, so it would refuse
+one; tongs says so before an editor opens.
+"""
+
+TRUNCATED_NOTICE = (
+    "This file's diff is too large for the forge to send. Press e to generate "
+    "it locally (downloads both versions of the file)."
+)
+"""Shown for a file whose diff the forge withheld in full or in part."""
+
 
 def gap_message(gap: DiffGap, *, loading: bool = False) -> str:
     """Return the ASCII text of a collapsed gap or fold, without indentation."""
@@ -83,12 +96,15 @@ class FileLayout:
 
     ``segments`` interleave hunks with collapsed and expanded gaps,
     ``loading`` names the gaps whose file read is in flight, and
-    ``expansion`` says which in-hunk folds stay open.
+    ``expansion`` says which in-hunk folds stay open. ``notice`` holds the
+    rows that stand above the hunks of a file the forge truncated, or in
+    place of them when it sent none.
     """
 
     segments: tuple[Segment, ...]
     loading: frozenset[int] = frozenset()
     expansion: FileExpansion = field(default_factory=FileExpansion)
+    notice: tuple[str, ...] = ()
 
 
 def _counts_against_range(gap: DiffGap) -> bool:
@@ -352,6 +368,13 @@ class SplitDiffColumn(TintedOptionList):
             return True
         return False
 
+    def _refuse_generated(self) -> bool:
+        """Notify and return True when the file's diff was generated locally."""
+        if self._current_file is not None and self._current_file.generated_locally:
+            self.app.notify(GENERATED_COMMENT_MESSAGE)
+            return True
+        return False
+
     def reset(self, file: DiffFile, expanded_threads: set[str]) -> None:
         self.clear_options()
         self._line_map.clear()
@@ -441,7 +464,7 @@ class SplitDiffColumn(TintedOptionList):
         self._split_view().focus_side(DiffSide.NEW)
 
     def action_comment(self) -> None:
-        if self._refuse_read_only(commenting=True):
+        if self._refuse_generated() or self._refuse_read_only(commenting=True):
             return
         selection = self.selection
         if selection is None:
@@ -452,7 +475,7 @@ class SplitDiffColumn(TintedOptionList):
         self.post_message(DiffSelectionChanged(self.selection))
 
     def action_suggest(self) -> None:
-        if self._refuse_read_only(commenting=True):
+        if self._refuse_generated() or self._refuse_read_only(commenting=True):
             return
         if self.side is DiffSide.OLD:
             self.app.notify("Suggestions are available on the new side only")
@@ -479,7 +502,7 @@ class SplitDiffColumn(TintedOptionList):
         self.post_message(_SplitThreadToggled(ids))
 
     def action_reply_discussion(self) -> None:
-        if self._refuse_read_only():
+        if self._refuse_generated() or self._refuse_read_only():
             return
         discussion = self._target_discussion()
         selection = self.selection
@@ -881,20 +904,35 @@ class SplitDiffView(Widget):
             DiffSide.NEW: None,
         }
 
+        layout = self._layout
         if file.is_binary or not file.hunks:
-            message = placeholder_message(file)
-            placeholder = Option(_single_line(message, Style(dim=True)), disabled=True)
-            old_options.append(placeholder)
-            new_options.append(
-                Option(_single_line(message, Style(dim=True)), disabled=True)
+            messages = (
+                layout.notice
+                if layout is not None and layout.notice
+                else (placeholder_message(file),)
             )
+            for message in messages:
+                old_options.append(
+                    Option(_single_line(message, Style(dim=True)), disabled=True)
+                )
+                new_options.append(
+                    Option(_single_line(message, Style(dim=True)), disabled=True)
+                )
         else:
-            layout = self._layout
             if layout is None:
                 layout = FileLayout(
                     tuple(HunkBlock(i, hunk) for i, hunk in enumerate(file.hunks))
                 )
             expansion = layout.expansion
+            # A file the forge sent only in part says so above its hunks.
+            for message in layout.notice:
+                old_options.append(
+                    Option(_single_line(f" {message}", _NOTICE_STYLE), disabled=True)
+                )
+                new_options.append(
+                    Option(_single_line(f" {message}", _NOTICE_STYLE), disabled=True)
+                )
+                option_index += 1
             for segment in layout.segments:
                 if isinstance(segment, GapRow):
                     gap = segment.gap
@@ -1153,6 +1191,10 @@ def _discussion_index(
     return index
 
 
+_NOTICE_STYLE = Style(dim=True, italic=True)
+"""Style of the truncation notice rows above a partial file's hunks."""
+
+
 def _single_line(content: str, style: Style | None = None) -> Text:
     """Build a non-wrapping row so paired columns stay vertically aligned."""
     return Text(content, style=style, no_wrap=True, overflow="crop")
@@ -1229,7 +1271,7 @@ def placeholder_message(file: DiffFile) -> str:
     if file.is_binary:
         return "[Binary file]"
     if file.is_truncated:
-        return "Diff truncated by the forge. Press o to view in browser."
+        return TRUNCATED_NOTICE
     if file.is_empty:
         return "[Empty file]"
     if file.is_mode_only:
@@ -1296,8 +1338,10 @@ def _thread_lines(discussions: list[Discussion]) -> list[Text]:
 
 
 __all__ = [
+    "GENERATED_COMMENT_MESSAGE",
     "RANGE_CROSSES_GAP_MESSAGE",
     "READ_ONLY_LINE_MESSAGE",
+    "TRUNCATED_NOTICE",
     "DiffModeChanged",
     "DiffModeState",
     "DiffSelection",
