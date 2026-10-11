@@ -3,6 +3,7 @@ import test from "node:test";
 import { parseInertMarkdown } from "../../../desktop/dist/src/renderer/core/markdown.js";
 import {
   FeatureRegistry,
+  InlineAnchorStore,
   Navigator,
   reconcileDiscoveryRoute,
 } from "../../../desktop/dist/src/renderer/core/navigation.js";
@@ -315,8 +316,7 @@ function featureContext() {
     repositoriesReady: true,
     repositoryGeneration: 1,
     reviewPanels: [],
-    inlineAnchor: null,
-    selectInlineAnchor: () => {},
+    inlineAnchors: new InlineAnchorStore(),
     navigate: () => {},
   };
 }

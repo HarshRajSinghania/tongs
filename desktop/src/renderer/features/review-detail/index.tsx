@@ -49,6 +49,7 @@ export function ReviewHeader({
   navigate,
   panels,
   controls = null,
+  progress = null,
 }: {
   readonly route: Extract<AppRoute, { kind: "review" }>;
   readonly navigate: (route: AppRoute) => void;
@@ -62,6 +63,12 @@ export function ReviewHeader({
    * the review's revision, and passes nothing until then.
    */
   readonly controls?: ReactNode;
+  /**
+   * A line about how far the reader is through the review, said under its
+   * title beside the review's own summary: the Files changed tab passes
+   * "N of M files viewed" once it knows the files. Null says nothing.
+   */
+  readonly progress?: string | null;
 }): ReactNode {
   return (
     <>
@@ -75,6 +82,11 @@ export function ReviewHeader({
         <div className="review-heading">
           <p className="eyebrow">Review #{route.item.summary.number}</p>
           <h1 className="view-title">{route.item.summary.title}</h1>
+          {progress !== null && (
+            <p className="review-progress" role="status">
+              {progress}
+            </p>
+          )}
         </div>
         {controls}
         <button

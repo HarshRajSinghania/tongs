@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import test, { afterEach } from "node:test";
+import { InlineAnchorStore } from "../../../desktop/dist/src/renderer/core/navigation.js";
 import { QueryCoordinator } from "../../../desktop/dist/src/renderer/core/query.js";
 import {
   classifyMutationFailure,
@@ -471,8 +472,7 @@ function featureContext(bridge) {
       { id: "overview", label: "Overview", order: 10 },
       { id: "pipelines", label: "Pipelines", order: 40 },
     ],
-    inlineAnchor: null,
-    selectInlineAnchor: () => {},
+    inlineAnchors: new InlineAnchorStore(),
     navigate: () => {},
   };
 }

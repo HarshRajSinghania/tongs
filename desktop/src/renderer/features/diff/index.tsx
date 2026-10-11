@@ -1,9 +1,12 @@
 import {
+  memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type KeyboardEvent,
   type ReactNode,
 } from "react";
@@ -24,6 +27,7 @@ import type {
   DiscussionDiffTarget,
   FeatureContribution,
   InlineAnchorSelection,
+  InlineAnchorStore,
   InlineSelectedLine,
 } from "../../core/navigation.js";
 import {
@@ -77,6 +81,15 @@ import {
 } from "../review/thread.js";
 import { ReviewHeaderControls } from "../review/header.js";
 import { ReviewHeader } from "../review-detail/index.js";
+import { SyntaxContent, highlightFile, type FileSyntax } from "./syntax.js";
+import {
+  setFileViewed,
+  useViewedFiles,
+  viewedFileKey,
+  viewedFilesFor,
+  viewedProgressText,
+  type ViewedFiles,
+} from "./viewed.js";
 
 const MAX_DIFF_PAGES = 1000;
 const MAX_DIFF_ROWS = 100_000;
@@ -177,8 +190,7 @@ export function createDiffFeature(): FeatureContribution {
           navigate={context.navigate}
           panels={context.reviewPanels}
           repositories={context.repositories}
-          inlineAnchor={context.inlineAnchor}
-          selectInlineAnchor={context.selectInlineAnchor}
+          anchors={context.inlineAnchors}
         />
       ) : null,
   };
@@ -191,8 +203,7 @@ function DiffView({
   navigate,
   panels,
   repositories,
-  inlineAnchor,
-  selectInlineAnchor,
+  anchors,
 }: {
   readonly bridge: DesktopBridge;
   readonly queries: QueryCoordinator;
@@ -200,10 +211,11 @@ function DiffView({
   readonly navigate: (route: AppRoute) => void;
   readonly panels: FeatureContributionParameters["reviewPanels"];
   readonly repositories: readonly RepositoryDto[];
-  readonly inlineAnchor: InlineAnchorSelection | null;
-  readonly selectInlineAnchor: (
-    selection: InlineAnchorSelection | null,
-  ) => void;
+  /**
+   * The line selection. This view only writes it; the workspace below reads
+   * it, so a line click re-renders the workspace and not this view.
+   */
+  readonly anchors: InlineAnchorStore;
 }): ReactNode {
   // The suggestion block syntax is the forge's, so the composer needs to know
   // which forge this review lives on.
@@ -271,7 +283,7 @@ function DiffView({
       })
       .catch((reason: unknown) => {
         if (current) {
-          if (invalidatesSelection(reason)) selectInlineAnchor(null);
+          if (invalidatesSelection(reason)) anchors.select(null);
           // A layout switch can stop the previous layout mid-paging; its
           // drawn pages are then still on screen waiting for the rest.
           const drawn =
@@ -309,19 +321,45 @@ function DiffView({
     );
     if (target) {
       setJumpError(null);
-      selectInlineAnchor(target);
+      // The route keeps its jump across a Refresh, a layout switch and a tab
+      // switch. Once the jump has opened its file, a reader who marked that
+      // file viewed again has moved on, so a later read leaves the line alone
+      // rather than selecting a row the collapsed file does not draw.
+      if (
+        revealedJumps.has(route.diffTarget) &&
+        fileIsViewed(route.item.handle, loaded, target.fileIndex)
+      )
+        return;
+      revealJumpTarget(route.item.handle, loaded, route.diffTarget, target);
+      anchors.select(target);
     } else if (!loaded.loadingMore) {
       setJumpError(
         "This discussion location is unavailable in the displayed revision. Refresh the diff or open the discussion on the forge.",
       );
     }
-  }, [loaded, route.diffTarget, route.item.handle, selectInlineAnchor]);
+  }, [anchors, loaded, route.diffTarget, route.item.handle]);
+  const files = useMemo(
+    () =>
+      loaded === null
+        ? EMPTY_FILES
+        : loaded.rows.filter((row): row is DiffFileRow => row.kind === "file"),
+    [loaded?.rows],
+  );
+  // The marks belong to the head commit on screen, so a Refresh that brings a
+  // new revision shows a review with nothing viewed yet.
+  const viewed = useViewedFiles(
+    route.item.handle,
+    loaded?.revision.head_sha ?? "",
+  );
   return (
     <>
       <ReviewHeader
         route={route}
         navigate={navigate}
         panels={panels}
+        progress={
+          files.length > 0 ? viewedProgressText(files, viewed.files) : null
+        }
         controls={
           loaded ? (
             <ReviewHeaderControls
@@ -393,13 +431,61 @@ function DiffView({
           review={route.item.handle}
           forge={forge}
           loaded={loaded}
+          files={files}
+          viewed={viewed}
           reloadToken={reload}
-          selection={inlineAnchor}
-          selectAnchor={selectInlineAnchor}
+          anchors={anchors}
         />
       )}
     </>
   );
+}
+
+/**
+ * The jumps that have already opened their file. A jump from a discussion is a
+ * request to read that line, so the file it lands in stops being viewed rather
+ * than hiding the line the reader asked for. That happens once per jump: the
+ * route keeps its target across a tab switch, a layout switch and a Refresh,
+ * and none of those asks to read the line again.
+ */
+const revealedJumps = new WeakSet<DiscussionDiffTarget>();
+
+function revealJumpTarget(
+  review: string,
+  loaded: LoadedDiff,
+  jump: DiscussionDiffTarget,
+  target: InlineAnchorSelection,
+): void {
+  if (revealedJumps.has(jump)) return;
+  revealedJumps.add(jump);
+  revealFile(review, loaded, target.fileIndex);
+}
+
+function fileAt(loaded: LoadedDiff, fileIndex: number): DiffFileRow | undefined {
+  return loaded.rows.find(
+    (row): row is DiffFileRow =>
+      row.kind === "file" && row.file_index === fileIndex,
+  );
+}
+
+/** True when the file at `fileIndex` is marked as viewed at this revision. */
+function fileIsViewed(
+  review: string,
+  loaded: LoadedDiff,
+  fileIndex: number,
+): boolean {
+  const file = fileAt(loaded, fileIndex);
+  return (
+    file !== undefined &&
+    viewedFilesFor(review, loaded.revision.head_sha).has(viewedFileKey(file))
+  );
+}
+
+/** Clears the viewed mark of the file at `fileIndex`, if it has one. */
+function revealFile(review: string, loaded: LoadedDiff, fileIndex: number): void {
+  const file = fileAt(loaded, fileIndex);
+  if (file)
+    setFileViewed(review, loaded.revision.head_sha, viewedFileKey(file), false);
 }
 
 export async function loadAllPages(
@@ -534,23 +620,29 @@ function DiffWorkspace({
   review,
   forge,
   loaded,
+  files,
+  viewed,
   reloadToken,
-  selection,
-  selectAnchor,
+  anchors,
 }: {
   readonly bridge: DesktopBridge;
   readonly review: string;
   readonly forge: RepositoryDto["forge_type"] | null;
   readonly loaded: LoadedDiff;
+  /** The file rows of `loaded`, in diff order. */
+  readonly files: readonly DiffFileRow[];
+  /** The files the reader has marked as viewed at this revision. */
+  readonly viewed: ViewedFiles;
   /** Bumped by the toolbar's Refresh, so the published threads are reread too. */
   readonly reloadToken: number;
-  readonly selection: InlineAnchorSelection | null;
-  readonly selectAnchor: (selection: InlineAnchorSelection | null) => void;
+  readonly anchors: InlineAnchorStore;
 }): ReactNode {
-  const files = useMemo(
-    () => loaded.rows.filter((row): row is DiffFileRow => row.kind === "file"),
-    [loaded.rows],
-  );
+  const selection = useSyncExternalStore(anchors.subscribe, anchors.current);
+  const selectAnchor = anchors.select;
+  // Each file's rows and hunk rows, read once per loaded diff. The changed-file
+  // list and the rows view take their slice from here instead of filtering all
+  // rows per file on every render, which made a click cost files times rows.
+  const slices = useMemo(() => fileSlices(loaded.rows), [loaded.rows]);
   const [selected, setSelected] = useState(files[0]?.file_index ?? 0);
   const [target, setTarget] = useState(0);
   const [composerAnchor, setComposerAnchor] =
@@ -601,23 +693,31 @@ function DiffWorkspace({
     setSelected(files[0]?.file_index ?? 0);
     setTarget(0);
   }, [loaded.snapshotId]);
+  // A selection made in this diff already names a row of it, so only a new
+  // diff (a Refresh, a layout switch, another page) rebinds it. Reading it from
+  // the store keeps a line click from scanning every loaded row again.
   useEffect(() => {
-    if (!selection) return;
-    const rebound = rebindInlineAnchor(selection, review, loaded);
+    const current = anchors.current();
+    if (!current) return;
+    const rebound = rebindInlineAnchor(current, review, loaded);
     if (!rebound) {
       // The row may be on a page that has not arrived yet.
-      if (!loaded.loadingMore) selectAnchor(null);
-    } else if (!sameAnchorIdentity(selection, rebound)) selectAnchor(rebound);
-  }, [loaded, review, selectAnchor, selection]);
+      if (!loaded.loadingMore) anchors.select(null);
+    } else if (!sameAnchorIdentity(current, rebound)) anchors.select(rebound);
+  }, [anchors, loaded, review]);
   useEffect(() => {
     if (!selection || selection.review !== review) return;
     const matchingFile = files.find(
       (file) => file.file_index === selection.fileIndex,
     );
     if (!matchingFile) return;
-    const fileRows = loaded.rows.filter(
-      (row) => row.file_index === matchingFile.file_index,
-    );
+    // A viewed file draws its header alone, so a selection inside it would
+    // let `c` open a composer on a row that is not drawn.
+    if (viewed.files.has(viewedFileKey(matchingFile))) {
+      selectAnchor(null);
+      return;
+    }
+    const fileRows = sliceOf(slices, matchingFile.file_index).rows;
     const rowIndex = fileRows.findIndex((row) =>
       loaded.layout === "split"
         ? row.kind === "split" && row.row_index === selection.rowIndex
@@ -628,10 +728,16 @@ function DiffWorkspace({
     );
     setSelected(matchingFile.file_index);
     if (rowIndex >= 0) setTarget(rowIndex);
-  }, [files, loaded, review, selection]);
-  const visible = loaded.rows.filter((row) => row.file_index === selected);
+  }, [files, loaded, review, selectAnchor, selection, slices, viewed.files]);
   const selectedFile =
     files.find((file) => file.file_index === selected) ?? null;
+  const selectedViewed =
+    selectedFile !== null && viewed.files.has(viewedFileKey(selectedFile));
+  // A viewed file collapses to its header row.
+  const visible = useMemo(() => {
+    const rows = sliceOf(slices, selected).rows;
+    return selectedViewed ? rows.filter((row) => row.kind === "file") : rows;
+  }, [selected, selectedViewed, slices]);
   // The entry the composer is editing is re-read from the controller on every
   // render, so a save that rewrote the pending list cannot leave the composer
   // holding a body the store no longer has.
@@ -684,6 +790,8 @@ function DiffWorkspace({
         return;
       }
       takePendingEdit(review);
+      // An Edit asks for the entry's line, as a jump does.
+      revealFile(review, loaded, resolved.fileIndex);
       composerController.clearMessage();
       // The selection the reader built is left alone, exactly as the in-diff
       // card's own Edit leaves it, and the entry keeps the anchor it was
@@ -709,6 +817,17 @@ function DiffWorkspace({
       setComposerAnchor(null);
       setEditingEntry(null);
     },
+  };
+  const markViewed = (file: DiffFileRow, next: boolean): void => {
+    viewed.setViewed(viewedFileKey(file), next);
+    if (!next || file.file_index !== selected) return;
+    // Collapsing the file takes the composer and the line selection with it,
+    // so neither `c` nor Ctrl+Enter can act on a row that is no longer drawn.
+    // Unsent text stays in the per-anchor buffer.
+    setComposerAnchor(null);
+    setEditingEntry(null);
+    if (selection !== null && selection.fileIndex === file.file_index)
+      selectAnchor(null);
   };
   const drag: LineRangeDrag = {
     begin: (row) => {
@@ -824,6 +943,26 @@ function DiffWorkspace({
     // stands down for is offered there.
     { standDown: reviewDrawerIsOpen },
   );
+  // The changed-file list gets one handler per store, so a memoised entry
+  // re-renders only when its own file, slice or active state changes. The
+  // handler reads the current file through a ref, synced after each commit,
+  // instead of closing over one render's value; the store's setter is stable.
+  const selectedRef = useRef(selected);
+  useLayoutEffect(() => {
+    selectedRef.current = selected;
+  }, [selected]);
+  const selectFile = useCallback(
+    (fileIndex: number, rowIndex: number) => {
+      const moved = fileIndex !== selectedRef.current;
+      setSelected(fileIndex);
+      setTarget(rowIndex);
+      if (moved) {
+        setComposerAnchor(null);
+        anchors.select(null);
+      }
+    },
+    [anchors],
+  );
   const moveFocus = (event: KeyboardEvent<HTMLElement>): void => {
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
     const buttons = [
@@ -855,16 +994,10 @@ function DiffWorkspace({
           <FileNavigation
             key={file.file_index}
             file={file}
-            rows={loaded.rows}
-            selected={selected}
-            select={(fileIndex, rowIndex) => {
-              setSelected(fileIndex);
-              setTarget(rowIndex);
-              if (fileIndex !== selected) {
-                setComposerAnchor(null);
-                selectAnchor(null);
-              }
-            }}
+            slice={sliceOf(slices, file.file_index)}
+            active={selected === file.file_index}
+            viewed={viewed.files.has(viewedFileKey(file))}
+            select={selectFile}
           />
         ))}
         {files.length === 0 && (
@@ -911,6 +1044,8 @@ function DiffWorkspace({
           drag={drag}
           pending={composerController.pending}
           threads={threads}
+          viewed={selectedViewed}
+          markViewed={markViewed}
         />
       </section>
     </div>
@@ -930,6 +1065,8 @@ function DiffRowsWindow({
   drag,
   pending,
   threads,
+  viewed,
+  markViewed,
 }: {
   readonly review: string;
   readonly loaded: LoadedDiff;
@@ -943,6 +1080,9 @@ function DiffRowsWindow({
   readonly drag: LineRangeDrag;
   readonly pending: readonly PendingDraftEntry[];
   readonly threads: DiscussionThreadSlot;
+  /** True when `file` is marked as viewed and `items` is its header alone. */
+  readonly viewed: boolean;
+  readonly markViewed: MarkViewed;
 }): ReactNode {
   const [start, setStart] = useState(
     Math.max(0, Math.floor(targetIndex / pageSize) * pageSize),
@@ -951,9 +1091,21 @@ function DiffRowsWindow({
     () => setStart(Math.max(0, Math.floor(targetIndex / pageSize) * pageSize)),
     [pageSize, targetIndex],
   );
+  // Highlighted once per file and remembered, so paging through the rows or
+  // selecting a line does not highlight the file again.
+  const syntax = useMemo(() => highlightFile(file, items), [file, items]);
   const boundedStart = Math.min(start, Math.max(0, items.length - 1));
   const end = Math.min(items.length, boundedStart + pageSize);
   const windowed = items.slice(boundedStart, end);
+  // The file header carries the Viewed checkbox and the file's counts, so a
+  // window past the first one repeats it above its rows. Each row is painted
+  // with its index in the file, which keys it.
+  const header =
+    boundedStart > 0 && items[0]?.kind === "file" ? items[0] : null;
+  const painted: readonly (readonly [DiffRow, number])[] = [
+    ...(header === null ? [] : [[header, 0] as const]),
+    ...windowed.map((row, offset) => [row, boundedStart + offset] as const),
+  ];
   // The card that spells the refusal out is chosen from the cards this window
   // actually paints, in the order the reader meets them. Choosing by stored
   // order instead let the sentence vanish whenever the file's first entry was
@@ -972,9 +1124,9 @@ function DiffRowsWindow({
           {(["old", "new"] as const).map((side) => (
             <div className={`split-pane split-pane-${side}`} key={side}>
               <div className="split-pane-content" role="list">
-                {windowed.map((row, offset) => (
+                {painted.map(([row, index]) => (
                   <SplitPaneRow
-                    key={`${side}:${row.kind}:${row.file_index}:${"hunk_index" in row ? row.hunk_index : 0}:${boundedStart + offset}`}
+                    key={`${side}:${row.kind}:${row.file_index}:${"hunk_index" in row ? row.hunk_index : 0}:${index}`}
                     review={review}
                     loaded={loaded}
                     row={row}
@@ -987,6 +1139,9 @@ function DiffRowsWindow({
                     pending={pending}
                     explains={explains}
                     threads={threads}
+                    syntax={syntax}
+                    viewed={viewed}
+                    markViewed={markViewed}
                   />
                 ))}
               </div>
@@ -995,9 +1150,9 @@ function DiffRowsWindow({
         </div>
       ) : (
         <div className="windowed-items" role="list">
-          {windowed.map((row, offset) => (
+          {painted.map(([row, index]) => (
             <DiffRowView
-              key={`${row.kind}:${row.file_index}:${"hunk_index" in row ? row.hunk_index : 0}:${boundedStart + offset}`}
+              key={`${row.kind}:${row.file_index}:${"hunk_index" in row ? row.hunk_index : 0}:${index}`}
               review={review}
               loaded={loaded}
               row={row}
@@ -1009,9 +1164,17 @@ function DiffRowsWindow({
               pending={pending}
               explains={explains}
               threads={threads}
+              syntax={syntax}
+              viewed={viewed}
+              markViewed={markViewed}
             />
           ))}
         </div>
+      )}
+      {viewed && (
+        <p className="diff-viewed-note">
+          This file is marked as viewed. Clear Viewed to show its changes.
+        </p>
       )}
       {items.length > pageSize && (
         <nav className="window-controls" aria-label="Diff row windows">
@@ -1038,44 +1201,80 @@ function DiffRowsWindow({
   );
 }
 
-function FileNavigation({
+/** One file's rows in diff order, and the hunk rows among them. */
+interface FileSlice {
+  readonly rows: readonly DiffRow[];
+  readonly hunks: readonly DiffHunkRow[];
+}
+
+const EMPTY_FILES: readonly DiffFileRow[] = Object.freeze([]);
+
+const EMPTY_SLICE: FileSlice = Object.freeze({
+  rows: Object.freeze([]),
+  hunks: Object.freeze([]),
+});
+
+/** Groups the loaded rows by file in one pass, keeping their order. */
+function fileSlices(rows: readonly DiffRow[]): ReadonlyMap<number, FileSlice> {
+  const slices = new Map<number, { rows: DiffRow[]; hunks: DiffHunkRow[] }>();
+  for (const row of rows) {
+    let slice = slices.get(row.file_index);
+    if (!slice) {
+      slice = { rows: [], hunks: [] };
+      slices.set(row.file_index, slice);
+    }
+    slice.rows.push(row);
+    if (row.kind === "hunk") slice.hunks.push(row);
+  }
+  return slices;
+}
+
+function sliceOf(
+  slices: ReadonlyMap<number, FileSlice>,
+  fileIndex: number,
+): FileSlice {
+  return slices.get(fileIndex) ?? EMPTY_SLICE;
+}
+
+const FileNavigation = memo(function FileNavigation({
   file,
-  rows,
-  selected,
+  slice,
+  active,
+  viewed,
   select,
 }: {
   readonly file: DiffFileRow;
-  readonly rows: readonly DiffRow[];
-  readonly selected: number;
+  readonly slice: FileSlice;
+  readonly active: boolean;
+  readonly viewed: boolean;
   readonly select: (fileIndex: number, rowIndex: number) => void;
 }): ReactNode {
-  const visible = rows.filter((row) => row.file_index === file.file_index);
-  const hunks = visible.filter(
-    (row): row is DiffHunkRow => row.kind === "hunk",
-  );
   return (
     <>
       <button
-        className={`file-item ${selected === file.file_index ? "nav-item-active" : ""}`}
+        className={`file-item${active ? " nav-item-active" : ""}${viewed ? " file-item-viewed" : ""}`}
         onClick={() => select(file.file_index, 0)}
       >
         <span>{file.new_path || file.old_path}</span>
         <span className="file-stats">
-          +{file.additions} −{file.deletions}
+          {viewed && <span className="file-viewed-mark">Viewed </span>}
+          {`+${file.additions} −${file.deletions}`}
         </span>
       </button>
-      {hunks.map((hunk) => (
-        <button
-          key={hunk.hunk_index}
-          className="file-item hunk-item"
-          onClick={() => select(file.file_index, visible.indexOf(hunk))}
-        >
-          {hunk.context_text || hunk.header}
-        </button>
-      ))}
+      {/* A viewed file is collapsed, so its hunks are not offered either. */}
+      {!viewed &&
+        slice.hunks.map((hunk) => (
+          <button
+            key={hunk.hunk_index}
+            className="file-item hunk-item"
+            onClick={() => select(file.file_index, slice.rows.indexOf(hunk))}
+          >
+            {hunk.context_text || hunk.header}
+          </button>
+        ))}
     </>
   );
-}
+});
 
 function DiffRowView({
   review,
@@ -1089,6 +1288,9 @@ function DiffRowView({
   pending,
   explains,
   threads,
+  syntax,
+  viewed,
+  markViewed,
 }: {
   readonly review: string;
   readonly loaded: LoadedDiff;
@@ -1101,6 +1303,9 @@ function DiffRowView({
   readonly pending: readonly PendingDraftEntry[];
   readonly explains: string | null;
   readonly threads: DiscussionThreadSlot;
+  readonly syntax: FileSyntax | null;
+  readonly viewed: boolean;
+  readonly markViewed: MarkViewed;
 }): ReactNode {
   if (row.kind === "file") {
     const path =
@@ -1115,6 +1320,7 @@ function DiffRowView({
         <FileBadges file={row} />
         <PendingFileCount pending={pending} file={row} />
         <ThreadFileCount threads={threads} file={row} />
+        <ViewedToggle file={row} viewed={viewed} markViewed={markViewed} />
       </header>
     );
   }
@@ -1248,7 +1454,7 @@ function DiffRowView({
           }
         >
           {marker(row.line_type)}
-          {row.content}
+          <SyntaxContent line={syntax?.get(row)} text={row.content} />
         </code>
       </div>
       {composerOpen && inline.anchor && (
@@ -1307,6 +1513,43 @@ function composerKey(slot: InlineComposerSlot): string {
   return slot.editing
     ? `edit:${slot.editing.id}`
     : `new:${anchorIdentity(slot.anchor)}`;
+}
+
+/** Marks one file as viewed, or clears the mark. */
+export type MarkViewed = (file: DiffFileRow, viewed: boolean) => void;
+
+/**
+ * The Viewed checkbox in a file header (#195). It is a native checkbox inside
+ * its label, so it takes the focus in tab order and is named "Viewed". Space
+ * toggles it on the press itself; `preventDefault` stops the browser's own
+ * click on key release, which would otherwise toggle it a second time.
+ */
+function ViewedToggle({
+  file,
+  viewed,
+  markViewed,
+}: {
+  readonly file: DiffFileRow;
+  readonly viewed: boolean;
+  readonly markViewed: MarkViewed;
+}): ReactNode {
+  return (
+    <label className="file-viewed">
+      <input
+        type="checkbox"
+        checked={viewed}
+        onChange={(event) => markViewed(file, event.currentTarget.checked)}
+        onKeyDown={(event) => {
+          if (event.key !== " ") return;
+          if (event.ctrlKey || event.metaKey || event.altKey) return;
+          event.preventDefault();
+          // A held Space toggles once, not once per repeat.
+          if (!event.repeat) markViewed(file, !viewed);
+        }}
+      />
+      Viewed
+    </label>
+  );
 }
 
 /**
@@ -1602,6 +1845,9 @@ function SplitPaneRow({
   pending,
   explains,
   threads,
+  syntax,
+  viewed,
+  markViewed,
 }: {
   readonly review: string;
   readonly loaded: LoadedDiff;
@@ -1615,6 +1861,9 @@ function SplitPaneRow({
   readonly pending: readonly PendingDraftEntry[];
   readonly explains: string | null;
   readonly threads: DiscussionThreadSlot;
+  readonly syntax: FileSyntax | null;
+  readonly viewed: boolean;
+  readonly markViewed: MarkViewed;
 }): ReactNode {
   if (row.kind === "file")
     return (
@@ -1627,6 +1876,11 @@ function SplitPaneRow({
         <FileBadges file={row} />
         {side === "new" && <PendingFileCount pending={pending} file={row} />}
         {side === "new" && <ThreadFileCount threads={threads} file={row} />}
+        {/* One control per file: the new side's header carries it, as it
+            carries the file's counts. */}
+        {side === "new" && (
+          <ViewedToggle file={row} viewed={viewed} markViewed={markViewed} />
+        )}
       </header>
     );
   if (row.kind === "hunk")
@@ -1669,6 +1923,7 @@ function SplitPaneRow({
         selectAnchor={selectAnchor}
         inline={inline}
         drag={drag}
+        syntax={syntax}
       />
       {composerOpen &&
         inline.anchor &&
@@ -1791,6 +2046,7 @@ function SplitCell({
   selectAnchor,
   inline,
   drag,
+  syntax,
 }: {
   readonly review: string;
   readonly loaded: LoadedDiff;
@@ -1802,6 +2058,7 @@ function SplitCell({
   readonly selectAnchor: (selection: InlineAnchorSelection | null) => void;
   readonly inline: InlineComposerSlot;
   readonly drag: LineRangeDrag;
+  readonly syntax: FileSyntax | null;
 }): ReactNode {
   const cellNode = useRef<HTMLDivElement | null>(null);
   const selectable =
@@ -1913,7 +2170,7 @@ function SplitCell({
           />
           <code className="line-content">
             {marker(cell.line_type)}
-            {cell.content}
+            <SyntaxContent line={syntax?.get(cell)} text={cell.content} />
           </code>
         </>
       )}

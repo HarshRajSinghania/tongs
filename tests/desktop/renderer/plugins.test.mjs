@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import test, { afterEach } from "node:test";
+import { InlineAnchorStore } from "../../../desktop/dist/src/renderer/core/navigation.js";
 import { createPluginsFeature } from "../../../desktop/dist/src/renderer/features/plugins/index.js";
 import {
   PluginLocationPublisher,
@@ -106,8 +107,7 @@ test("plugin workspace mounts a usable module and renders help as inert text", a
     repositoriesReady: true,
     repositoryGeneration: 1,
     reviewPanels: [],
-    inlineAnchor: null,
-    selectInlineAnchor: () => undefined,
+    inlineAnchors: new InlineAnchorStore(),
     navigate: () => undefined,
   };
   const view = render(feature.render(context, route()));

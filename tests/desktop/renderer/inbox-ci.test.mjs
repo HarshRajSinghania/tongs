@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import test, { afterEach } from "node:test";
+import { InlineAnchorStore } from "../../../desktop/dist/src/renderer/core/navigation.js";
 import { QueryCoordinator } from "../../../desktop/dist/src/renderer/core/query.js";
 import {
   CI_LOADING_TEXT,
@@ -593,6 +594,9 @@ test("rows the list already knows the CI of are not looked up", async () => {
   });
   await waitFor(() => assert.equal(cardTitles(view).length, 2));
   assert.deepEqual(cardCI(view), ["A12:running", `A11:${CI_LOADING_TEXT}`]);
+  // Lookups start from an effect after the cards render, so under load the
+  // first one can lag the titles. One request names every near row at once.
+  await waitFor(() => assert.equal(bridge.calls.length > 0, true));
   assert.deepEqual(
     bridge.calls.map((call) => call.params.review),
     ["review-A11"],
@@ -871,8 +875,7 @@ function featureContext(bridge, repositories) {
     repositoriesReady: true,
     repositoryGeneration: 1,
     reviewPanels: [],
-    inlineAnchor: null,
-    selectInlineAnchor: () => {},
+    inlineAnchors: new InlineAnchorStore(),
     navigate: () => {},
   };
 }

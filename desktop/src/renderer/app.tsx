@@ -13,11 +13,11 @@ import { createRoot } from "react-dom/client";
 import type { RepositoryDto } from "../shared/bridge.js";
 import {
   FeatureRegistry,
+  InlineAnchorStore,
   Navigator,
   reconcileDiscoveryRoute,
   type AppRoute,
   type FeatureContext,
-  type InlineAnchorSelection,
 } from "./core/navigation.js";
 import { safeError } from "./core/presentation.js";
 import { QueryCoordinator } from "./core/query.js";
@@ -56,6 +56,7 @@ const pluginsFeature = createPluginsFeature(bridge);
 const pluginLocations = new PluginLocationPublisher(bridge);
 const utilityController = new WorkspaceUtilityController();
 const serviceStatus = new ServiceStatusModel();
+const inlineAnchors = new InlineAnchorStore();
 registry.register(createInboxFeature());
 registry.register(createReviewOverviewFeature());
 registry.register(createCommitsFeature());
@@ -76,8 +77,6 @@ function App(): ReactNode {
   );
   const discoveryRetry = useRef<(() => void) | null>(null);
   const [repositoryGeneration, setRepositoryGeneration] = useState(0);
-  const [inlineAnchor, setInlineAnchor] =
-    useState<InlineAnchorSelection | null>(null);
   const [routeNotice, setRouteNotice] = useState<string | null>(null);
   const plugins = usePluginSnapshot(pluginsFeature.runtime);
   useEffect(() => navigator.subscribe(setRoute), []);
@@ -116,11 +115,7 @@ function App(): ReactNode {
   }, []);
   const navigation = useCallback((next: AppRoute) => {
     setRouteNotice(null);
-    setInlineAnchor((current) =>
-      next.kind === "review" && current?.review === next.item.handle
-        ? current
-        : null,
-    );
+    inlineAnchors.retainFor(next);
     navigator.navigate(next);
   }, []);
   const onDiscovery = useCallback((next: readonly RepositoryDto[]) => {
@@ -158,8 +153,7 @@ function App(): ReactNode {
     retryDiscovery,
     repositoryGeneration,
     reviewPanels: registry.reviewPanels(),
-    inlineAnchor,
-    selectInlineAnchor: setInlineAnchor,
+    inlineAnchors,
     navigate: navigation,
   };
   const commands = [

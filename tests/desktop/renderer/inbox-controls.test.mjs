@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import test, { afterEach } from "node:test";
 import {
+  InlineAnchorStore,
   Navigator,
   resetInboxReturnRoute,
 } from "../../../desktop/dist/src/renderer/core/navigation.js";
@@ -661,8 +662,7 @@ function featureContext(bridge, navigate = () => {}) {
     repositoriesReady: true,
     repositoryGeneration: 1,
     reviewPanels: [],
-    inlineAnchor: null,
-    selectInlineAnchor: () => {},
+    inlineAnchors: new InlineAnchorStore(),
     navigate,
   };
 }

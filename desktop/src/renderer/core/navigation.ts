@@ -37,10 +37,12 @@ export interface FeatureContext {
   readonly retryDiscovery?: () => void;
   readonly repositoryGeneration: number;
   readonly reviewPanels: readonly ReviewPanelContribution[];
-  readonly inlineAnchor: InlineAnchorSelection | null;
-  readonly selectInlineAnchor: (
-    selection: InlineAnchorSelection | null,
-  ) => void;
+  /**
+   * The line selection in the Files changed tab. It is held here, outside any
+   * component's state, so it outlives a switch between the review's tabs while
+   * a line click re-renders only the diff that shows it, not the app shell.
+   */
+  readonly inlineAnchors: InlineAnchorStore;
   readonly navigate: (route: AppRoute) => void;
 }
 
@@ -63,6 +65,37 @@ export interface InlineAnchorSelection {
   readonly rangeOriginOldLine?: number | null;
   readonly rangeOriginNewLine?: number | null;
   readonly selectedLines?: readonly InlineSelectedLine[];
+}
+
+/**
+ * Holds the inline anchor selection and tells its subscribers when it changes.
+ * The selection names its review, and a navigation to any route that leaves
+ * that review clears it.
+ */
+export class InlineAnchorStore {
+  #current: InlineAnchorSelection | null = null;
+  readonly #listeners = new Set<() => void>();
+
+  /** The selection now, for `useSyncExternalStore` and for effects. */
+  current = (): InlineAnchorSelection | null => this.#current;
+
+  subscribe = (listener: () => void): (() => void) => {
+    this.#listeners.add(listener);
+    return () => this.#listeners.delete(listener);
+  };
+
+  select = (selection: InlineAnchorSelection | null): void => {
+    if (selection === this.#current) return;
+    this.#current = selection;
+    for (const listener of [...this.#listeners]) listener();
+  };
+
+  /** Keeps the selection only when `route` stays on the review it belongs to. */
+  retainFor(route: AppRoute): void {
+    if (route.kind === "review" && this.#current?.review === route.item.handle)
+      return;
+    this.select(null);
+  }
 }
 
 export interface InlineSelectedLine {

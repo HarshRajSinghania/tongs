@@ -198,7 +198,10 @@ export class SidecarTransport extends EventEmitter {
   readonly crashHistory: SidecarCrash[] = [];
   private child: ChildProcessWithoutNullStreams | null = null;
   private pending = new Map<string, PendingRequest>();
-  private buffer = Buffer.alloc(0);
+  // The unterminated tail of the current output frame, kept as the chunks it
+  // arrived in so each byte is scanned and copied once per frame.
+  private partialChunks: Buffer[] = [];
+  private partialLength = 0;
   private nextId = 1;
   private generation = 0;
   private lastEventSequence = 0;
@@ -338,7 +341,8 @@ export class SidecarTransport extends EventEmitter {
     if (this.child) await this.reapBeforeReplacement(this.child);
     this.expectedExit = false;
     this.failureReported = false;
-    this.buffer = Buffer.alloc(0);
+    this.partialChunks = [];
+    this.partialLength = 0;
     this.lastEventSequence = 0;
     this.jsonLimits = DEFAULT_JSON_LIMITS;
     this.generation += 1;
@@ -475,23 +479,44 @@ export class SidecarTransport extends EventEmitter {
   }
 
   private consume(child: ChildProcessWithoutNullStreams, generation: number, chunk: Buffer): void {
-    if (this.child !== child || this.generation !== generation) return;
-    this.buffer = Buffer.concat([this.buffer, chunk]);
+    // A failed connection reads nothing more: the child is being stopped, and
+    // a frame after the bad one must not reach a listener.
+    if (this.child !== child || this.generation !== generation || this.failureReported) return;
+    let start = 0;
     while (true) {
-      const newline = this.buffer.indexOf(0x0a);
+      // Only the new chunk is scanned: the held tail is known to hold no newline.
+      const newline = chunk.indexOf(0x0a, start);
       if (newline < 0) {
-        if (this.buffer.length > MAX_RESPONSE_BYTES) this.failConnection(child, generation, "frame_too_large");
+        this.holdPartial(chunk.subarray(start));
+        if (this.partialLength > MAX_RESPONSE_BYTES) this.failConnection(child, generation, "frame_too_large");
         return;
       }
-      const raw = this.buffer.subarray(0, newline);
-      this.buffer = this.buffer.subarray(newline + 1);
+      const raw = this.takeFrame(chunk.subarray(start, newline));
+      start = newline + 1;
       if (raw.length === 0 || raw.length > MAX_RESPONSE_BYTES) {
+        this.holdPartial(chunk.subarray(start));
         this.failConnection(child, generation, "invalid_frame");
         return;
       }
       this.consumeFrame(child, generation, raw);
-      if (!this.child) return;
+      if (this.child !== child || this.generation !== generation || this.failureReported) return;
     }
+  }
+
+  private holdPartial(piece: Buffer): void {
+    if (piece.length === 0) return;
+    this.partialChunks.push(piece);
+    this.partialLength += piece.length;
+  }
+
+  /** Joins the held tail with the frame's last piece, copying at most once. */
+  private takeFrame(last: Buffer): Buffer {
+    if (this.partialChunks.length === 0) return last;
+    this.partialChunks.push(last);
+    const raw = Buffer.concat(this.partialChunks, this.partialLength + last.length);
+    this.partialChunks = [];
+    this.partialLength = 0;
+    return raw;
   }
 
   private consumeFrame(child: ChildProcessWithoutNullStreams, generation: number, raw: Buffer): void {

@@ -10,6 +10,7 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import test, { afterEach } from "node:test";
+import { InlineAnchorStore } from "../../../desktop/dist/src/renderer/core/navigation.js";
 import { QueryCoordinator } from "../../../desktop/dist/src/renderer/core/query.js";
 import { createPipelinesFeature } from "../../../desktop/dist/src/renderer/features/pipelines/index.js";
 import {
@@ -387,8 +388,7 @@ function featureContext(bridge) {
     repositoriesReady: true,
     repositoryGeneration: 1,
     reviewPanels: [{ id: "pipelines", label: "Pipelines", order: 40 }],
-    inlineAnchor: null,
-    selectInlineAnchor: () => {},
+    inlineAnchors: new InlineAnchorStore(),
     navigate: () => {},
   };
 }
