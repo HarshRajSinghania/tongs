@@ -1144,21 +1144,39 @@ class DiffContent(Widget):
         if line.line_type is not LineType.CONTEXT:
             return False
         refolded = expansion.refold(line.new_lineno)
-        if refolded == expansion:
+        if refolded == expansion or not self._folds_line(file, line, refolded):
+            # A thread or a draft keeps the line on screen, or it sits at the
+            # edge of a run where the hunk always shows it: nothing folds.
             return False
-        selection = self.selection
         self._set_expansion(file, refolded)
         self._render_current_file()
         self._land_on(line.new_lineno)
-        fold = self.cursor_gap()
-        if fold is None or fold.position is not GapPosition.INSIDE:
-            # A thread or a draft keeps the line on screen, or it sits at the
-            # edge of a run where the hunk always shows it: nothing folded.
-            self._set_expansion(file, expansion)
-            self._render_current_file(selection)
-            return False
         self.post_message(DiffSelectionChanged(self.selection))
         return True
+
+    def _folds_line(
+        self, file: DiffFile, line: DiffLine, expansion: FileExpansion
+    ) -> bool:
+        """Whether a hunk line would sit inside a fold under ``expansion``.
+
+        The active layout runs its own fold on the line's hunk, with the
+        threads and drafts that keep lines on screen, without drawing it.
+        """
+        hunk = next(
+            (hunk for hunk in file.hunks if any(shown is line for shown in hunk.lines)),
+            None,
+        )
+        if hunk is None:
+            return False
+        if self._effective_mode is DiffViewMode.SPLIT:
+            return self.query_one(SplitDiffView).folds_line(file, hunk, line, expansion)
+        renderer = DiffRenderer(
+            file.language,
+            comment_lines=_build_comment_lines(self._file_discussions),
+            protected_lines=self._draft_line_keys(file),
+            revealed=expansion.reveals,
+        )
+        return renderer.folds_line(hunk, line)
 
     def set_full_file(self, file: DiffFile, full: bool) -> None:
         """Switch the whole-file view of one file, keeping the reader's place.
@@ -1650,6 +1668,10 @@ class DiffRenderer:
             result.append("\n")
         result.rstrip()
         return result
+
+    def folds_line(self, hunk: DiffHunk, line: DiffLine) -> bool:
+        """Whether :meth:`render_lines` would hide a line of ``hunk`` in a fold."""
+        return not any(item is line for item in self._fold_context(list(hunk.lines)))
 
     def _fold_context(
         self, lines: list[DiffLine], *, hunk_index: int = 0
@@ -2455,12 +2477,16 @@ class DiffPanel(Widget):
         opens at once: the forge already sent its lines. On an expanded line,
         or a line shown from a fold, ``e`` hides those lines again with no
         read. On a file the forge truncated, ``e`` on any other row generates
-        the diff locally, and pressing it again cancels that.
+        the diff locally. While that runs, ``e`` on any row cancels it.
         """
         file = self._shown_file()
         if file is None:
             return
         content = self.query_one("#diff-content", DiffContent)
+        if content.generation_running(file):
+            # The notice says "Press e again to cancel", wherever the cursor is.
+            self._toggle_generation(file)
+            return
         gap = content.cursor_gap()
         if gap is None and content.collapse_at_cursor(file):
             # Collapsing in the whole-file view turns it off.

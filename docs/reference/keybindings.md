@@ -82,7 +82,7 @@ These keys work on the inbox, the repository list and MR detail.
 | ++n++ / ++shift+n++ | Next / previous file |
 | ++m++ | Toggle the Markdown preview |
 | ++v++ | Toggle unified and split layout |
-| ++e++ | Expand the unchanged lines behind the gap row under the cursor, or collapse the expanded lines under the cursor |
+| ++e++ | Expand the unchanged lines behind the gap row under the cursor, or collapse the expanded lines under the cursor and fold again the lines a fold showed |
 | ++shift+f++ | Show the whole file, or go back to what you had expanded |
 | ++escape++ | Clear the selection |
 

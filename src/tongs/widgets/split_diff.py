@@ -32,7 +32,7 @@ from tongs.diff.context import (
     Segment,
     inside_gap,
 )
-from tongs.diff.models import DiffFile, DiffLine, LineType, SplitDiffRow
+from tongs.diff.models import DiffFile, DiffHunk, DiffLine, LineType, SplitDiffRow
 from tongs.forges.models import Discussion
 from tongs.helpers import relative_time
 from tongs.state.drafts import DiffSide
@@ -694,6 +694,30 @@ class SplitDiffView(Widget):
         new_column = self._column(DiffSide.NEW)
         return new_column._readonly_rows.get(index) or new_column._line_map.get(index)
 
+    def folds_line(
+        self, file: DiffFile, hunk: DiffHunk, line: DiffLine, expansion: FileExpansion
+    ) -> bool:
+        """Whether a hunk line would sit inside a fold under ``expansion``.
+
+        It runs the same fold as :meth:`show_file`, so a line a thread or a
+        draft keeps on screen answers False, and nothing is drawn.
+        """
+        return not any(
+            not isinstance(row, str) and row.new is line
+            for row in _fold_context_rows(
+                align_hunk(hunk), preserve=self._fold_preserve(file, expansion)
+            )
+        )
+
+    def _fold_preserve(
+        self, file: DiffFile, expansion: FileExpansion
+    ) -> Callable[[SplitDiffRow], bool]:
+        """Rows that never fold: opened by the reader, or carrying a thread or draft."""
+        return lambda row: (
+            (row.old is not None and expansion.reveals(row.old))
+            or self._row_has_visible_detail(file, row)
+        )
+
     def land_on(self, new_line: int) -> bool:
         """Move the cursor to the row that shows a new-side line number.
 
@@ -983,10 +1007,7 @@ class SplitDiffView(Widget):
                 option_index += 1
                 for row in _fold_context_rows(
                     align_hunk(hunk),
-                    preserve=lambda row: (
-                        (row.old is not None and expansion.reveals(row.old))
-                        or self._row_has_visible_detail(file, row)
-                    ),
+                    preserve=self._fold_preserve(file, expansion),
                     hunk_index=segment.hunk_index,
                 ):
                     if isinstance(row, str):

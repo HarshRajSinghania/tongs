@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from uuid import uuid4
 
 import pytest
 from textual.app import App, ComposeResult
@@ -12,6 +13,7 @@ from tests.test_widgets.test_diff_context_split import WIDE_CONTEXT
 from tongs.diff.context import GapPosition
 from tongs.diff.models import DiffFile, LineType
 from tongs.diff.parser import parse_diff
+from tongs.state.drafts import DiffSide
 from tongs.widgets.diff_panel import (
     FULL_FILE_LABEL,
     MOVE_TO_GAP_MESSAGE,
@@ -22,6 +24,7 @@ from tongs.widgets.diff_panel import (
     GenerateCancelRequested,
     GenerateRequested,
 )
+from tongs.widgets.review_draft import DraftMarker
 from tongs.widgets.split_diff import DiffViewMode, SplitDiffColumn
 
 GAP_3 = "... 3 unchanged lines (e to expand) ..."
@@ -249,6 +252,50 @@ async def test_e_on_a_line_shown_from_a_fold_folds_it_again(
         before = _rows(widget)
         await _press_e_at(app, pilot, widget, changed)
         assert _rows(widget) == before
+        assert app.requests == []
+
+
+@pytest.mark.parametrize("mode", [DiffViewMode.UNIFIED, DiffViewMode.SPLIT])
+@pytest.mark.asyncio
+async def test_e_on_a_line_a_draft_keeps_shown_leaves_the_fold_open(
+    mode: DiffViewMode,
+) -> None:
+    app = _CollapseApp()
+    async with app.run_test(size=(200, 60), notifications=True) as pilot:
+        file = _file(WIDE_CONTEXT)
+        if mode is DiffViewMode.SPLIT:
+            panel = await _open_split(app, pilot, file)
+            widget = _columns(app)[1]
+        else:
+            panel = await _open(app, pilot, file)
+            widget = _option_list(app)
+        content = app.query_one(DiffContent)
+        folds = sorted(
+            index
+            for index, gap in widget._gap_rows.items()
+            if gap.position is GapPosition.INSIDE
+        )
+        await _press_e_at(app, pilot, widget, folds[1])
+        opened = content.file_expansion(file)
+        assert opened.folds == frozenset({(14, 8)})
+
+        # A draft on line 17, inside the opened fold, keeps it on screen and
+        # splits the run so that lines 14 to 16 would not fold either.
+        marker = DraftMarker(
+            uuid4(), "Draft note", "f.txt", "f.txt", 17, 17, DiffSide.NEW, False
+        )
+        panel.set_draft_markers((marker,))
+        await pilot.pause()
+        before = _rows(widget)
+        assert FOLD_8 not in [row.strip() for row in before]
+
+        for new_line in (17, 15):
+            row = _row_of(widget, new_line)
+            await _press_e_at(app, pilot, widget, row)
+            assert widget.highlighted == row
+            assert _rows(widget) == before
+            assert content.file_expansion(file) == opened
+        assert MOVE_TO_GAP_MESSAGE in _messages(app)
         assert app.requests == []
 
 
