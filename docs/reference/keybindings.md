@@ -82,9 +82,15 @@ These keys work on the inbox, the repository list and MR detail.
 | ++n++ / ++shift+n++ | Next / previous file |
 | ++m++ | Toggle the Markdown preview |
 | ++v++ | Toggle unified and split layout |
+| ++e++ | Expand the unchanged lines behind the gap row under the cursor |
+| ++shift+f++ | Show the whole file, or go back to what you had expanded |
 | ++escape++ | Clear the selection |
 
 In the split layout, ++h++ and ++l++ move focus between the old and new side.
+
+The first ++e++ or ++shift+f++ on a file reads it once from the forge.
+Expanded lines are read-only. See
+[Expanding context](/guides/diffs/#expanding-context).
 
 ++f3++ works on the new side only, and not on deleted lines. It opens
 `$VISUAL`, then `$EDITOR`, then the first of `nvim`, `vim`, `vi` or `nano` on

@@ -14,7 +14,7 @@ parser keeps it.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
 from tongs.diff.models import DiffFile, DiffHunk, DiffLine, FileStatus, LineType
@@ -37,6 +37,9 @@ class GapPosition(StrEnum):
     BEFORE = "before"
     BETWEEN = "between"
     AFTER = "after"
+    # A long run of context lines inside one hunk that the viewer folds. The
+    # forge sent those lines, so showing them needs no file read.
+    INSIDE = "inside"
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +51,10 @@ class DiffGap:
     ``hunk_index`` is the hunk that follows the gap, or ``len(file.hunks)``
     for the AFTER gap. ``length`` is None only for an AFTER gap read before
     the new file's line count is known.
+
+    An INSIDE gap is a fold within hunk ``hunk_index``. It is not one of
+    :func:`file_gaps`, so its ``index`` is :data:`INSIDE_GAP_INDEX`; its
+    :attr:`key` tells it apart from other folds.
     """
 
     index: int
@@ -56,6 +63,33 @@ class DiffGap:
     old_start: int
     new_start: int
     length: int | None
+
+    @property
+    def key(self) -> tuple[GapPosition, int]:
+        """Identify the gap across redraws, whether or not its length is known."""
+        return (self.position, self.new_start)
+
+    def covers(self, new_line: int) -> bool:
+        """Whether a new-side line number falls inside this gap."""
+        if new_line < self.new_start:
+            return False
+        return self.length is None or new_line < self.new_start + self.length
+
+
+INSIDE_GAP_INDEX = -1
+"""The ``index`` of every INSIDE gap, which :func:`file_gaps` never returns."""
+
+
+def inside_gap(hunk_index: int, first: DiffLine, length: int) -> DiffGap:
+    """Return the fold that hides ``length`` context lines from ``first`` on."""
+    return DiffGap(
+        index=INSIDE_GAP_INDEX,
+        position=GapPosition.INSIDE,
+        hunk_index=hunk_index,
+        old_start=first.old_lineno or 0,
+        new_start=first.new_lineno or 0,
+        length=length,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,8 +306,9 @@ def _followed_by_marker(lines: Sequence[DiffLine], index: int) -> bool:
 class FileContextModel:
     """The new file's lines mapped onto one file's gaps.
 
-    Expanded lines are built once per gap and kept, so their identity is
-    stable across redraws and can key highlight maps by ``id()``.
+    Expanded lines are built once, for every gap, when the model is made and
+    never rebuilt, so their identity is stable across redraws and threads and
+    can key highlight maps by ``id()``.
     """
 
     def __init__(
@@ -284,22 +319,15 @@ class FileContextModel:
         self.ends_with_newline = ends_with_newline
         self.gaps = file_gaps(file, len(self.lines))
         self._by_index = {gap.index: gap for gap in self.gaps}
-        self._expanded: dict[int, tuple[DiffLine, ...]] = {}
+        self._expanded: dict[int, tuple[DiffLine, ...]] = {
+            gap.index: self._build(gap) for gap in self.gaps
+        }
 
-    def gap(self, gap_index: int) -> DiffGap | None:
-        """Return the gap with this index, or None when the file has none."""
-        return self._by_index.get(gap_index)
-
-    def expanded_lines(self, gap_index: int) -> tuple[DiffLine, ...]:
-        """Return the gap's lines as read-only EXPANDED diff lines."""
-        cached = self._expanded.get(gap_index)
-        if cached is not None:
-            return cached
-        gap = self._by_index.get(gap_index)
-        if gap is None or not gap.length:
+    def _build(self, gap: DiffGap) -> tuple[DiffLine, ...]:
+        if not gap.length:
             return ()
         start = gap.new_start - 1
-        built = tuple(
+        return tuple(
             DiffLine(
                 old_lineno=gap.old_start + offset,
                 new_lineno=gap.new_start + offset,
@@ -308,28 +336,76 @@ class FileContextModel:
             )
             for offset, content in enumerate(self.lines[start : start + gap.length])
         )
-        self._expanded[gap_index] = built
-        return built
+
+    def gap(self, gap_index: int) -> DiffGap | None:
+        """Return the gap with this index, or None when the file has none."""
+        return self._by_index.get(gap_index)
+
+    def expanded_lines(self, gap_index: int) -> tuple[DiffLine, ...]:
+        """Return the gap's lines as read-only EXPANDED diff lines."""
+        return self._expanded.get(gap_index, ())
+
+    def all_expanded_lines(self) -> tuple[DiffLine, ...]:
+        """Return every gap's expanded lines in file order."""
+        return tuple(line for gap in self.gaps for line in self._expanded[gap.index])
+
+    def full_view_rows(self) -> int:
+        """Count the code rows the whole-file view shows for this file.
+
+        Every line of the new file shows once, and every deleted line once
+        more, so this is the new file's length plus the hunks' deletions.
+        """
+        deletions = sum(
+            1
+            for hunk in self.file.hunks
+            for line in hunk.lines
+            if line.line_type is LineType.DELETION
+        )
+        return len(self.lines) + deletions
 
 
 @dataclass(frozen=True, slots=True)
 class FileExpansion:
-    """Which gaps of one file the reader has opened."""
+    """Which gaps of one file the reader has opened.
+
+    ``shown`` holds the indices of opened gaps around the hunks and ``folds``
+    the ``(new_start, length)`` of opened folds inside them. ``full`` is the
+    whole-file view, which shows everything without forgetting the rest, so
+    switching it off restores exactly what was open before.
+    """
 
     shown: frozenset[int] = field(default_factory=frozenset)
     full: bool = False
+    folds: frozenset[tuple[int, int]] = field(default_factory=frozenset)
 
     def expand(self, gap_index: int) -> FileExpansion:
         """Return this expansion with one more gap shown."""
-        return FileExpansion(self.shown | {gap_index}, self.full)
+        return replace(self, shown=self.shown | {gap_index})
+
+    def reveal_fold(self, gap: DiffGap) -> FileExpansion:
+        """Return this expansion with one more in-hunk fold shown."""
+        return replace(self, folds=self.folds | {(gap.new_start, gap.length or 0)})
 
     def toggle_full(self) -> FileExpansion:
         """Return this expansion with the whole-file view switched."""
-        return FileExpansion(self.shown, not self.full)
+        return replace(self, full=not self.full)
+
+    def with_full(self, full: bool) -> FileExpansion:
+        """Return this expansion with the whole-file view on or off."""
+        return self if self.full is full else replace(self, full=full)
 
     def is_shown(self, gap_index: int) -> bool:
         """Whether a gap is open, on its own or through the whole-file view."""
         return self.full or gap_index in self.shown
+
+    def reveals(self, line: DiffLine) -> bool:
+        """Whether an in-hunk context line must stay visible instead of folding."""
+        if self.full:
+            return True
+        number = line.new_lineno
+        if number is None:
+            return False
+        return any(start <= number < start + length for start, length in self.folds)
 
 
 def segments(
