@@ -651,7 +651,7 @@ jobs:
           output="$RUNNER_TEMP/tongs-desktop-rpm"
           staged="$RUNNER_TEMP/tongs-desktop-release-rpms"
           mkdir -p "$staged/rpms/final" "$staged/companion-consumer-rpms" \
-            "$staged/prepared"
+            "$staged/prepared" "$staged/builder"
           cp -- "$output"/rpms/final/*.rpm "$staged/rpms/final/"
           cp -- "$output"/companion-consumer-rpms/*.rpm "$staged/companion-consumer-rpms/"
           cp -- "$output/rpms/final/SHA256SUMS" "$staged/rpms/final/SHA256SUMS"
@@ -659,6 +659,8 @@ jobs:
           cp -- "$output/payload-input-contract.json" "$staged/"
           cp -- "$output/prepared/prepared-inputs.json" "$staged/prepared/"
           cp -- "$output/ALL-SHA256SUMS" "$staged/"
+          cp -- "$output/builder-pin.json" "$output/builder-attestation.json" \
+            "$staged/builder/"
           cp -a -- "$output/install" "$staged/install"
       - name: Upload the release RPMs for this run and attempt
         id: upload

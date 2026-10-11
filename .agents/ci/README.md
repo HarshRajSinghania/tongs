@@ -254,7 +254,8 @@ The pin has three consumers, each of which refuses an unpublished pin with
   hold `attestations: read` for the check, and the `ci.yml` call of
   `desktop-production.yml` grants it, because a called job gets no scope its
   caller does not. The pin, the verification output and the builder's
-  `podman image inspect` are in the evidence `ALL-SHA256SUMS` hashes. A
+  `podman image inspect` are in the evidence `ALL-SHA256SUMS` hashes, and the
+  pin and the verification output are uploaded with the evidence. A
   release tag therefore builds its RPMs from the image its own commit pins.
 - `packaging/rpm/python-dependencies/run_hosted.sh` (the manual companion RPM
   workflow) builds on plain Fedora at the pin's `base_digest`, never on the

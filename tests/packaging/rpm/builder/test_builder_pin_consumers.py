@@ -429,3 +429,16 @@ def test_the_probe_names_no_moving_fedora_tag() -> None:
     assert re.findall(r"^ARG BASE_IMAGE.*$", containerfile, re.MULTILINE) == [
         "ARG BASE_IMAGE"
     ]
+
+
+def test_the_gate_and_the_release_upload_the_builder_pin_and_verification() -> None:
+    """The evidence names the builder digest and its check, not only hashes."""
+    gate = (ROOT / ".github/workflows/desktop-production.yml").read_text()
+    for name in ("builder-pin.json", "builder-attestation.json"):
+        assert f'"path": "inputs/{name}"' in gate
+        assert f'"source": "$output/{name}"' in gate
+    release = (ROOT / ".github/workflows/release-desktop.yml").read_text()
+    assert (
+        'cp -- "$output/builder-pin.json" "$output/builder-attestation.json" \\\n'
+        '            "$staged/builder/"'
+    ) in release

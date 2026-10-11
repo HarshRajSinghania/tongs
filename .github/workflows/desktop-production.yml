@@ -815,6 +815,16 @@ jobs:
                 "source": "$output/prepared/prepared-inputs.json"
               },
               {
+                "kind": "input",
+                "path": "inputs/builder-pin.json",
+                "source": "$output/builder-pin.json"
+              },
+              {
+                "kind": "input",
+                "path": "inputs/builder-attestation.json",
+                "source": "$output/builder-attestation.json"
+              },
+              {
                 "kind": "artifact",
                 "path": "artifacts/ALL-SHA256SUMS",
                 "source": "$output/ALL-SHA256SUMS",
