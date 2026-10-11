@@ -91,9 +91,9 @@ lines below** until tongs knows how long the file is.
 
 When the forge sends only part of a file's diff, or none of it, a notice above
 the file's rows says so, and the file header offers **Generate diff locally**.
-Pressing it downloads both versions of the file from the forge and builds the
-diff on your machine, with the same limits as the terminal app: 5 MiB or
-100,000 lines per version.
+Pressing it downloads the file's old and new versions, or one version for an
+added or deleted file, from the forge and builds the diff on your machine, with
+the same limits as the terminal app: 5 MiB or 100,000 lines per version.
 
 - While it runs, the notice shows its progress and a **Cancel** button.
   **Cancel** stops the work in the local service; press **Generate diff

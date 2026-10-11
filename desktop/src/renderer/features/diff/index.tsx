@@ -366,15 +366,21 @@ function DiffView({
   const [jumpError, setJumpError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [reload, setReload] = useState(0);
-  // Set when an expansion or a generation found the open diff gone and the
-  // diff was read again for it; any later Refresh or layout switch clears it.
-  const [reloaded, setReloaded] = useState(false);
+  // The snapshot an expansion or a generation found gone, so the diff was read
+  // again for it. The next expansion or generation that succeeds on a newer
+  // snapshot clears it, as does any later Refresh or layout switch.
+  const [reloadedFrom, setReloadedFrom] = useState<string | null>(null);
   // The toolbar's slot for the selected file's Full file toggle, which the
   // workspace below owns because it owns the file selection.
   const [fileTools, setFileTools] = useState<HTMLElement | null>(null);
-  const reloadExpired = useCallback(() => {
-    setReloaded(true);
+  const reloadExpired = useCallback((snapshotId: string) => {
+    setReloadedFrom(snapshotId);
     setReload((value) => value + 1);
+  }, []);
+  const contextSucceeded = useCallback((snapshotId: string) => {
+    setReloadedFrom((current) =>
+      current === null || current === snapshotId ? current : null,
+    );
   }, []);
   // The diff on screen and the Refresh it was read for. A layout switch
   // re-projects that same read in the sidecar; a Refresh reads the forge.
@@ -525,7 +531,7 @@ function DiffView({
         <button
           className={`button ${layout === "unified" ? "button-active" : "button-secondary"}`}
           onClick={() => {
-            setReloaded(false);
+            setReloadedFrom(null);
             setLayout("unified");
           }}
         >
@@ -534,7 +540,7 @@ function DiffView({
         <button
           className={`button ${layout === "split" ? "button-active" : "button-secondary"}`}
           onClick={() => {
-            setReloaded(false);
+            setReloadedFrom(null);
             setLayout("split");
           }}
         >
@@ -544,7 +550,7 @@ function DiffView({
           className="button button-secondary"
           disabled={loading}
           onClick={() => {
-            setReloaded(false);
+            setReloadedFrom(null);
             setReload((value) => value + 1);
           }}
         >
@@ -580,7 +586,9 @@ function DiffView({
         </Notice>
       )}
       {jumpError && <Notice kind="warning">{jumpError}</Notice>}
-      {reloaded && <Notice kind="warning">{DIFF_RELOADED_MESSAGE}</Notice>}
+      {reloadedFrom !== null && (
+        <Notice kind="warning">{DIFF_RELOADED_MESSAGE}</Notice>
+      )}
       {loaded && changesOverflow && (
         <Notice kind="warning">{CHANGES_OVERFLOW_NOTICE}</Notice>
       )}
@@ -595,6 +603,7 @@ function DiffView({
           reloadToken={reload}
           anchors={anchors}
           reloadExpired={reloadExpired}
+          contextSucceeded={contextSucceeded}
           fileTools={fileTools}
         />
       )}
@@ -886,6 +895,8 @@ class DiffContextStore {
     private readonly revision: ReviewRevisionDto,
     private readonly changed: () => void,
     private readonly expired: () => void,
+    /** Called when an expansion or a generation on this snapshot succeeds. */
+    private readonly succeeded: () => void,
   ) {}
 
   file(fileIndex: number): FileContextView {
@@ -928,6 +939,7 @@ class DiffContextStore {
       shown: withItem(now.shown, gap.gap_index),
       message: null,
     });
+    this.succeed();
   }
 
   /**
@@ -995,6 +1007,7 @@ class DiffContextStore {
       ),
       fullLoading: false,
     });
+    this.succeed();
   }
 
   /** Turns Full file off for a file the reader has left. */
@@ -1260,7 +1273,9 @@ class DiffContextStore {
       rows.some((row) => row.file_index !== fileIndex || row.kind === "gap")
     )
       return inconsistent();
+    if (!live()) return;
     settle({ state: "done", rows: Object.freeze(rows) });
+    this.succeed();
   }
 
   /** Stops a running generation through the bridge's cancel frame. */
@@ -1273,6 +1288,10 @@ class DiffContextStore {
     this.update(fileIndex, {
       generation: { state: "failed", message: GENERATION_CANCELLED_MESSAGE },
     });
+  }
+
+  private succeed(): void {
+    if (!this.closed) this.succeeded();
   }
 
   private update(fileIndex: number, patch: Partial<FileContextView>): void {
@@ -1400,6 +1419,7 @@ function DiffWorkspace({
   reloadToken,
   anchors,
   reloadExpired,
+  contextSucceeded,
   fileTools,
 }: {
   readonly bridge: DesktopBridge;
@@ -1414,7 +1434,9 @@ function DiffWorkspace({
   readonly reloadToken: number;
   readonly anchors: InlineAnchorStore;
   /** Reads the diff again, as Refresh does, after the sidecar dropped it. */
-  readonly reloadExpired: () => void;
+  readonly reloadExpired: (snapshotId: string) => void;
+  /** Called with the snapshot an expansion or a generation succeeded on. */
+  readonly contextSucceeded: (snapshotId: string) => void;
   /** The toolbar slot that holds the selected file's Full file toggle. */
   readonly fileTools: HTMLElement | null;
 }): ReactNode {
@@ -1437,7 +1459,8 @@ function DiffWorkspace({
         loaded.snapshotId,
         loaded.revision,
         () => setContextVersion((value) => value + 1),
-        reloadExpired,
+        () => reloadExpired(loaded.snapshotId),
+        () => contextSucceeded(loaded.snapshotId),
       ),
     [bridge, review, loaded.snapshotId],
   );

@@ -868,22 +868,29 @@ test("split view expands a gap into both panes with each side's numbers", async 
 
 // ---------------------------------------------------------------- expired
 
+/** Whether the "reloaded, try again" notice is on screen. */
+function showsReloaded(view) {
+  return texts(view, ".notice-warning").includes(DIFF_RELOADED_MESSAGE);
+}
+
 test("an expired diff takes the reload path and the gap can be expanded again", async () => {
   const review = "review-expired";
-  let expired = true;
+  const replies = [
+    () =>
+      settledRead({
+        status: "expired",
+        message: "This diff is no longer open. Reload it to continue.",
+        line_count: null,
+        rows: [],
+      }),
+    () =>
+      settledRead({ status: "not_found", message: null, line_count: null, rows: [] }),
+  ];
   const rows = (layout) => expandableRows(layout);
   const bridge = diffBridge(review, rows, {
     getDiffContext: (params) => {
-      if (expired) {
-        expired = false;
-        return settledRead({
-          status: "expired",
-          message: "This diff is no longer open. Reload it to continue.",
-          line_count: null,
-          rows: [],
-        });
-      }
-      return settledRead(contextReply(rows("unified"), params));
+      const next = replies.shift();
+      return next ? next(params) : settledRead(contextReply(rows("unified"), params));
     },
   });
   const view = renderDiff(review, bridge);
@@ -904,15 +911,82 @@ test("an expired diff takes the reload path and the gap can be expanded again", 
   await waitFor(() => assert.equal(gapTexts(view).length, 3));
   assert.equal(expandedLines(view).length, 0);
 
+  // A retry that fails on the new snapshot leaves the notice up.
+  clickText(view, ".diff-gap-button", "3 unchanged lines");
+  await waitFor(() =>
+    assert.deepEqual(warnings(view), [CONTEXT_STATUS_MESSAGES.not_found]),
+  );
+  assert.equal(showsReloaded(view), true);
+
+  // The next retry succeeds, so the notice no longer asks to try again.
   clickText(view, ".diff-gap-button", "3 unchanged lines");
   await waitFor(() => assert.equal(expandedLines(view).length, 3));
+  await waitFor(() => assert.deepEqual(texts(view, ".notice-warning"), []));
   assert.deepEqual(
     bridge.calls.context.map((call) => call.snapshot),
-    ["snapshot-1", "snapshot-2"],
+    ["snapshot-1", "snapshot-2", "snapshot-2"],
   );
-  // Refresh clears the notice.
+});
+
+test("Refresh clears the reloaded notice", async () => {
+  const review = "review-expired-refresh";
+  let expired = true;
+  const rows = (layout) => expandableRows(layout);
+  const bridge = diffBridge(review, rows, {
+    getDiffContext: (params) => {
+      if (expired) {
+        expired = false;
+        return settledRead({
+          status: "expired",
+          message: "This diff is no longer open. Reload it to continue.",
+          line_count: null,
+          rows: [],
+        });
+      }
+      return settledRead(contextReply(rows("unified"), params));
+    },
+  });
+  const view = renderDiff(review, bridge);
+  await waitFor(() => assert.equal(gapTexts(view).length, 3));
+  clickText(view, ".diff-gap-button", "3 unchanged lines");
+  await waitFor(() => assert.equal(bridge.calls.open.length, 2));
+  await waitFor(() => assert.equal(showsReloaded(view), true));
+
   fireEvent.click(view.getByText("Refresh"));
+  await waitFor(() => assert.equal(bridge.calls.open.length, 3));
   await waitFor(() => assert.deepEqual(texts(view, ".notice-warning"), []));
+});
+
+test("Full file on the reloaded snapshot clears the reloaded notice", async () => {
+  const review = "review-expired-full";
+  let expired = true;
+  const rows = (layout) => expandableRows(layout);
+  const bridge = diffBridge(review, rows, {
+    getDiffContext: (params) => {
+      if (expired) {
+        expired = false;
+        return settledRead({
+          status: "expired",
+          message: "This diff is no longer open. Reload it to continue.",
+          line_count: null,
+          rows: [],
+        });
+      }
+      return settledRead(contextReply(rows("unified"), params));
+    },
+  });
+  const view = renderDiff(review, bridge);
+  await waitFor(() => assert.equal(gapTexts(view).length, 3));
+  clickText(view, ".diff-gap-button", "3 unchanged lines");
+  await waitFor(() => assert.equal(bridge.calls.open.length, 2));
+  await waitFor(() => assert.equal(showsReloaded(view), true));
+  await waitFor(() => assert.equal(gapTexts(view).length, 3));
+
+  fireEvent.click(view.getByText("Full file"));
+  await waitFor(() => assert.equal(fullFileState(view).pressed, "true"));
+  // Every unchanged line of the 20-line file: 4 + 3 + 7.
+  await waitFor(() => assert.equal(expandedLines(view).length, 14));
+  assert.deepEqual(texts(view, ".notice-warning"), []);
 });
 
 // ---------------------------------------------------------------- generate
@@ -1079,7 +1153,7 @@ test("a refused or failed generation keeps the notice and says why", async () =>
       settledRead(
         generateFailure(
           "too_large",
-          "The generated diff is too large to show with the diffs already open.",
+          "The generated diff is too large to show with the other diffs already open. Close one and try again.",
         ),
       ),
     () =>
@@ -1106,7 +1180,7 @@ test("a refused or failed generation keeps the notice and says why", async () =>
 
   for (const reason of [
     "This file is binary, so there is no text diff to generate.",
-    "The generated diff is too large to show with the diffs already open.",
+    "The generated diff is too large to show with the other diffs already open. Close one and try again.",
     "This file is too large to generate locally (limit 5 MiB or 100,000 lines per version).",
     "Could not generate the diff. (The forge could not be reached.)",
   ]) {
@@ -1141,14 +1215,18 @@ test("a partly truncated file shows the notice above its hunks", async () => {
 
 test("an expired generation takes the reload path", async () => {
   const review = "review-generate-expired";
-  const bridge = diffBridge(review, (layout) => truncatedRows(layout), {
-    generateDiff: () =>
+  const replies = [
+    () =>
       settledRead(
         generateFailure(
           "expired",
           "This diff is no longer open. Reload it to continue.",
         ),
       ),
+    () => settledRead(generatedPage(review, generatedRows())),
+  ];
+  const bridge = diffBridge(review, (layout) => truncatedRows(layout), {
+    generateDiff: () => replies.shift()(),
   });
   const view = renderDiff(review, bridge);
   await waitFor(() => assert.equal(texts(view, ".file-generate").length, 1));
@@ -1159,5 +1237,20 @@ test("an expired generation takes the reload path", async () => {
       DIFF_RELOADED_MESSAGE,
       TRUNCATED_NOTICE,
     ]),
+  );
+
+  // Generating again on the reloaded snapshot succeeds and clears the notice.
+  fireEvent.click(view.getByText("Generate diff locally"));
+  await waitFor(() =>
+    assert.deepEqual(texts(view, ".diff-unified .line-content"), [
+      " kept",
+      "−removed",
+      "+added one",
+    ]),
+  );
+  assert.deepEqual(texts(view, ".notice-warning"), []);
+  assert.deepEqual(
+    bridge.calls.generate.map((call) => call.snapshot),
+    ["snapshot-1", "snapshot-2"],
   );
 });
