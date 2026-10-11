@@ -1,6 +1,6 @@
 const { contextBridge, ipcRenderer } = require("electron") as typeof import("electron");
 import type {
-  AcceptedResult, AssetDescriptor, CommitsResult, DesktopBridge, DesktopEvent,
+  AcceptedResult, AppearanceDto, AssetDescriptor, ColorScheme, CommitsResult, DesktopBridge, DesktopEvent,
   DesktopRead, DiffContextParams, DiffContextResult, DiffPage, DiffWireRow, DiscussionsPage,
   GenerateDiffParams, GenerateDiffResult, InvokePluginParams, JobsResult,
   JsonValue, ListPipelinesParams, ListReviewPipelinesParams, ListReviewsParams,
@@ -60,6 +60,8 @@ const IPC_CHANNELS = Object.freeze({
   listPlugins: "tongs:plugins.list", invokePlugin: "tongs:plugins.invoke", setLocation: "tongs:host.set-location", listAssets: "tongs:assets.list",
   cancelRead: "tongs:read.cancel", openExternal: "tongs:external.open", event: "tongs:event",
   serviceStatus: "tongs:service.status", getServiceStatus: "tongs:service.status.get",
+  appearance: "tongs:appearance", getAppearance: "tongs:appearance.get",
+  setColorScheme: "tongs:appearance.set-color-scheme",
 } as const);
 const CI_IPC_CHANNELS = Object.freeze({
   capabilities: "tongs:ci.capabilities",
@@ -185,6 +187,13 @@ const bridge: DesktopBridge = Object.freeze({
     return () => ipcRenderer.removeListener(IPC_CHANNELS.serviceStatus, wrapped);
   },
   openExternal: async (url: string): Promise<boolean> => await ipcRenderer.invoke(IPC_CHANNELS.openExternal, url) === true,
+  getAppearance: async (): Promise<AppearanceDto> => ipcRenderer.invoke(IPC_CHANNELS.getAppearance) as Promise<AppearanceDto>,
+  setColorScheme: async (choice: ColorScheme): Promise<AppearanceDto> => ipcRenderer.invoke(IPC_CHANNELS.setColorScheme, choice) as Promise<AppearanceDto>,
+  onAppearance: (listener: (appearance: AppearanceDto) => void): (() => void) => {
+    const wrapped = (_event: unknown, value: JsonValue): void => listener(value as unknown as AppearanceDto);
+    ipcRenderer.on(IPC_CHANNELS.appearance, wrapped);
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.appearance, wrapped);
+  },
   copyReviewUrl: async (review: string): Promise<CopyReviewUrlResult> => ipcRenderer.invoke(UTILITY_IPC_CHANNELS.copyReviewUrl, review) as Promise<CopyReviewUrlResult>,
   clearCache: async (): Promise<ClearCacheResult> => ipcRenderer.invoke(UTILITY_IPC_CHANNELS.clearCache, {}) as Promise<ClearCacheResult>,
   openJobLogInEditor: async (job: string): Promise<OpenJobLogEditorResult> => ipcRenderer.invoke(UTILITY_IPC_CHANNELS.openJobLogInEditor, job) as Promise<OpenJobLogEditorResult>,

@@ -23,7 +23,9 @@ The Diff tab has two panes:
 
 Press ++v++ to switch between unified and split view. Split view shows the old
 and new versions side by side with their lines aligned. Press ++h++ to move
-focus to the old side and ++l++ to move it to the new side.
+focus to the old side and ++l++ to move it to the new side. To open every diff
+in split view, set `diff_style = "split"` in the
+[`[ui]`](/reference/configuration/#ui) table.
 
 When the terminal is too narrow for split view, tongs uses unified view and
 tells you: "Split view selected; using unified at this width".
@@ -189,9 +191,11 @@ Press ++f2++ in the comment editor to continue the comment in an external
 editor. tongs moves the text to the editor and back when you save and close
 it.
 
-++f2++ and ++f3++ use `$VISUAL`, then `$EDITOR`, then the first of `nvim`,
-`vim`, `vi` and `nano` found on your `PATH`. ++f2++ is not available on
-Windows.
+++f2++ and ++f3++ use the `command` set in the
+[`[editor]`](/reference/configuration/#editor) table, then `$VISUAL`, then
+`$EDITOR`, then the first of `nvim`, `vim`, `vi` and `nano` found on your
+`PATH`. `external_editor_enabled = false` turns them off. They are not
+available on Windows.
 
 :::tip[Review drafts]
 While a review draft is open (++ctrl+g++), ++c++, ++r++ and ++f3++ add to the

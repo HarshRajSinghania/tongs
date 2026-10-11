@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.segment import Segment
 from rich.style import Style
 
+from tongs.config import DEFAULT_SYNTAX_THEME
 from tongs.forges.models import CIStatus
 from tongs.scanner.repo import ForgeType
 
@@ -64,38 +68,69 @@ _CI_STYLES = {
     CIStatus.UNKNOWN: ("?", Style(dim=True)),
 }
 
-_CI_MARKUP = {
-    CIStatus.SUCCESS: "[green]●[/]",
-    CIStatus.FAILED: "[red]●[/]",
-    CIStatus.RUNNING: "[yellow]▶[/]",
-    CIStatus.PENDING: "[dim]○[/]",
-    CIStatus.CANCELED: "[dim]—[/]",
-    CIStatus.SKIPPED: "[dim]—[/]",
-    CIStatus.UNKNOWN: "[dim]?[/]",
+# The ``[ui] ascii_mode`` labels: words instead of glyphs, same colours.
+_CI_ASCII = {
+    CIStatus.SUCCESS: "OK",
+    CIStatus.FAILED: "FAIL",
+    CIStatus.RUNNING: "RUN",
+    CIStatus.PENDING: "PEND",
+    CIStatus.CANCELED: "CANC",
+    CIStatus.SKIPPED: "SKIP",
+    CIStatus.UNKNOWN: "?",
 }
 
+CI_ASCII_WIDTH = max(len(label) for label in _CI_ASCII.values())
+"""The widest ASCII CI label, for lining up rows that start with one."""
 
-def ci_icon_text(status: CIStatus) -> tuple[str, Style]:
-    """Return (character, Style) for a CI status icon."""
-    return _CI_STYLES.get(status, ("?", Style(dim=True)))
+_CI_UNKNOWN = ("?", Style(dim=True))
 
 
-def ci_icon_markup(status: CIStatus) -> str:
-    """Return Rich markup string for a CI status icon."""
-    return _CI_MARKUP.get(status, "[dim]?[/]")
+def ci_icon_text(status: CIStatus, ascii_mode: bool = False) -> tuple[str, Style]:
+    """Return (character, Style) for a CI status icon, or its ASCII label."""
+    glyph, style = _CI_STYLES.get(status, _CI_UNKNOWN)
+    if ascii_mode:
+        return _CI_ASCII.get(status, "?"), style
+    return glyph, style
+
+
+def ci_icon_markup(status: CIStatus, ascii_mode: bool = False) -> str:
+    """Return Rich markup for a CI status icon, or its ASCII label."""
+    glyph, style = ci_icon_text(status, ascii_mode)
+    return f"[{style}]{glyph}[/]"
 
 
 def ci_icon(status: CIStatus, ascii_mode: bool = False) -> str:
     """Return a Rich markup CI status icon (or ASCII fallback)."""
-    if ascii_mode:
-        labels = {
-            CIStatus.SUCCESS: "[green]OK[/]",
-            CIStatus.FAILED: "[red]FAIL[/]",
-            CIStatus.RUNNING: "[yellow]RUN[/]",
-            CIStatus.PENDING: "[dim]PEND[/]",
-            CIStatus.CANCELED: "[dim]CANC[/]",
-            CIStatus.SKIPPED: "[dim]SKIP[/]",
-            CIStatus.UNKNOWN: "[dim]?[/]",
-        }
-        return labels.get(status, "[dim]?[/]")
-    return ci_icon_markup(status)
+    return ci_icon_markup(status, ascii_mode)
+
+
+# Glyphs Rich draws in Markdown even when it is told the output is ASCII.
+_MARKDOWN_ASCII = str.maketrans({"•": "*", "▌": "|", "🌆": "#", "…": "..."})
+
+
+def markdown_lines(
+    body: str,
+    width: int,
+    *,
+    ascii_mode: bool = False,
+    code_theme: str = DEFAULT_SYNTAX_THEME,
+) -> list[list[Segment]]:
+    """Render Markdown with Rich into lines of segments ``width`` cells wide.
+
+    With ``ascii_mode`` the headings, tables and rules use ASCII boxes and the
+    list bullets and quote bars become ``*`` and ``|``. Fenced code uses the
+    Pygments style ``code_theme``.
+    """
+    console = Console(width=80)
+    options = console.options.update_width(width)
+    markdown = Markdown(body, code_theme=code_theme)
+    if not ascii_mode:
+        return console.render_lines(markdown, options)
+    options.encoding = "ascii"
+    return [
+        [
+            Segment(segment.text.translate(_MARKDOWN_ASCII), segment.style)
+            for segment in line
+        ]
+        for line in console.render_lines(markdown, options)
+    ]

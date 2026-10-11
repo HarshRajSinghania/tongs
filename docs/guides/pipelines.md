@@ -76,9 +76,10 @@ with your credentials, and tongs cannot undo a cancel.
 ## Open a log in your editor
 
 ++f2++ hands the log to your editor, which helps with long logs or with
-comparing two runs side by side. tongs reads `$VISUAL`, then `$EDITOR`, and
-otherwise opens the first of `nvim`, `vim`, `vi`, `nano` or `less` it finds on
-your `PATH`:
+comparing two runs side by side. tongs starts the `command` set in the
+[`[editor]`](/reference/configuration/#editor) table, then `$VISUAL`, then
+`$EDITOR`, and otherwise the first of `nvim`, `vim`, `vi`, `nano` or `less` it
+finds on your `PATH`:
 
 ```bash title="~/.bashrc"
 # Open job logs and long comments in VS Code
@@ -86,8 +87,8 @@ export VISUAL="code --wait"
 ```
 
 tongs writes the log to a private temporary file, waits for the editor to
-exit, then deletes the file. The [`[editor]`](/reference/configuration/#editor)
-table in Configuration applies to the desktop app (beta) only.
+exit, then deletes the file. `external_editor_enabled = false` in the same
+table turns ++f2++ off.
 
 Every key on this page is also listed in the
 [keybindings reference](/reference/keybindings/#pipeline-tab).

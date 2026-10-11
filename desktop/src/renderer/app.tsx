@@ -19,6 +19,7 @@ import {
   type AppRoute,
   type FeatureContext,
 } from "./core/navigation.js";
+import { ColorSchemeToggle } from "./core/appearance.js";
 import { safeError } from "./core/presentation.js";
 import { QueryCoordinator } from "./core/query.js";
 import {
@@ -188,6 +189,7 @@ function App(): ReactNode {
               </button>
             );
           })}
+          <ColorSchemeToggle bridge={bridge} />
           <ServiceStatusLine model={serviceStatus} bridge={bridge} />
         </div>
       </header>

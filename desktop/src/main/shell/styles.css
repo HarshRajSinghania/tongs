@@ -257,6 +257,30 @@ button {
   align-items: center;
   gap: 8px;
 }
+/* The header's System / Light / Dark toggle (#226). */
+.color-scheme-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.color-scheme-toggle .button {
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.color-scheme-error {
+  color: var(--danger);
+  font-size: 12px;
+}
+/*
+ * The main process drives prefers-color-scheme through Electron's native
+ * theme; the root attribute also pins built-in controls and scrollbars.
+ */
+:root[data-color-scheme="light"] {
+  color-scheme: light;
+}
+:root[data-color-scheme="dark"] {
+  color-scheme: dark;
+}
 .app-layout {
   height: calc(100vh - 52px);
   display: grid;

@@ -32,6 +32,7 @@ const omittedBeforeIssue137 = new Set([
   "dist/src/shared/utilities.js",
 ]);
 const expectedRuntimeModules = [
+  "/dist/src/main/appearance.js",
   "/dist/src/main/assets.js",
   "/dist/src/main/ci.js",
   "/dist/src/main/index.js",

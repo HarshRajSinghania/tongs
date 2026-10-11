@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import test from "node:test";
 import {
+  configurationFailureMessage,
+  MAX_CONFIGURATION_MESSAGE,
   MAX_JSON_DEPTH,
   MAX_JSON_ITEMS,
   MAX_RESPONSE_BYTES,
   MIN_JSON_ITEMS,
+  SidecarError,
   SidecarTransport,
 } from "../../../desktop/dist/src/main/sidecar.js";
 import {
@@ -723,4 +726,57 @@ test("a service that keeps crashing is restarted three times, then left stopped"
   assert.equal(fake.children.length, 4);
   detach();
   await transport.stop();
+});
+
+test("an invalid config.toml fails startup with the service's own message", async () => {
+  const fake = harness({ autoHandshake: false });
+  const transport = transportFor(fake);
+  const starting = transport.start();
+  await until(() => fake.children[0]?.handshake !== undefined, "handshake");
+  const message =
+    "Invalid config file /home/me/.config/tongs/config.toml: [cache] mr_list_ttl must be a whole number, not a string.";
+  fake.children[0].stdout.write(
+    `${JSON.stringify({
+      v: 1,
+      type: "response",
+      id: fake.children[0].handshake.id,
+      error: {
+        code: "service_error",
+        message,
+        retryable: false,
+        details: { service_code: "configuration_invalid", operation: "start_session" },
+      },
+    })}\n`,
+  );
+  const failure = await starting.then(
+    () => null,
+    (error) => error,
+  );
+  assert.equal(failure?.code, "configuration_invalid");
+  assert.equal(failure?.message, message);
+  assert.equal(configurationFailureMessage(failure), message);
+  assert.equal(transport.serviceState, "stopped");
+});
+
+test("only a configuration failure has a startup message, cleaned and bounded", () => {
+  assert.equal(
+    configurationFailureMessage(new SidecarError("start_failed", "Could not start.")),
+    null,
+  );
+  assert.equal(configurationFailureMessage(new Error("configuration_invalid")), null);
+  assert.equal(configurationFailureMessage("configuration_invalid"), null);
+  assert.equal(
+    configurationFailureMessage(new SidecarError("configuration_invalid", " \n\t ")),
+    null,
+  );
+  assert.equal(
+    configurationFailureMessage(
+      new SidecarError("configuration_invalid", "Line one\nline two\u0007."),
+    ),
+    "Line one line two .",
+  );
+  const long = configurationFailureMessage(
+    new SidecarError("configuration_invalid", "x".repeat(MAX_CONFIGURATION_MESSAGE + 50)),
+  );
+  assert.equal(long?.length, MAX_CONFIGURATION_MESSAGE);
 });

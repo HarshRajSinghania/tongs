@@ -185,6 +185,45 @@ export interface ServiceStatusDto {
   readonly revision: number;
   readonly notices: readonly string[];
 }
+/**
+ * The desktop colour scheme (#226): follow the operating system, or force
+ * light or dark. `system` is the default of `[ui] color_scheme`.
+ */
+export type ColorScheme = "system" | "light" | "dark";
+export const COLOR_SCHEMES: readonly ColorScheme[] = Object.freeze(["system", "light", "dark"]);
+/** A choice the toggle saves; choosing `system` clears the saved choice. */
+export type SavedColorScheme = Exclude<ColorScheme, "system">;
+/**
+ * `configured` is `[ui] color_scheme` from config.toml. `saved` is the
+ * toggle's saved choice, or null when the window follows the configured value.
+ * `effective` is what applies: the saved choice when there is one, else the
+ * configured value. `revision` only grows, so a stale copy can be ignored.
+ */
+export interface AppearanceDto {
+  readonly configured: ColorScheme;
+  readonly saved: SavedColorScheme | null;
+  readonly effective: ColorScheme;
+  readonly revision: number;
+}
+
+export function isColorScheme(value: unknown): value is ColorScheme {
+  return typeof value === "string" && (COLOR_SCHEMES as readonly string[]).includes(value);
+}
+
+/** Whether `value` is an appearance whose fields agree with each other. */
+export function isAppearance(value: unknown): value is AppearanceDto {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const { configured, saved, effective, revision } = value as Record<string, unknown>;
+  return (
+    Object.keys(value).length === 4 &&
+    isColorScheme(configured) &&
+    (saved === null || saved === "light" || saved === "dark") &&
+    effective === (saved ?? configured) &&
+    Number.isSafeInteger(revision) &&
+    (revision as number) >= 0
+  );
+}
+
 export interface AssetDescriptor { readonly source: "core" | "plugin"; readonly asset_id: string; readonly plugin_id: string | null; readonly kind: string; readonly media_type: string; readonly byte_count: number; readonly sha256: string; readonly url: string; }
 export interface DesktopRead<T> { readonly requestToken: string; readonly result: Promise<T>; }
 
@@ -217,6 +256,10 @@ export interface DesktopBridge extends CIDesktopBridge, ReviewDesktopBridge, Wor
   getServiceStatus(): Promise<ServiceStatusDto>;
   onServiceStatus(listener: (status: ServiceStatusDto) => void): () => void;
   openExternal(url: string): Promise<boolean>;
+  getAppearance(): Promise<AppearanceDto>;
+  /** Saves `choice` and applies it at once; `system` clears the saved choice. */
+  setColorScheme(choice: ColorScheme): Promise<AppearanceDto>;
+  onAppearance(listener: (appearance: AppearanceDto) => void): () => void;
 }
 
 export const IPC_CHANNELS = Object.freeze({
@@ -230,6 +273,8 @@ export const IPC_CHANNELS = Object.freeze({
   invokePlugin: "tongs:plugins.invoke", setLocation: "tongs:host.set-location", listAssets: "tongs:assets.list",
   cancelRead: "tongs:read.cancel", openExternal: "tongs:external.open", event: "tongs:event",
   serviceStatus: "tongs:service.status", getServiceStatus: "tongs:service.status.get",
+  appearance: "tongs:appearance", getAppearance: "tongs:appearance.get",
+  setColorScheme: "tongs:appearance.set-color-scheme",
 } as const);
 
 /**

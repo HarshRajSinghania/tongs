@@ -9,7 +9,14 @@ import pytest
 from rich.style import Style
 
 from tongs.forges.models import CIStatus
-from tongs.helpers import ci_icon, ci_icon_text, format_duration, relative_time
+from tongs.helpers import (
+    CI_ASCII_WIDTH,
+    ci_icon,
+    ci_icon_markup,
+    ci_icon_text,
+    format_duration,
+    relative_time,
+)
 
 
 class TestCiIconRichMode:
@@ -61,6 +68,33 @@ class TestCiIconAsciiMode:
 def test_ci_icon_text_table(status: CIStatus, expected: tuple[str, Style]) -> None:
     """The pipeline and job rows draw from this table, not from the markup one."""
     assert ci_icon_text(status) == expected
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (CIStatus.SUCCESS, ("OK", Style(color="green"))),
+        (CIStatus.FAILED, ("FAIL", Style(color="red"))),
+        (CIStatus.RUNNING, ("RUN", Style(color="yellow"))),
+        (CIStatus.PENDING, ("PEND", Style(dim=True))),
+        (CIStatus.CANCELED, ("CANC", Style(dim=True))),
+        (CIStatus.SKIPPED, ("SKIP", Style(dim=True))),
+        (CIStatus.UNKNOWN, ("?", Style(dim=True))),
+    ],
+)
+def test_ci_icon_text_ascii_labels(
+    status: CIStatus, expected: tuple[str, Style]
+) -> None:
+    """The pipeline panel's ASCII labels match the inbox's, in the same colours."""
+    assert ci_icon_text(status, ascii_mode=True) == expected
+    assert ci_icon_markup(status, ascii_mode=True) == ci_icon(status, True)
+    assert len(expected[0]) <= CI_ASCII_WIDTH
+
+
+@pytest.mark.parametrize("status", list(CIStatus))
+def test_ci_icon_markup_matches_the_text_table(status: CIStatus) -> None:
+    glyph, style = ci_icon_text(status)
+    assert ci_icon_markup(status) == f"[{style}]{glyph}[/]" == ci_icon(status)
 
 
 _REFERENCE = datetime(2026, 1, 1, tzinfo=UTC)

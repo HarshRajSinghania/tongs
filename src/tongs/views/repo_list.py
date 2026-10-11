@@ -9,11 +9,12 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.reactive import reactive
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Input, Static
+from textual.widgets import DataTable, Footer, Input, Static
 
 from tongs.helpers import forge_label
 from tongs.scanner.repo import ForgeType, Repo
 from tongs.services.errors import ServiceError
+from tongs.widgets.ascii import tongs_header
 
 
 class RepoListScreen(Screen):
@@ -40,7 +41,7 @@ class RepoListScreen(Screen):
     search_text: reactive[str] = reactive("")
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield tongs_header(self.app)
         yield Input(
             placeholder="type to filter...",
             id="repo-search",

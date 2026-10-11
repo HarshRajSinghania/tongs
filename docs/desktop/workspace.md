@@ -278,6 +278,24 @@ response entries only. It does not delete durable review drafts or any other
 file of yours. If it fails, the notice reads **The shared API cache could not be
 cleared. Retry after reconnecting the local service.**
 
+## Colour scheme
+
+The application bar has a **System**, **Light** and **Dark** toggle. By
+default the desktop app follows your operating system's light or dark setting,
+or `[ui] color_scheme` when `config.toml` sets one.
+
+- **Light** or **Dark** applies at once, to the window and to its native
+  dialogs, and the app remembers it the next time it starts.
+- **System** clears that choice. The app then uses `color_scheme` in the
+  `[ui]` section of `config.toml`, which is `"system"` unless you set it to
+  `"light"` or `"dark"`. Hover over **System** to see which applies.
+
+The toggle saves its choice in `desktop-settings.json`, in the desktop app's
+own data folder, and never edits `config.toml`. If the choice cannot be saved,
+the toggle shows **The colour scheme could not be saved.** and the scheme stays
+as it was. See [`[ui]`](/reference/configuration/#ui) for the configuration
+key.
+
 ## Use installed plugins
 
 The sidebar also contains **Plugins**. Its refresh button, labelled **Refresh

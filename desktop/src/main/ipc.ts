@@ -11,6 +11,7 @@ import {
   type JsonObject,
   type JsonValue,
 } from "../shared/bridge.js";
+import type { AppearanceController } from "./appearance.js";
 import type { AssetCatalog } from "./assets.js";
 import {
   assertCIParams,
@@ -78,12 +79,16 @@ export class DesktopIpcController {
   private readonly bindings = new Map<string, Binding>();
   private eventListener: ((event: DesktopEvent) => void) | null = null;
   private serviceStatus: ServiceStatusPublisher | null = null;
+  private appearanceSubscription: (() => void) | null = null;
 
   constructor(
     private readonly window: BrowserWindow,
     private readonly transport: SidecarTransport,
     private readonly assets: AssetCatalog,
     private readonly utilities: WorkspaceUtilities,
+    // The manual native proofs build a controller without one; the toggle
+    // then reads nothing and the window follows the OS.
+    private readonly appearance: AppearanceController | null = null,
   ) {}
 
   register(): void {
@@ -153,6 +158,21 @@ export class DesktopIpcController {
     });
     serviceStatus.start();
     this.serviceStatus = serviceStatus;
+    const appearance = this.appearance;
+    if (appearance === null) return;
+    ipcMain.handle(IPC_CHANNELS.getAppearance, (event) => {
+      assertAuthorizedSender(event, this.window.webContents);
+      return appearance.current;
+    });
+    ipcMain.handle(IPC_CHANNELS.setColorScheme, (event, choice) => {
+      assertAuthorizedSender(event, this.window.webContents);
+      return appearance.choose(choice);
+    });
+    this.appearanceSubscription = appearance.onChange((current) => {
+      if (!this.window.isDestroyed()) {
+        this.window.webContents.send(IPC_CHANNELS.appearance, current);
+      }
+    });
   }
 
   reset(): void {
@@ -170,6 +190,8 @@ export class DesktopIpcController {
       IPC_CHANNELS.cancelRead,
       IPC_CHANNELS.openExternal,
       IPC_CHANNELS.getServiceStatus,
+      IPC_CHANNELS.getAppearance,
+      IPC_CHANNELS.setColorScheme,
       ...Object.values(UTILITY_IPC_CHANNELS),
     ]) {
       ipcMain.removeHandler(channel);
@@ -180,6 +202,8 @@ export class DesktopIpcController {
     this.eventListener = null;
     this.serviceStatus?.dispose();
     this.serviceStatus = null;
+    this.appearanceSubscription?.();
+    this.appearanceSubscription = null;
   }
 
   private async read(

@@ -32,8 +32,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     from tongs.app import TongsApp
     from tongs.config import load_config
+    from tongs.errors import ConfigError
 
-    config = load_config()
+    try:
+        config = load_config()
+    except ConfigError as error:
+        print(f"tongs: {error}", file=sys.stderr)
+        return 2
     if args.scan_root:
         config.scan_root = args.scan_root
 
