@@ -64,13 +64,27 @@ function fileRow(index, path) {
   };
 }
 
-function fileRows(fileIndex, layout) {
-  const line = {
+function fileRows(fileIndex, layout, count = 1) {
+  const sourceLine = (number) => ({
     old_line: null,
-    new_line: 1,
-    content: `value_${fileIndex} = ${fileIndex}`,
+    new_line: number,
+    content:
+      number === 1 ? `value_${fileIndex} = ${fileIndex}` : `line_${number}`,
     line_type: "addition",
-  };
+  });
+  const lineRows = Array.from({ length: count }, (_, offset) => {
+    const line = sourceLine(offset + 1);
+    return layout === "split"
+      ? {
+          kind: "split",
+          file_index: fileIndex,
+          hunk_index: 0,
+          row_index: offset,
+          old: null,
+          new: { ...line, anchor_side: "new" },
+        }
+      : { kind: "line", file_index: fileIndex, hunk_index: 0, ...line };
+  });
   return [
     fileRow(fileIndex, `src/file_${fileIndex}.py`),
     {
@@ -81,19 +95,10 @@ function fileRows(fileIndex, layout) {
       old_start: 0,
       old_count: 0,
       new_start: 1,
-      new_count: 1,
+      new_count: count,
       context_text: `hunk_${fileIndex}`,
     },
-    layout === "split"
-      ? {
-          kind: "split",
-          file_index: fileIndex,
-          hunk_index: 0,
-          row_index: 0,
-          old: null,
-          new: { ...line, anchor_side: "new" },
-        }
-      : { kind: "line", file_index: fileIndex, hunk_index: 0, ...line },
+    ...lineRows,
   ];
 }
 
@@ -136,7 +141,7 @@ function summary() {
  * A bridge whose diff has two files. `heads` names the head SHA each forge
  * read returns in turn; a layout switch re-projects the last one.
  */
-function viewedBridge(review, heads = ["head-1"]) {
+function viewedBridge(review, heads = ["head-1"], lineCount = 1) {
   const opens = [];
   let reads = 0;
   let head = heads[0];
@@ -171,7 +176,10 @@ function viewedBridge(review, heads = ["head-1"]) {
         revision: revisionAt(head),
         cursor: 0,
         next_cursor: null,
-        entries: [...fileRows(0, params.layout), ...fileRows(1, params.layout)],
+        entries: [
+          ...fileRows(0, params.layout, lineCount),
+          ...fileRows(1, params.layout),
+        ],
       });
     },
     pageDiff: () => {
@@ -565,6 +573,41 @@ test("a selection in a file that becomes viewed is dropped", async () => {
   assert.equal(selectedLineCount(view), 0);
   assert.equal(composerCount(view), 0);
 });
+
+for (const layout of ["unified", "split"]) {
+  test(`the Viewed checkbox stays reachable past the first window of ${layout} rows`, async () => {
+    const review = `review-viewed-window-${layout}`;
+    // A header, a hunk and 250 lines: two windows of up to 200 rows.
+    const view = renderDiff(review, viewedBridge(review, ["head-1"], 250));
+    await waitFor(() => assert.equal(lines(view).length, 198));
+    if (layout === "split") {
+      fireEvent.click(view.getByText("Split"));
+      await waitFor(() =>
+        assert.equal(
+          view.container.querySelectorAll(".diff-view.diff-split").length,
+          1,
+        ),
+      );
+      await waitFor(() =>
+        assert.equal(texts(view, ".split-pane-new .line-content").length, 198),
+      );
+    }
+    fireEvent.click(view.getByText("Next rows"));
+    await waitFor(() =>
+      assert.deepEqual(texts(view, ".window-position"), ["201-252 of 252"]),
+    );
+    // The window repeats the file's header, with its checkbox, above its rows.
+    assert.deepEqual(texts(view, ".diff-view .file-path").slice(-1), [
+      "src/file_0.py",
+    ]);
+    assert.equal(viewedBox(view).checked, false);
+
+    fireEvent.click(viewedBox(view));
+    assert.equal(viewedBox(view).checked, true);
+    assert.deepEqual(lines(view), []);
+    assert.deepEqual(progress(view), ["1 of 2 files viewed"]);
+  });
+}
 
 test("the viewed store keeps one revision per review and a bounded number of reviews", () => {
   const file = fileRow(0, "src/a.py");

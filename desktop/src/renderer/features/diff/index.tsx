@@ -1097,6 +1097,15 @@ function DiffRowsWindow({
   const boundedStart = Math.min(start, Math.max(0, items.length - 1));
   const end = Math.min(items.length, boundedStart + pageSize);
   const windowed = items.slice(boundedStart, end);
+  // The file header carries the Viewed checkbox and the file's counts, so a
+  // window past the first one repeats it above its rows. Each row is painted
+  // with its index in the file, which keys it.
+  const header =
+    boundedStart > 0 && items[0]?.kind === "file" ? items[0] : null;
+  const painted: readonly (readonly [DiffRow, number])[] = [
+    ...(header === null ? [] : [[header, 0] as const]),
+    ...windowed.map((row, offset) => [row, boundedStart + offset] as const),
+  ];
   // The card that spells the refusal out is chosen from the cards this window
   // actually paints, in the order the reader meets them. Choosing by stored
   // order instead let the sentence vanish whenever the file's first entry was
@@ -1115,9 +1124,9 @@ function DiffRowsWindow({
           {(["old", "new"] as const).map((side) => (
             <div className={`split-pane split-pane-${side}`} key={side}>
               <div className="split-pane-content" role="list">
-                {windowed.map((row, offset) => (
+                {painted.map(([row, index]) => (
                   <SplitPaneRow
-                    key={`${side}:${row.kind}:${row.file_index}:${"hunk_index" in row ? row.hunk_index : 0}:${boundedStart + offset}`}
+                    key={`${side}:${row.kind}:${row.file_index}:${"hunk_index" in row ? row.hunk_index : 0}:${index}`}
                     review={review}
                     loaded={loaded}
                     row={row}
@@ -1141,9 +1150,9 @@ function DiffRowsWindow({
         </div>
       ) : (
         <div className="windowed-items" role="list">
-          {windowed.map((row, offset) => (
+          {painted.map(([row, index]) => (
             <DiffRowView
-              key={`${row.kind}:${row.file_index}:${"hunk_index" in row ? row.hunk_index : 0}:${boundedStart + offset}`}
+              key={`${row.kind}:${row.file_index}:${"hunk_index" in row ? row.hunk_index : 0}:${index}`}
               review={review}
               loaded={loaded}
               row={row}
