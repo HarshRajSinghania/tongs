@@ -24,6 +24,8 @@
     "typescript": "7.0.2"
   },
   "dependencies": {
+    "highlight.js": "11.11.2",
+    "lowlight": "3.3.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "react-markdown": "10.1.0",

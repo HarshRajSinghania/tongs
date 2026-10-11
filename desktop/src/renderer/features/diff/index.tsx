@@ -78,6 +78,7 @@ import {
 } from "../review/thread.js";
 import { ReviewHeaderControls } from "../review/header.js";
 import { ReviewHeader } from "../review-detail/index.js";
+import { SyntaxContent, highlightFile, type FileSyntax } from "./syntax.js";
 
 const MAX_DIFF_PAGES = 1000;
 const MAX_DIFF_ROWS = 100_000;
@@ -964,6 +965,9 @@ function DiffRowsWindow({
     () => setStart(Math.max(0, Math.floor(targetIndex / pageSize) * pageSize)),
     [pageSize, targetIndex],
   );
+  // Highlighted once per file and remembered, so paging through the rows or
+  // selecting a line does not highlight the file again.
+  const syntax = useMemo(() => highlightFile(file, items), [file, items]);
   const boundedStart = Math.min(start, Math.max(0, items.length - 1));
   const end = Math.min(items.length, boundedStart + pageSize);
   const windowed = items.slice(boundedStart, end);
@@ -1000,6 +1004,7 @@ function DiffRowsWindow({
                     pending={pending}
                     explains={explains}
                     threads={threads}
+                    syntax={syntax}
                   />
                 ))}
               </div>
@@ -1022,6 +1027,7 @@ function DiffRowsWindow({
               pending={pending}
               explains={explains}
               threads={threads}
+              syntax={syntax}
             />
           ))}
         </div>
@@ -1131,6 +1137,7 @@ function DiffRowView({
   pending,
   explains,
   threads,
+  syntax,
 }: {
   readonly review: string;
   readonly loaded: LoadedDiff;
@@ -1143,6 +1150,7 @@ function DiffRowView({
   readonly pending: readonly PendingDraftEntry[];
   readonly explains: string | null;
   readonly threads: DiscussionThreadSlot;
+  readonly syntax: FileSyntax | null;
 }): ReactNode {
   if (row.kind === "file") {
     const path =
@@ -1290,7 +1298,7 @@ function DiffRowView({
           }
         >
           {marker(row.line_type)}
-          {row.content}
+          <SyntaxContent line={syntax?.get(row)} text={row.content} />
         </code>
       </div>
       {composerOpen && inline.anchor && (
@@ -1644,6 +1652,7 @@ function SplitPaneRow({
   pending,
   explains,
   threads,
+  syntax,
 }: {
   readonly review: string;
   readonly loaded: LoadedDiff;
@@ -1657,6 +1666,7 @@ function SplitPaneRow({
   readonly pending: readonly PendingDraftEntry[];
   readonly explains: string | null;
   readonly threads: DiscussionThreadSlot;
+  readonly syntax: FileSyntax | null;
 }): ReactNode {
   if (row.kind === "file")
     return (
@@ -1711,6 +1721,7 @@ function SplitPaneRow({
         selectAnchor={selectAnchor}
         inline={inline}
         drag={drag}
+        syntax={syntax}
       />
       {composerOpen &&
         inline.anchor &&
@@ -1833,6 +1844,7 @@ function SplitCell({
   selectAnchor,
   inline,
   drag,
+  syntax,
 }: {
   readonly review: string;
   readonly loaded: LoadedDiff;
@@ -1844,6 +1856,7 @@ function SplitCell({
   readonly selectAnchor: (selection: InlineAnchorSelection | null) => void;
   readonly inline: InlineComposerSlot;
   readonly drag: LineRangeDrag;
+  readonly syntax: FileSyntax | null;
 }): ReactNode {
   const cellNode = useRef<HTMLDivElement | null>(null);
   const selectable =
@@ -1955,7 +1968,7 @@ function SplitCell({
           />
           <code className="line-content">
             {marker(cell.line_type)}
-            {cell.content}
+            <SyntaxContent line={syntax?.get(cell)} text={cell.content} />
           </code>
         </>
       )}

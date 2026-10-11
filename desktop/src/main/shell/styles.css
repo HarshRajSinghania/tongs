@@ -19,6 +19,17 @@
   --addition: #123626;
   --deletion: #3e1d25;
   /*
+   * Diff syntax colours. Tokens set only a foreground colour, so the added,
+   * removed and selected line backgrounds always show through.
+   */
+  --syntax-keyword: #ff7b72;
+  --syntax-string: #a5d6ff;
+  --syntax-constant: #79c0ff;
+  --syntax-entity: #d2a8ff;
+  --syntax-variable: #ffa657;
+  --syntax-tag: #7ee787;
+  --syntax-comment: #8b949e;
+  /*
    * The only monospace stack a token, rather than a literal font-family list,
    * ever names (the review drawer's file names and footer). Declared here so
    * that a var() referencing it resolves to something instead of silently
@@ -1109,6 +1120,62 @@ button {
   color: var(--muted);
   font-style: italic;
 }
+/*
+ * Diff syntax tokens (highlight.js class names). Each rule sets the
+ * foreground colour and nothing else, so the line backgrounds win.
+ */
+.line-content .hljs-keyword,
+.line-content .hljs-doctag,
+.line-content .hljs-template-tag,
+.line-content .hljs-template-variable,
+.line-content .hljs-type,
+.line-content .hljs-selector-tag {
+  color: var(--syntax-keyword);
+}
+.line-content .hljs-string,
+.line-content .hljs-regexp,
+.line-content .hljs-char {
+  color: var(--syntax-string);
+}
+.line-content .hljs-number,
+.line-content .hljs-literal,
+.line-content .hljs-attr,
+.line-content .hljs-attribute,
+.line-content .hljs-property,
+.line-content .hljs-operator,
+.line-content .hljs-selector-attr,
+.line-content .hljs-selector-class,
+.line-content .hljs-selector-id,
+.line-content .hljs-meta {
+  color: var(--syntax-constant);
+}
+.line-content .hljs-title,
+.line-content .hljs-section {
+  color: var(--syntax-entity);
+}
+.line-content .hljs-built_in,
+.line-content .hljs-variable,
+.line-content .hljs-symbol {
+  color: var(--syntax-variable);
+}
+.line-content .hljs-name,
+.line-content .hljs-selector-pseudo,
+.line-content .hljs-bullet {
+  color: var(--syntax-tag);
+}
+.line-content .hljs-comment,
+.line-content .hljs-quote {
+  color: var(--syntax-comment);
+}
+.line-content .hljs-addition {
+  color: var(--success);
+}
+.line-content .hljs-deletion {
+  color: var(--danger);
+}
+.line-content .hljs-subst {
+  color: var(--text);
+}
 .split-panes {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
@@ -1561,6 +1628,13 @@ button {
     --warning: #8a5a00;
     --addition: #dcfce7;
     --deletion: #fee2e2;
+    --syntax-keyword: #cf222e;
+    --syntax-string: #0a3069;
+    --syntax-constant: #0550ae;
+    --syntax-entity: #8250df;
+    --syntax-variable: #953800;
+    --syntax-tag: #116329;
+    --syntax-comment: #6e7781;
   }
   .button:hover,
   .button:focus-visible,
