@@ -43,7 +43,7 @@ export function assertParams(method: string, value: unknown): asserts value is J
     "reviews.get": { required: ["review"] }, "discussions.list": { required: ["review"] },
     "reviews.ci_status": { required: ["review"], optional: ["fresh"] },
     "commits.list": { required: ["review"] }, "jobs.list": { required: ["pipeline"] },
-    "diff.open": { required: ["review"], optional: ["layout", "max_items"] },
+    "diff.open": { required: ["review"], optional: ["layout", "max_items", "from_snapshot"] },
     "logs.open": { required: ["job"], optional: ["max_items"] },
     "diff.page": { required: ["snapshot", "resource", "cursor"], optional: ["max_items"] },
     "discussions.page": { required: ["snapshot", "resource", "cursor"], optional: ["max_items"] },
@@ -62,6 +62,9 @@ export function assertParams(method: string, value: unknown): asserts value is J
     if (method === "reviews.list" && key === "cursor") {
       // An opaque cursor the service sealed; the service rejects forged ones.
       if (item !== null && (typeof item !== "string" || !/^[A-Za-z0-9._-]{1,64}$/.test(item))) throw new Error("Invalid desktop cursor parameter");
+    } else if (method === "diff.open" && key === "from_snapshot") {
+      // The snapshot id a diff open issued, for a layout switch that reuses it.
+      if (typeof item !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(item)) throw new Error("Invalid desktop snapshot parameter");
     } else if ((method === "reviews.list" || method === "reviews.ci_status") && key === "fresh") {
       // An explicit refresh that reads past the service's list cache.
       if (typeof item !== "boolean") throw new Error("Invalid desktop boolean parameter");
@@ -231,7 +234,7 @@ function assertDiscussionsPage(value: unknown): void {
 function assertDiffRow(value: unknown): void {
   if (!isRecord(value) || typeof value.kind !== "string") throw new Error("Invalid diff row");
   const common = ["kind", "file_index"];
-  if (value.kind === "file") { assertKeys(value, [...common, "old_path", "new_path", "status", "additions", "deletions", "is_binary", "language", "is_truncated", "is_empty", "is_mode_only", "is_rename_only", "is_unavailable"]); integer(value.file_index, 0, "file_index"); for (const key of ["old_path", "new_path", "status"] as const) text(value[key], MAX_TEXT, key); integer(value.additions, 0, "additions"); integer(value.deletions, 0, "deletions"); for (const key of ["is_binary", "is_truncated", "is_empty", "is_mode_only", "is_rename_only", "is_unavailable"] as const) bool(value[key], key); nullableText(value.language, "language"); return; }
+  if (value.kind === "file") { assertKeys(value, [...common, "old_path", "new_path", "status", "additions", "deletions", "is_binary", "language", "is_truncated", "is_empty", "is_mode_only", "is_rename_only", "is_unavailable", "old_mode", "new_mode"]); integer(value.file_index, 0, "file_index"); for (const key of ["old_path", "new_path", "status"] as const) text(value[key], MAX_TEXT, key); integer(value.additions, 0, "additions"); integer(value.deletions, 0, "deletions"); for (const key of ["is_binary", "is_truncated", "is_empty", "is_mode_only", "is_rename_only", "is_unavailable"] as const) bool(value[key], key); nullableText(value.language, "language"); for (const key of ["old_mode", "new_mode"] as const) nullableText(value[key], key); return; }
   if (value.kind === "hunk") { assertKeys(value, [...common, "hunk_index", "header", "old_start", "old_count", "new_start", "new_count", "context_text"]); for (const key of ["file_index", "hunk_index", "old_start", "old_count", "new_start", "new_count"] as const) integer(value[key], 0, key); text(value.header, MAX_TEXT, "header"); if (typeof value.context_text !== "string") fail("context_text", "must be text"); return; }
   if (value.kind === "line") { assertKeys(value, [...common, "hunk_index", "old_line", "new_line", "content", "line_type"]); integer(value.file_index, 0, "file_index"); integer(value.hunk_index, 0, "hunk_index"); numberOrNull(value.old_line, "old_line"); numberOrNull(value.new_line, "new_line"); if (typeof value.content !== "string") fail("content", "must be text"); text(value.line_type, MAX_TEXT, "line_type"); return; }
   if (value.kind === "split") {

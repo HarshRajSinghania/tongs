@@ -17,7 +17,12 @@ from typing import Protocol, Self, TypeVar, cast
 from tongs.cache.store import CacheStore
 from tongs.config import Config, load_config
 from tongs.errors import PartialResultsError, RateLimitError
-from tongs.forges.base import ForgeClient, read_mr_ci_status, read_mr_page
+from tongs.forges.base import (
+    ForgeClient,
+    read_mr_ci_status,
+    read_mr_page,
+    read_mr_revision,
+)
 from tongs.forges.models import (
     CIStatus,
     Commit,
@@ -197,7 +202,7 @@ class ApplicationSession:
         self._shutdown_error: ServiceError | None = None
         self._review_mutations = ReviewMutationService(
             get_client=self._client_for_review,
-            get_review=self.get_review,
+            get_review=self._get_review_revision,
             get_diff=self.get_raw_diff,
             get_discussions=self.get_discussions,
             emit_change=self.emit_change,
@@ -205,7 +210,7 @@ class ApplicationSession:
         self._review_submissions = ReviewSubmissionService(
             store=self._draft_store,
             mutations=self._review_mutations,
-            get_review=self.get_review,
+            get_review=self._get_review_revision,
         )
         self._ci_mutations = CIMutationService(
             get_client=self._client_for_repository,
@@ -215,7 +220,7 @@ class ApplicationSession:
         )
         self._mr_actions = MRActionService(
             get_client=self._client_for_review,
-            get_review=self.get_review,
+            get_review=self._get_review_revision,
             emit_change=self.emit_change,
         )
 
@@ -868,9 +873,29 @@ class ApplicationSession:
 
     async def get_review(self, ref: ReviewRef) -> ReviewSnapshot:
         """Read review detail and bind it to complete revision metadata."""
+        return await self._read_review(ref, revision_only=False)
+
+    async def _get_review_revision(self, ref: ReviewRef) -> ReviewSnapshot:
+        """Read the review resource alone for the mutation revision guards.
+
+        The snapshot's detail carries no CI status or approvals, so it serves
+        revision, state, branch and capability checks only and never display.
+        """
+        return await self._read_review(ref, revision_only=True)
+
+    async def _read_review(
+        self, ref: ReviewRef, *, revision_only: bool
+    ) -> ReviewSnapshot:
         client = await self._client_for_review(ref, "get_review")
         try:
-            detail = await client.get_mr_fresh(ref.repository.project_path, ref.number)
+            if revision_only:
+                detail = await read_mr_revision(
+                    client, ref.repository.project_path, ref.number
+                )
+            else:
+                detail = await client.get_mr_fresh(
+                    ref.repository.project_path, ref.number
+                )
             self._require_started()
             self._validate_detail(detail, ref)
             capabilities = self._capabilities(client)
@@ -899,11 +924,16 @@ class ApplicationSession:
             ) from None
 
     async def get_raw_diff(self, ref: ReviewRef) -> RawDiffSnapshot:
-        """Read fresh raw changes and prove the complete revision stayed stable."""
+        """Read fresh raw changes and prove the complete revision stayed stable.
+
+        The guards read the review resource alone, once before the diff
+        pages and once after them, so a diff costs its pages plus two review
+        requests.
+        """
         client = await self._client_for_review(ref, "get_raw_diff")
         try:
-            before_detail = await client.get_mr_fresh(
-                ref.repository.project_path, ref.number
+            before_detail = await read_mr_revision(
+                client, ref.repository.project_path, ref.number
             )
             self._require_started()
             self._validate_detail(before_detail, ref)
@@ -912,8 +942,8 @@ class ApplicationSession:
                 ref.repository.project_path, ref.number
             )
             self._require_started()
-            after_detail = await client.get_mr_fresh(
-                ref.repository.project_path, ref.number
+            after_detail = await read_mr_revision(
+                client, ref.repository.project_path, ref.number
             )
             self._require_started()
             self._validate_detail(after_detail, ref)

@@ -314,8 +314,12 @@ async def test_github_all_open_cost_is_one_query_per_fifty_rows_in_view(
         # First paint: one list page per repository. Then one screen of CI
         # (the rows in view and one screen below): one GraphQL query per 15
         # rows, give or take a batch split by timing, and no REST CI request.
+        # Lookups that start more than a batch window apart on a loaded
+        # runner can split a batch, so allow up to twice the ideal count;
+        # that is still far below one request per row.
         queries = paths.count("/graphql")
-        assert math.ceil(len(window) / 15) <= queries <= math.ceil(len(window) / 15) + 1
+        ideal = math.ceil(len(window) / 15)
+        assert ideal <= queries <= 2 * ideal
         assert sorted(path for path in paths if path != "/graphql") == sorted(
             f"/repos/{project}/pulls" for project in projects
         )

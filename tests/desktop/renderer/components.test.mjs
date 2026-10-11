@@ -213,10 +213,88 @@ test("every sandbox diff shape renders from the captured wire page", async () =>
           [badge],
           `${key} ${file}`,
         );
+        // Only GitLab reports modes, and only its chmod changes one.
+        assert.equal(
+          header.querySelector(".file-mode")?.textContent ?? null,
+          key === "gitlab_unified_page" && file === "src/tool.sh"
+            ? "mode 100644 -> 100755"
+            : null,
+          `${key} ${file} mode`,
+        );
       });
     }
     view.unmount();
   }
+});
+
+test("a GitLab chmod shows its mode change in both diff layouts", async () => {
+  const chmodPage = (layout) => {
+    const page = diffPage(layout);
+    return {
+      ...page,
+      entries: [
+        { ...page.entries[0], old_mode: "100644", new_mode: "100755" },
+        ...page.entries.slice(1),
+      ],
+    };
+  };
+  const layouts = [];
+  const bridge = baseBridge({
+    openDiff: (params) => {
+      layouts.push(params.layout);
+      return read(chmodPage(params.layout));
+    },
+    pageDiff: () => {
+      throw new Error("no next page");
+    },
+  });
+  const feature = createDiffFeature();
+  const view = render(
+    feature.render(featureContext(bridge), {
+      kind: "review",
+      item: reviewItem(),
+      panel: "diff",
+    }),
+  );
+  const modes = (selector) =>
+    [...view.container.querySelectorAll(`${selector} .diff-file .file-mode`)].map(
+      (node) => node.textContent,
+    );
+  await waitFor(() =>
+    assert.deepEqual(modes(".diff-unified"), ["mode 100644 -> 100755"]),
+  );
+  fireEvent.click(view.getByText("Split"));
+  await waitFor(() =>
+    assert.deepEqual(modes(".diff-split"), [
+      "mode 100644 -> 100755",
+      "mode 100644 -> 100755",
+    ]),
+  );
+  assert.equal(layouts[0], "unified");
+});
+
+test("a file with no reported mode shows no mode in its header", async () => {
+  const bridge = baseBridge({
+    openDiff: (params) => read(diffPage(params.layout)),
+    pageDiff: () => {
+      throw new Error("no next page");
+    },
+  });
+  const feature = createDiffFeature();
+  const view = render(
+    feature.render(featureContext(bridge), {
+      kind: "review",
+      item: reviewItem(),
+      panel: "diff",
+    }),
+  );
+  await waitFor(() =>
+    assert.equal(
+      view.container.querySelector(".diff-file .file-path")?.textContent,
+      "src/tongs/services/__init__.py",
+    ),
+  );
+  assert.equal(view.container.querySelectorAll(".file-mode").length, 0);
 });
 
 test("diff anchor selection keeps full immutable identity across layouts", async () => {
@@ -579,6 +657,8 @@ function diffPage(layout) {
     is_mode_only: false,
     is_rename_only: false,
     is_unavailable: false,
+    old_mode: null,
+    new_mode: null,
   };
   const hunk = {
     kind: "hunk",

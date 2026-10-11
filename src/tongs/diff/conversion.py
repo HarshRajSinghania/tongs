@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 from tongs.diff.models import DiffFile, DiffHunk, FileStatus, LineType
-from tongs.diff.parser import _detect_language, parse_diff
+from tongs.diff.parser import _detect_language, is_file_mode, parse_diff
 
 # Suffixes whose content a unified diff cannot show as reviewable text.  The
 # probe that uses this set applies only where the forge withheld both the patch
@@ -134,6 +134,7 @@ def _convert_change(change: Mapping[str, object]) -> DiffFile:
         "collapsed",
     )
     mode_only_value = _first_bool(change, "is_mode_only", "mode_only", "mode_changed")
+    old_mode, new_mode = _modes(change, parsed_file)
 
     parsed_additions = parsed_file.additions if parsed_file else 0
     parsed_deletions = parsed_file.deletions if parsed_file else 0
@@ -173,7 +174,9 @@ def _convert_change(change: Mapping[str, object]) -> DiffFile:
         mode_only_value is True
         or (
             mode_only_value is None
-            and _modes_differ(change)
+            and old_mode is not None
+            and new_mode is not None
+            and old_mode != new_mode
             and status in (FileStatus.MODIFIED, FileStatus.RENAMED)
         )
     ) and not has_hunks
@@ -279,6 +282,8 @@ def _convert_change(change: Mapping[str, object]) -> DiffFile:
         is_mode_only=is_mode_only,
         is_rename_only=is_rename_only,
         is_unavailable=is_unavailable,
+        old_mode=old_mode,
+        new_mode=new_mode,
     )
 
 
@@ -344,7 +349,9 @@ def _parse_patch(patch: str) -> list[DiffFile]:
     new_header = "__tongs_new__"
     clean_patch = patch.rstrip("\n")
     text = f"--- a/{old_header}\n+++ b/{new_header}\n{clean_patch}"
-    return parse_diff(text)
+    # The placeholder names have no language; the caller detects it from the
+    # real path, so the parser skips a lookup that could only miss.
+    return parse_diff(text, detect_language=False)
 
 
 def _json_count(value: object) -> int | None:
@@ -355,10 +362,27 @@ def _json_count(value: object) -> int | None:
     return None
 
 
-def _modes_differ(change: Mapping[str, object]) -> bool:
-    old_mode = _string(change.get("a_mode")) or _string(change.get("old_mode"))
-    new_mode = _string(change.get("b_mode")) or _string(change.get("new_mode"))
-    return old_mode is not None and new_mode is not None and old_mode != new_mode
+def _modes(
+    change: Mapping[str, object], parsed_file: DiffFile | None
+) -> tuple[str | None, str | None]:
+    """Read the file modes the forge reports, else the ones the patch states.
+
+    GitLab sends ``a_mode``/``b_mode`` on every file and ``"0"`` for the side
+    that does not exist; that, an empty value or anything that is not an
+    octal mode reads as no mode.  GitHub's files endpoint sends neither.
+    """
+    old_mode = _mode(change.get("a_mode")) or _mode(change.get("old_mode"))
+    new_mode = _mode(change.get("b_mode")) or _mode(change.get("new_mode"))
+    if old_mode is None and new_mode is None and parsed_file is not None:
+        return _mode(parsed_file.old_mode), _mode(parsed_file.new_mode)
+    return old_mode, new_mode
+
+
+def _mode(value: object) -> str | None:
+    """A forge mode of any shape but an octal git mode is dropped, not shown."""
+    if not isinstance(value, str) or not is_file_mode(value):
+        return None
+    return value if value.strip("0") else None
 
 
 def _reports_no_line_change(change: Mapping[str, object]) -> bool:

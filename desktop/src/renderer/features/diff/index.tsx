@@ -144,6 +144,22 @@ export interface LoadedDiff {
   readonly revision: DiffPage["revision"];
   readonly rows: readonly DiffRow[];
   readonly partialError: RendererReadError | null;
+  /**
+   * True while the rows are the pages read so far and more are on the way.
+   * The diff is drawn from its first page, and anything that would give up on
+   * a row the diff does not hold yet waits for the rest instead.
+   */
+  readonly loadingMore?: boolean;
+}
+
+export interface LoadDiffOptions {
+  /**
+   * A diff snapshot already open for this review. The sidecar projects that
+   * same read again, so a layout switch makes no forge request.
+   */
+  readonly fromSnapshot?: string | undefined;
+  /** Called with the rows read so far, after the first page and each later one. */
+  readonly onProgress?: (loaded: LoadedDiff) => void;
 }
 
 export function createDiffFeature(): FeatureContribution {
@@ -201,6 +217,12 @@ function DiffView({
   const [jumpError, setJumpError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [reload, setReload] = useState(0);
+  // The diff on screen and the Refresh it was read for. A layout switch
+  // re-projects that same read in the sidecar; a Refresh reads the forge.
+  const shown = useRef<{
+    readonly loaded: LoadedDiff;
+    readonly reload: number;
+  } | null>(null);
   // The review detail carries the forge's truncation flag. It is read beside
   // the diff, and a failed or older read simply shows no banner: the flag is
   // optional on the wire and absent means a complete list.
@@ -217,12 +239,32 @@ function DiffView({
   const changesOverflow = detail.value?.detail.changes_overflow === true;
   useEffect(() => {
     let current = true;
+    let partial: LoadedDiff | null = null;
+    const previous = shown.current;
+    const fromSnapshot =
+      previous !== null &&
+      previous.reload === reload &&
+      previous.loaded.resource === route.item.handle &&
+      previous.loaded.layout !== layout
+        ? previous.loaded.snapshotId
+        : undefined;
+    const show = (value: LoadedDiff): void => {
+      shown.current = { loaded: value, reload };
+      setLoaded(value);
+    };
     setLoading(true);
     setError(null);
-    void loadAllPages(route.item.handle, layout, bridge, queries)
+    void loadAllPages(route.item.handle, layout, bridge, queries, {
+      fromSnapshot,
+      onProgress: (value) => {
+        if (!current) return;
+        partial = value;
+        show(value);
+      },
+    })
       .then((value) => {
         if (current) {
-          setLoaded(value);
+          show(value);
           setError(value.partialError);
           setLoading(false);
         }
@@ -230,7 +272,26 @@ function DiffView({
       .catch((reason: unknown) => {
         if (current) {
           if (invalidatesSelection(reason)) selectInlineAnchor(null);
-          setError(reason);
+          // A layout switch can stop the previous layout mid-paging; its
+          // drawn pages are then still on screen waiting for the rest.
+          const drawn =
+            partial ??
+            (shown.current?.loaded.loadingMore ? shown.current.loaded : null);
+          if (drawn === null) {
+            setError(reason);
+          } else {
+            // The pages already drawn stay, as a bounded partial snapshot
+            // that names why the rest is missing.
+            const stopped = partialFailure(reason);
+            show(
+              Object.freeze({
+                ...drawn,
+                loadingMore: false,
+                partialError: stopped,
+              }),
+            );
+            setError(stopped);
+          }
           setLoading(false);
         }
       });
@@ -249,7 +310,7 @@ function DiffView({
     if (target) {
       setJumpError(null);
       selectInlineAnchor(target);
-    } else {
+    } else if (!loaded.loadingMore) {
       setJumpError(
         "This discussion location is unavailable in the displayed revision. Refresh the diff or open the discussion on the forge.",
       );
@@ -307,7 +368,11 @@ function DiffView({
       </div>
       {loading && (
         <Notice kind="loading">
-          {loaded ? "Refreshing diff…" : "Loading source diff…"}
+          {loaded?.loadingMore
+            ? "Loading the rest of the diff…"
+            : loaded
+              ? "Refreshing diff…"
+              : "Loading source diff…"}
         </Notice>
       )}
       {Boolean(error) && (
@@ -342,10 +407,16 @@ export async function loadAllPages(
   layout: DiffLayout,
   bridge: DesktopBridge,
   queries: QueryCoordinator,
+  options: LoadDiffOptions = {},
 ): Promise<LoadedDiff> {
   const key = `diff:${review}`;
+  const { fromSnapshot, onProgress } = options;
   const first = await queries.run(key, () =>
-    bridge.openDiff({ review, layout, max_items: 1000 }),
+    bridge.openDiff(
+      fromSnapshot === undefined
+        ? { review, layout, max_items: 1000 }
+        : { review, layout, max_items: 1000, from_snapshot: fromSnapshot },
+    ),
   );
   if (first.cursor !== 0)
     throw invalidPage("The first diff page did not start at cursor zero.");
@@ -361,6 +432,8 @@ export async function loadAllPages(
   let page = first;
   let pageCount = 1;
   while (page.next_cursor !== null) {
+    // Draw what is read so far before asking for the next page.
+    onProgress?.(loadedDiff(layout, first, [...rows], null, true));
     if (pageCount >= MAX_DIFF_PAGES || rows.length >= MAX_DIFF_ROWS)
       return loadedDiff(
         layout,
@@ -408,6 +481,7 @@ function loadedDiff(
   first: DiffPage,
   rows: readonly DiffRow[],
   partialError: RendererReadError | null,
+  loadingMore = false,
 ): LoadedDiff {
   return Object.freeze({
     layout,
@@ -416,7 +490,17 @@ function loadedDiff(
     revision: first.revision,
     rows: Object.freeze(rows),
     partialError,
+    loadingMore,
   });
+}
+
+/** The failure that stopped a diff after some of its pages were drawn. */
+function partialFailure(reason: unknown): RendererReadError {
+  if (reason instanceof RendererReadError) return reason;
+  const failure = serviceErrorOf(reason);
+  return failure === null
+    ? new RendererReadError("unreported", "", false)
+    : new RendererReadError(failure.code, failure.message, failure.retryable);
 }
 
 function assertNextCursor(page: DiffPage): void {
@@ -511,15 +595,19 @@ function DiffWorkspace({
     setComposerAnchor(null);
     setEditingEntry(null);
   }, [composerAnchor, loaded, review]);
+  // A new snapshot starts at its first file. The pages that arrive after the
+  // first one only append rows, so they leave the reader where they are.
   useEffect(() => {
     setSelected(files[0]?.file_index ?? 0);
     setTarget(0);
-  }, [files]);
+  }, [loaded.snapshotId]);
   useEffect(() => {
     if (!selection) return;
     const rebound = rebindInlineAnchor(selection, review, loaded);
-    if (!rebound) selectAnchor(null);
-    else if (!sameAnchorIdentity(selection, rebound)) selectAnchor(rebound);
+    if (!rebound) {
+      // The row may be on a page that has not arrived yet.
+      if (!loaded.loadingMore) selectAnchor(null);
+    } else if (!sameAnchorIdentity(selection, rebound)) selectAnchor(rebound);
   }, [loaded, review, selectAnchor, selection]);
   useEffect(() => {
     if (!selection || selection.review !== review) return;
@@ -591,7 +679,8 @@ function DiffWorkspace({
           })
         : null;
       if (!resolved) {
-        takePendingEdit(review);
+        // The entry's line may be on a page that has not arrived yet.
+        if (!loaded.loadingMore) takePendingEdit(review);
         return;
       }
       takePendingEdit(review);
@@ -1022,6 +1111,7 @@ function DiffRowView({
       <header className="diff-file" role="listitem">
         <strong className="file-path">{path}</strong>
         <span className="file-status">{row.status}</span>
+        <FileMode file={row} />
         <FileBadges file={row} />
         <PendingFileCount pending={pending} file={row} />
         <ThreadFileCount threads={threads} file={row} />
@@ -1533,6 +1623,7 @@ function SplitPaneRow({
           {side === "old" ? row.old_path : row.new_path}
         </strong>
         <span className="file-status">{row.status}</span>
+        <FileMode file={row} />
         <FileBadges file={row} />
         {side === "new" && <PendingFileCount pending={pending} file={row} />}
         {side === "new" && <ThreadFileCount threads={threads} file={row} />}
@@ -1663,6 +1754,20 @@ const FILE_BADGES: ReadonlyArray<
     "The forge sent no diff content for this file and did not report whether it is a binary or a mode-only change.",
   ],
 ];
+
+// GitLab and git patches report file modes; GitHub's files endpoint does not,
+// so its rows carry null and show nothing here.
+function fileModeChange(file: DiffFileRow): string {
+  const oldMode = file.old_mode ?? null;
+  const newMode = file.new_mode ?? null;
+  if (oldMode === null || newMode === null || oldMode === newMode) return "";
+  return `mode ${oldMode} -> ${newMode}`;
+}
+
+function FileMode({ file }: { readonly file: DiffFileRow }): ReactNode {
+  const change = fileModeChange(file);
+  return change ? <span className="file-status file-mode">{change}</span> : null;
+}
 
 function FileBadges({ file }: { readonly file: DiffFileRow }): ReactNode {
   return FILE_BADGES.map(
@@ -2206,6 +2311,7 @@ export function splitSourceContext(
 function contextIsComplete(loaded: LoadedDiff, file: DiffFileRow): boolean {
   return (
     loaded.partialError === null &&
+    !loaded.loadingMore &&
     !file.is_truncated &&
     !file.is_unavailable
   );

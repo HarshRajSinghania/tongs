@@ -8,7 +8,12 @@ from datetime import datetime
 from typing import Any
 
 from tongs.cache.store import CacheStore
-from tongs.forges.base import ForgeClient, read_mr_ci_status, read_mr_page
+from tongs.forges.base import (
+    ForgeClient,
+    read_mr_ci_status,
+    read_mr_page,
+    read_mr_revision,
+)
 from tongs.forges.models import (
     CIStatus,
     ForgeMergeResult,
@@ -354,6 +359,10 @@ class CachedForgeClient:
     async def get_mr_fresh(self, repo_path: str, number: int) -> MRDetail:
         """Bypass any present or future wrapper cache for revision checks."""
         return await self._inner.get_mr_fresh(repo_path, number)
+
+    async def get_mr_revision(self, repo_path: str, number: int) -> MRDetail:
+        """Read the revision-only review resource, never from the cache."""
+        return await read_mr_revision(self._inner, repo_path, number)
 
     async def get_mr_diff_fresh(self, repo_path: str, number: int) -> list[dict]:
         """Bypass cached diff payloads for revision-bound reads."""

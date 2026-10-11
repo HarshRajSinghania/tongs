@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
 from tongs.diff.conversion import convert_forge_changes
-from tongs.diff.models import DiffHunk, DiffLine, LineType
+from tongs.diff.models import DiffFile, DiffHunk, DiffLine, LineType
 from tongs.errors import (
     AuthError,
     ConflictError,
@@ -240,6 +240,46 @@ class _ValidatedCommand:
     discussion: Discussion | None = None
 
 
+_FileIndex = Mapping[tuple[str, str], DiffFile]
+
+
+class DiffScope:
+    """Share one raw diff read per review revision across related commands.
+
+    A submission validates its steps and then executes them, all bound to one
+    revision. Passing the same scope to each ``validate`` and ``execute`` call
+    reads and converts that diff once and indexes its files by path pair; the
+    cheap revision check of each command stays the race guard. A scope holds
+    no lock and belongs to one sequential caller.
+    """
+
+    __slots__ = ("_files",)
+
+    def __init__(self) -> None:
+        self._files: dict[tuple[ReviewRef, ReviewRevision], _FileIndex] = {}
+
+    async def files(
+        self,
+        review: ReviewRef,
+        revision: ReviewRevision,
+        read: Callable[[ReviewRef], Awaitable[RawDiffSnapshot]],
+    ) -> _FileIndex:
+        """Return the revision's converted files, reading the diff only once."""
+        key = (review, revision)
+        index = self._files.get(key)
+        if index is None:
+            raw = await read(review)
+            if raw.revision != revision:
+                raise ServiceError(
+                    ServiceErrorCode.REVISION_CHANGED,
+                    "The review revision changed. Refresh before writing.",
+                    retryable=True,
+                )
+            index = _index_files(convert_forge_changes(raw.changes))
+            self._files[key] = index
+        return index
+
+
 class ReviewMutationService:
     """Validate and dispatch single forge mutations without automatic replay."""
 
@@ -278,12 +318,17 @@ class ReviewMutationService:
         snapshot = await self._get_review(review)
         return _capabilities(snapshot)
 
-    async def validate(self, command: ReviewMutationCommand) -> None:
-        """Validate one command without reserving or dispatching a mutation."""
+    async def validate(
+        self, command: ReviewMutationCommand, *, diff_scope: DiffScope | None = None
+    ) -> None:
+        """Validate one command without reserving or dispatching a mutation.
+
+        ``diff_scope`` shares one diff read with the other calls given it.
+        """
         owner_task = await self._enter_validation()
         try:
             client = await self._get_client(command.review, "validate_review_mutation")
-            await self._validate(command, client)
+            await self._validate(command, client, diff_scope)
         except asyncio.CancelledError:
             raise
         except ServiceError:
@@ -297,7 +342,13 @@ class ReviewMutationService:
         finally:
             self._owner_tasks.discard(owner_task)
 
-    async def execute(self, command: ReviewMutationCommand) -> MutationOutcome:
+    async def execute(
+        self, command: ReviewMutationCommand, *, diff_scope: DiffScope | None = None
+    ) -> MutationOutcome:
+        """Dispatch one command once per operation ID.
+
+        ``diff_scope`` shares one diff read with the other calls given it.
+        """
         entry, owner = await self._reserve(command)
         if not owner:
             return await self._ledger.wait(entry)
@@ -305,7 +356,7 @@ class ReviewMutationService:
         if owner_task is None:
             raise RuntimeError("review mutation execution requires an asyncio task")
         try:
-            return await self._execute_owner(command, entry)
+            return await self._execute_owner(command, entry, diff_scope)
         finally:
             self._owner_tasks.discard(owner_task)
 
@@ -313,10 +364,11 @@ class ReviewMutationService:
         self,
         command: ReviewMutationCommand,
         entry: OperationEntry[ReviewMutationCommand, MutationOutcome],
+        diff_scope: DiffScope | None,
     ) -> MutationOutcome:
         try:
             client = await self._get_client(command.review, "mutate_review")
-            call = await self._prepare(command, client)
+            call = await self._prepare(command, client, diff_scope)
         except asyncio.CancelledError:
             self._ledger.release(
                 entry,
@@ -376,9 +428,12 @@ class ReviewMutationService:
         return self._ledger.complete(entry, outcome)
 
     async def _prepare(
-        self, command: ReviewMutationCommand, client: ForgeClient
+        self,
+        command: ReviewMutationCommand,
+        client: ForgeClient,
+        diff_scope: DiffScope | None,
     ) -> Awaitable[ForgeMutationResult]:
-        validated = await self._validate(command, client)
+        validated = await self._validate(command, client, diff_scope)
         path = command.review.repository.project_path
         number = command.review.number
         if isinstance(command, GeneralComment):
@@ -434,16 +489,22 @@ class ReviewMutationService:
         )
 
     async def _validate(
-        self, command: ReviewMutationCommand, _client: ForgeClient
+        self,
+        command: ReviewMutationCommand,
+        _client: ForgeClient,
+        diff_scope: DiffScope | None,
     ) -> _ValidatedCommand:
         if isinstance(command, GeneralComment):
             return _ValidatedCommand()
+        # Without a caller scope, the anchors of this one command still share
+        # a single diff read.
+        scope = diff_scope if diff_scope is not None else DiffScope()
 
         snapshot = await self._require_revision(command.review, command.revision)
         capabilities = _capabilities(snapshot)
         if isinstance(command, InlineComment):
             resolved = await self._validate_anchor(
-                command.review, command.revision, command.anchor
+                command.review, command.revision, command.anchor, scope
             )
             snapshot = await self._require_revision(command.review, command.revision)
             return _ValidatedCommand(snapshot, resolved)
@@ -478,7 +539,9 @@ class ReviewMutationService:
                     "GitLab approval and comment require separate operations."
                 )
         for draft in command.inline_comments:
-            await self._validate_anchor(command.review, command.revision, draft.anchor)
+            await self._validate_anchor(
+                command.review, command.revision, draft.anchor, scope
+            )
         snapshot = await self._require_revision(command.review, command.revision)
         return _ValidatedCommand(snapshot)
 
@@ -495,20 +558,20 @@ class ReviewMutationService:
         return snapshot
 
     async def _validate_anchor(
-        self, review: ReviewRef, revision: ReviewRevision, anchor: DiffAnchor
+        self,
+        review: ReviewRef,
+        revision: ReviewRevision,
+        anchor: DiffAnchor,
+        scope: DiffScope,
     ) -> _ResolvedAnchor:
-        raw = await self._get_diff(review)
-        if raw.revision != revision:
-            raise ServiceError(
-                ServiceErrorCode.REVISION_CHANGED,
-                "The review revision changed. Refresh before writing.",
-                retryable=True,
-            )
-        for file in convert_forge_changes(raw.changes):
-            if file.old_path != anchor.old_path or file.new_path != anchor.new_path:
-                continue
-            if file.is_truncated or file.is_metadata_only or not file.hunks:
-                break
+        files = await scope.files(review, revision, self._get_diff)
+        file = files.get((anchor.old_path, anchor.new_path))
+        if (
+            file is not None
+            and not file.is_truncated
+            and not file.is_metadata_only
+            and file.hunks
+        ):
             endpoint = _find_line(file.hunks, anchor.line, anchor.side)
             start = None
             if endpoint is not None and anchor.start_line is not None:
@@ -517,7 +580,6 @@ class ReviewMutationService:
                     endpoint = None
             if endpoint is not None:
                 return _ResolvedAnchor(anchor, endpoint, start)
-            break
         raise ServiceError(
             ServiceErrorCode.INVALID_INPUT,
             "The selected diff line is not commentable at this revision.",
@@ -692,6 +754,14 @@ def _unsupported(message: str) -> ServiceError:
     return ServiceError(ServiceErrorCode.UNSUPPORTED, message)
 
 
+def _index_files(files: Sequence[DiffFile]) -> _FileIndex:
+    """Index files by path pair, keeping the first as the linear scan did."""
+    index: dict[tuple[str, str], DiffFile] = {}
+    for file in files:
+        index.setdefault((file.old_path, file.new_path), file)
+    return index
+
+
 def _find_discussion(items: tuple[Discussion, ...], discussion_id: str) -> Discussion:
     for item in items:
         if item.id == discussion_id:
@@ -752,6 +822,7 @@ def _revision(command: ReviewMutationCommand) -> ReviewRevision | None:
 
 __all__ = [
     "DiffAnchor",
+    "DiffScope",
     "DiffSide",
     "GeneralComment",
     "InlineComment",

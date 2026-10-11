@@ -181,9 +181,9 @@ Diff lines flow through this pipeline from parser to screen:
 2. `DiffContent.show_file()` calls `_render_current_file()`, which sends split mode (`v`) to `SplitDiffView.show_file()` and unified mode to `_show_diff()`
 3. `_show_diff()` calls `DiffRenderer.render_lines(hunk)` for each hunk. `DiffRenderer` handles syntax highlighting (`rich.syntax.Syntax`), word-level diffs (`difflib.SequenceMatcher`) and context folding, and returns `list[tuple[DiffLine | None, Text]]` with foreground-only styling
 4. Each `(DiffLine, Text)` pair becomes an `Option` in `DiffOptionList`
-5. `DiffOptionList.render_line()`, and `SplitDiffColumn.render_line()` in split mode, add background colors (addition/deletion/selection) through `VisualStyle` BEFORE calling `_get_option_render()`. These are the only places backgrounds are set.
+5. `TintedOptionList.render_line()` in `src/tongs/widgets/tinted_option_list.py`, the shared base of `DiffOptionList` and `SplitDiffColumn`, lets Textual render the row and then replaces its background with the addition, deletion or selection tint (the cursor row keeps Textual's highlight). It finds the row's option from the `option` meta Textual stamps on every row. This is the only place row backgrounds are set.
 
-The foreground/background split is intentional: `Strip.apply_style()` cannot reliably override backgrounds due to Textual style priority, so backgrounds must be set in the VisualStyle before rendering.
+The foreground/background split is intentional: highlighted code carries colours and weights only, because `_build_highlight_map` drops the Pygments theme background from every span, so the row background shows through code.
 
 ## Suggestion Position Mapping
 
@@ -264,6 +264,6 @@ validator, the bridge type, the badge map and this widget together.
 
 ## Bulk Pygments Highlighting
 
-`_build_highlight_map(file)` in `src/tongs/widgets/diff_panel.py` performs a single Pygments call per file rather than per-line. It concatenates all diff line contents, highlights the bulk string via `rich.syntax.Syntax`, then splits the highlighted `Text` back into per-line entries keyed by `id(DiffLine)`. The `DiffRenderer` receives this map and uses pre-highlighted text instead of re-highlighting each line individually.
+`_build_highlight_map(file)` in `src/tongs/widgets/diff_panel.py` lexes two streams per hunk rather than each line: the old side (context plus deletions) and the new side (context plus additions), so a string opened on one side or in one hunk cannot colour another. It returns a `HighlightMap` keyed by `id(DiffLine)` per side. `DiffContent` caches the map per `DiffFile` until `set_files()` or `show_placeholder()`, so redraws for draft markers, threads, layout and file switches do not re-run Pygments, and `set_draft_markers()` returns early when the markers did not change.
 
 The batch `add_options()` call on `DiffOptionList` replaces the previous per-line `add_option()` loop, reducing Textual widget overhead for large files.

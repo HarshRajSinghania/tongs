@@ -4,15 +4,19 @@ This parser is forge-agnostic. Both GitHub and GitLab produce standard
 unified diff format. The parser handles:
 - Standard @@ hunk headers with optional function context
 - No-newline-at-end-of-file markers
-- File mode changes
+- File mode changes, including sections that change only the mode
 - Binary file markers
-- Renamed files (with similarity index)
+- Renamed and copied files (with similarity index)
 - Multiple files in a single diff
 """
 
 from __future__ import annotations
 
+import os
 import re
+from functools import lru_cache
+
+from pygments.lexers import get_lexer_for_filename
 
 from tongs.diff.models import DiffFile, DiffHunk, DiffLine, FileStatus, LineType
 
@@ -21,11 +25,39 @@ HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
 FILE_HEADER_RE = re.compile(r"^--- (.+)$")
 FILE_HEADER_NEW_RE = re.compile(r"^\+\+\+ (.+)$")
 
-DIFF_GIT_RE = re.compile(r"^diff --git a/(.+) b/(.+)$")
+# Either name may be written quoted, as git does for a path with a special or
+# non-ASCII character (core.quotePath).
+DIFF_GIT_RE = re.compile(r'^diff --git "?a/(.+) "?b/(.+)$')
+_DIFF_GIT_PREFIX = "diff --git "
+
+# A git file mode such as ``100644``.  Anything else on a mode line is ignored
+# rather than shown, so a header can only ever display octal digits.
+_MODE_RE = re.compile(r"[0-7]{1,7}")
+
+# The C escapes git writes inside a quoted path, besides octal byte escapes.
+_PATH_ESCAPES = {
+    "a": 0x07,
+    "b": 0x08,
+    "t": 0x09,
+    "n": 0x0A,
+    "v": 0x0B,
+    "f": 0x0C,
+    "r": 0x0D,
+    '"': 0x22,
+    "\\": 0x5C,
+}
+
+# Distinct file names whose language lookup is remembered.  Pygments matches a
+# lexer on the base name alone, so the cache key loses nothing.
+_LANGUAGE_CACHE_SIZE = 4096
 
 
-def parse_diff(diff_text: str) -> list[DiffFile]:
-    """Parse a unified diff string into a list of DiffFile objects."""
+def parse_diff(diff_text: str, *, detect_language: bool = True) -> list[DiffFile]:
+    """Parse a unified diff string into a list of DiffFile objects.
+
+    ``detect_language`` false leaves every file's language empty, for a caller
+    whose header paths are placeholders and that detects the language itself.
+    """
     if not diff_text or not diff_text.strip():
         return []
 
@@ -38,7 +70,7 @@ def parse_diff(diff_text: str) -> list[DiffFile]:
 
         git_match = DIFF_GIT_RE.match(line)
         if git_match:
-            file, consumed = _parse_git_diff_file(lines, i)
+            file, consumed = _parse_git_diff_file(lines, i, detect_language)
             if file:
                 files.append(file)
             i += consumed
@@ -48,7 +80,7 @@ def parse_diff(diff_text: str) -> list[DiffFile]:
         if old_match and i + 1 < len(lines):
             new_match = FILE_HEADER_NEW_RE.match(lines[i + 1])
             if new_match:
-                file, consumed = _parse_plain_diff_file(lines, i)
+                file, consumed = _parse_plain_diff_file(lines, i, detect_language)
                 if file:
                     files.append(file)
                 i += consumed
@@ -59,35 +91,70 @@ def parse_diff(diff_text: str) -> list[DiffFile]:
     return files
 
 
-def _parse_git_diff_file(lines: list[str], start: int) -> tuple[DiffFile | None, int]:
-    """Parse a file section starting from 'diff --git ...'."""
-    git_match = DIFF_GIT_RE.match(lines[start])
-    if not git_match:
+def _parse_git_diff_file(
+    lines: list[str], start: int, detect_language: bool = True
+) -> tuple[DiffFile | None, int]:
+    """Parse a file section starting from 'diff --git ...'.
+
+    The extended header lines are authoritative where git writes them:
+    ``rename from``/``rename to`` and ``copy from``/``copy to`` name the paths
+    exactly, so they win over the ambiguous ``diff --git`` line.  A copy is
+    kept like a rename, and a section that only changes the file mode is kept
+    as a mode-only file instead of being dropped.
+    """
+    if not DIFF_GIT_RE.match(lines[start]):
         return None, 1
 
-    old_path = git_match.group(1)
-    new_path = git_match.group(2)
+    old_path, new_path = _git_header_paths(lines[start][len(_DIFF_GIT_PREFIX) :])
     i = start + 1
     is_binary = False
     status = FileStatus.MODIFIED
+    old_mode: str | None = None
+    new_mode: str | None = None
+    moved_from: str | None = None
+    moved_to: str | None = None
 
     while i < len(lines):
         line = lines[i]
 
-        if line.startswith("diff --git "):
+        if line.startswith(_DIFF_GIT_PREFIX):
             break
 
         if line.startswith("new file"):
             status = FileStatus.ADDED
+            new_mode = _header_mode(line, "new file mode ") or new_mode
             i += 1
             continue
 
         if line.startswith("deleted file"):
             status = FileStatus.DELETED
+            old_mode = _header_mode(line, "deleted file mode ") or old_mode
             i += 1
             continue
 
-        if line.startswith(("rename from", "rename to")):
+        if line.startswith("old mode "):
+            old_mode = _header_mode(line, "old mode ")
+            i += 1
+            continue
+
+        if line.startswith("new mode "):
+            new_mode = _header_mode(line, "new mode ")
+            i += 1
+            continue
+
+        if line.startswith(("rename from ", "copy from ")):
+            status = FileStatus.RENAMED
+            moved_from = unquote_path(line.split(" from ", 1)[1])
+            i += 1
+            continue
+
+        if line.startswith(("rename to ", "copy to ")):
+            status = FileStatus.RENAMED
+            moved_to = unquote_path(line.split(" to ", 1)[1])
+            i += 1
+            continue
+
+        if line.startswith(("rename from", "rename to", "copy from", "copy to")):
             status = FileStatus.RENAMED
             i += 1
             continue
@@ -107,8 +174,8 @@ def _parse_git_diff_file(lines: list[str], start: int) -> tuple[DiffFile | None,
 
         if line.startswith("--- "):
             hunks, consumed = _parse_hunks_from(lines, i)
-            actual_old = _strip_prefix(lines[i][4:])
-            actual_new = (
+            actual_old = moved_from or _strip_prefix(lines[i][4:])
+            actual_new = moved_to or (
                 _strip_prefix(lines[i + 1][4:]) if i + 1 < len(lines) else new_path
             )
 
@@ -119,8 +186,12 @@ def _parse_git_diff_file(lines: list[str], start: int) -> tuple[DiffFile | None,
                 1 for h in hunks for dl in h.lines if dl.line_type == LineType.DELETION
             )
 
-            lang = _detect_language(
-                actual_new if actual_new != "/dev/null" else actual_old
+            lang = (
+                _detect_language(
+                    actual_new if actual_new != "/dev/null" else actual_old
+                )
+                if detect_language
+                else ""
             )
 
             return (
@@ -133,6 +204,11 @@ def _parse_git_diff_file(lines: list[str], start: int) -> tuple[DiffFile | None,
                     deletions=deletions,
                     is_binary=is_binary,
                     language=lang,
+                    is_mode_only=_is_mode_only(
+                        status, old_mode, new_mode, bool(hunks) or is_binary
+                    ),
+                    old_mode=old_mode,
+                    new_mode=new_mode,
                 ),
                 i + consumed - start,
             )
@@ -143,12 +219,20 @@ def _parse_git_diff_file(lines: list[str], start: int) -> tuple[DiffFile | None,
 
         i += 1
 
-    if is_binary or status in (
-        FileStatus.ADDED,
-        FileStatus.DELETED,
-        FileStatus.RENAMED,
+    old_path = moved_from or old_path
+    new_path = moved_to or new_path
+    is_mode_only = _is_mode_only(status, old_mode, new_mode, is_binary)
+    if (
+        is_binary
+        or is_mode_only
+        or status
+        in (
+            FileStatus.ADDED,
+            FileStatus.DELETED,
+            FileStatus.RENAMED,
+        )
     ):
-        lang = _detect_language(new_path)
+        lang = _detect_language(new_path) if detect_language else ""
         return (
             DiffFile(
                 old_path=old_path,
@@ -157,6 +241,15 @@ def _parse_git_diff_file(lines: list[str], start: int) -> tuple[DiffFile | None,
                 hunks=(),
                 is_binary=is_binary,
                 language=lang,
+                is_mode_only=is_mode_only,
+                is_rename_only=(
+                    status is FileStatus.RENAMED
+                    and not is_binary
+                    and not is_mode_only
+                    and old_path != new_path
+                ),
+                old_mode=old_mode,
+                new_mode=new_mode,
             ),
             i - start,
         )
@@ -164,7 +257,134 @@ def _parse_git_diff_file(lines: list[str], start: int) -> tuple[DiffFile | None,
     return None, i - start
 
 
-def _parse_plain_diff_file(lines: list[str], start: int) -> tuple[DiffFile | None, int]:
+def _git_header_paths(names: str) -> tuple[str, str]:
+    """Split the ``a/<old> b/<new>`` part of a ``diff --git`` line.
+
+    A path may itself contain `` b/``, so the first or last occurrence is not
+    reliable.  Without a rename or copy both names are the same path, which
+    git writes as two equal halves; that split is unambiguous and is tried
+    first.  Otherwise the last separator is used, and the caller replaces both
+    paths with the exact ``rename``/``copy`` or ``---``/``+++`` names.
+
+    A quoted name never holds an unquoted ``"``, so with either name quoted
+    the split is exact.
+    """
+    quoted = _split_quoted_names(names)
+    if quoted is not None:
+        return quoted
+    prefix = "a/"
+    separator = " b/"
+    if names.startswith(prefix):
+        name_length = (len(names) - len(prefix) - len(separator)) // 2
+        middle = len(prefix) + name_length
+        if (
+            name_length > 0
+            and len(names) == middle + len(separator) + name_length
+            and names[middle : middle + len(separator)] == separator
+            and names[len(prefix) : middle] == names[middle + len(separator) :]
+        ):
+            path = names[len(prefix) : middle]
+            return path, path
+    match = DIFF_GIT_RE.match(_DIFF_GIT_PREFIX + names)
+    if match:
+        return match.group(1), match.group(2)
+    return names, names
+
+
+def _split_quoted_names(names: str) -> tuple[str, str] | None:
+    """Split ``a/<old> b/<new>`` when git quoted either name, else None."""
+    if names.startswith('"'):
+        end = _closing_quote(names)
+        if end is None or names[end + 1 : end + 2] != " ":
+            return None
+        old, new = names[: end + 1], names[end + 2 :]
+    elif names.endswith('"') and ' "' in names:
+        old, new = names.split(' "', 1)
+        new = '"' + new
+    else:
+        return None
+    return _strip_prefix(old), _strip_prefix(new)
+
+
+def _closing_quote(text: str) -> int | None:
+    """Index of the quote that closes the one opening ``text``."""
+    index = 1
+    while index < len(text):
+        if text[index] == "\\":
+            index += 2
+            continue
+        if text[index] == '"':
+            return index
+        index += 1
+    return None
+
+
+def unquote_path(path: str) -> str:
+    """Undo git's quoting of a path written between double quotes.
+
+    git quotes a path holding a control, quote, backslash or (with
+    core.quotePath, the default) non-ASCII character: each such byte becomes
+    a C escape such as ``\\t`` or ``\\"``, or a three-digit octal escape.  The
+    octal escapes are UTF-8 bytes, so they are collected and decoded together.
+    A path that is not quoted is returned as it is.
+    """
+    if len(path) < 2 or not (path.startswith('"') and path.endswith('"')):
+        return path
+    body = path[1:-1]
+    out = bytearray()
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char != "\\" or index + 1 == len(body):
+            out += char.encode()
+            index += 1
+            continue
+        escape = body[index + 1]
+        octal = body[index + 1 : index + 4]
+        if len(octal) == 3 and all(digit in "01234567" for digit in octal):
+            out.append(int(octal, 8) & 0xFF)
+            index += 4
+        elif escape in _PATH_ESCAPES:
+            out.append(_PATH_ESCAPES[escape])
+            index += 2
+        else:
+            out += char.encode()
+            index += 1
+    return out.decode("utf-8", errors="replace")
+
+
+def is_file_mode(value: object) -> bool:
+    """Whether ``value`` is an octal git file mode such as ``100644``."""
+    return isinstance(value, str) and _MODE_RE.fullmatch(value) is not None
+
+
+def _header_mode(line: str, prefix: str) -> str | None:
+    """Read an octal git file mode from an extended header line."""
+    if not line.startswith(prefix):
+        return None
+    mode = line[len(prefix) :].strip()
+    return mode if is_file_mode(mode) else None
+
+
+def _is_mode_only(
+    status: FileStatus,
+    old_mode: str | None,
+    new_mode: str | None,
+    has_content: bool,
+) -> bool:
+    """A modified or renamed file whose only change is its mode."""
+    return (
+        not has_content
+        and status in (FileStatus.MODIFIED, FileStatus.RENAMED)
+        and old_mode is not None
+        and new_mode is not None
+        and old_mode != new_mode
+    )
+
+
+def _parse_plain_diff_file(
+    lines: list[str], start: int, detect_language: bool = True
+) -> tuple[DiffFile | None, int]:
     """Parse a file section starting from '--- ...' (no git prefix)."""
     old_path = _strip_prefix(lines[start][4:])
     new_path = _strip_prefix(lines[start + 1][4:])
@@ -184,7 +404,11 @@ def _parse_plain_diff_file(lines: list[str], start: int) -> tuple[DiffFile | Non
     elif new_path == "/dev/null":
         status = FileStatus.DELETED
 
-    lang = _detect_language(new_path if new_path != "/dev/null" else old_path)
+    lang = (
+        _detect_language(new_path if new_path != "/dev/null" else old_path)
+        if detect_language
+        else ""
+    )
 
     return (
         DiffFile(
@@ -365,8 +589,8 @@ def _is_file_header_boundary(
 
 
 def _strip_prefix(path: str) -> str:
-    """Strip a/ or b/ prefix from diff paths."""
-    path = path.strip()
+    """Unquote a diff path and strip its a/ or b/ prefix."""
+    path = unquote_path(path.strip())
     if path.startswith(("a/", "b/")):
         return path[2:]
     return path
@@ -376,10 +600,14 @@ def _detect_language(path: str) -> str:
     """Detect programming language from file path using Pygments."""
     if path == "/dev/null":
         return ""
-    try:
-        from pygments.lexers import get_lexer_for_filename
+    return _language_for_name(os.path.basename(path))
 
-        lexer = get_lexer_for_filename(path)
+
+@lru_cache(maxsize=_LANGUAGE_CACHE_SIZE)
+def _language_for_name(name: str) -> str:
+    """Look up one base name's lexer once; Pygments matches on it alone."""
+    try:
+        lexer = get_lexer_for_filename(name)
         return lexer.aliases[0] if lexer.aliases else lexer.name.lower()
     except Exception:  # noqa: BLE001 - Third-party lexer failures must leave the diff readable.
         return ""

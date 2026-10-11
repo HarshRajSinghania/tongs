@@ -881,10 +881,14 @@ async def test_close_retries_cancellation_of_submission_owner(tmp_path: Path) ->
     cancellations = 0
 
     class FirstCancelResistantMutations:
-        async def validate(self, _command: object) -> None:
+        async def validate(
+            self, _command: object, *, diff_scope: object = None
+        ) -> None:
             return None
 
-        async def execute(self, _command: object) -> object:
+        async def execute(
+            self, _command: object, *, diff_scope: object = None
+        ) -> object:
             nonlocal cancellations
             entered.set()
             try:
@@ -936,10 +940,14 @@ async def test_failed_close_can_finish_after_uncooperative_owner_settles(
     release = asyncio.Event()
 
     class ResistantMutations:
-        async def validate(self, _command: object) -> None:
+        async def validate(
+            self, _command: object, *, diff_scope: object = None
+        ) -> None:
             return None
 
-        async def execute(self, command: object) -> MutationOutcome:
+        async def execute(
+            self, command: object, *, diff_scope: object = None
+        ) -> MutationOutcome:
             entered.set()
             while not release.is_set():
                 try:
@@ -1769,4 +1777,29 @@ async def test_cancelled_return_whose_first_unknown_write_fails_propagates(
     assert failures == [1]
     assert not store.holds_attempt(paused.attempt_id)
     assert (await store.get_draft(draft.id)).state is DraftState.PARTIAL
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("forge", [ForgeType.GITHUB, ForgeType.GITLAB])
+async def test_thirty_comment_submission_reads_the_diff_once(
+    tmp_path: Path, forge: ForgeType
+) -> None:
+    comments = tuple(
+        InlineDraftComment(uuid4(), f"inline {index}", _anchor()) for index in range(30)
+    )
+    store, service, client, _snapshot_value, draft = await _services(
+        tmp_path / "drafts.db", _content(*comments), forge=forge
+    )
+    get_diff = service._mutations._get_diff
+
+    progress = await service.start(draft.id, draft.version)
+
+    assert progress.outcome is SubmissionOutcome.SUBMITTED
+    get_diff.assert_awaited_once()
+    if forge is ForgeType.GITHUB:
+        client.submit_review.assert_awaited_once()
+        assert len(client.submit_review.await_args.args[4]) == 30
+    else:
+        assert client.create_inline_comment.await_count == 30
     await store.close()

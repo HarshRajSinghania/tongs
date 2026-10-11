@@ -8,7 +8,7 @@ from typing import ClassVar
 import pytest
 
 from tongs.diff.models import DiffFile, FileStatus, LineType
-from tongs.diff.parser import parse_diff
+from tongs.diff.parser import parse_diff, unquote_path
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 
@@ -631,3 +631,214 @@ class TestEdgeCases:
             "++ comment",
         ]
         assert [line.content for line in files[0].hunks[1].lines] == ["old", "new"]
+
+
+class TestGitExtendedHeaders:
+    """Mode, copy and path headers that git writes before any hunk (#397)."""
+
+    def test_mode_only_section_is_kept(self) -> None:
+        diff = (
+            "diff --git a/bin/run.sh b/bin/run.sh\n"
+            "old mode 100644\n"
+            "new mode 100755\n"
+            "diff --git a/app.py b/app.py\n"
+            "index 1111111..2222222 100644\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+
+        files = parse_diff(diff)
+
+        assert [file.new_path for file in files] == ["bin/run.sh", "app.py"]
+        chmod = files[0]
+        assert chmod.status is FileStatus.MODIFIED
+        assert chmod.hunks == ()
+        assert chmod.is_mode_only is True
+        assert chmod.is_rename_only is False
+        assert (chmod.old_mode, chmod.new_mode) == ("100644", "100755")
+        assert chmod.mode_change == "mode 100644 -> 100755"
+        assert files[1].mode_change == ""
+        assert len(files[1].hunks) == 1
+
+    def test_edit_plus_mode_keeps_hunks_and_modes(self) -> None:
+        diff = (
+            "diff --git a/bin/run.sh b/bin/run.sh\n"
+            "old mode 100644\n"
+            "new mode 100755\n"
+            "index 1111111..2222222\n"
+            "--- a/bin/run.sh\n"
+            "+++ b/bin/run.sh\n"
+            "@@ -1 +1 @@\n"
+            "-echo old\n"
+            "+echo new\n"
+        )
+
+        (file,) = parse_diff(diff)
+
+        assert file.is_mode_only is False
+        assert file.mode_change == "mode 100644 -> 100755"
+        assert (file.additions, file.deletions) == (1, 1)
+        assert [line.content for line in file.hunks[0].lines] == [
+            "echo old",
+            "echo new",
+        ]
+
+    def test_new_and_deleted_file_modes_are_not_a_mode_change(self) -> None:
+        diff = (
+            "diff --git a/new.sh b/new.sh\n"
+            "new file mode 100755\n"
+            "diff --git a/old.sh b/old.sh\n"
+            "deleted file mode 100644\n"
+        )
+
+        added, deleted = parse_diff(diff)
+
+        assert (added.old_mode, added.new_mode) == (None, "100755")
+        assert (deleted.old_mode, deleted.new_mode) == ("100644", None)
+        assert added.mode_change == deleted.mode_change == ""
+        assert added.is_mode_only is deleted.is_mode_only is False
+
+    def test_copy_is_kept_like_a_rename(self) -> None:
+        diff = (
+            "diff --git a/src/base.py b/src/copy.py\n"
+            "similarity index 100%\n"
+            "copy from src/base.py\n"
+            "copy to src/copy.py\n"
+        )
+
+        (file,) = parse_diff(diff)
+
+        assert (file.old_path, file.new_path) == ("src/base.py", "src/copy.py")
+        assert file.status is FileStatus.RENAMED
+        assert file.is_rename_only is True
+        assert file.language == "python"
+
+    def test_copy_with_edits_keeps_its_hunks(self) -> None:
+        diff = (
+            "diff --git a/src/base.py b/src/copy.py\n"
+            "similarity index 80%\n"
+            "copy from src/base.py\n"
+            "copy to src/copy.py\n"
+            "index 1111111..2222222 100644\n"
+            "--- a/src/base.py\n"
+            "+++ b/src/copy.py\n"
+            "@@ -1 +1 @@\n"
+            "-a\n"
+            "+b\n"
+        )
+
+        (file,) = parse_diff(diff)
+
+        assert (file.old_path, file.new_path) == ("src/base.py", "src/copy.py")
+        assert file.status is FileStatus.RENAMED
+        assert file.is_rename_only is False
+        assert len(file.hunks) == 1
+
+    def test_path_containing_b_slash_splits_in_the_middle(self) -> None:
+        diff = (
+            "diff --git a/docs/a b/notes.txt b/docs/a b/notes.txt\n"
+            "old mode 100644\n"
+            "new mode 100755\n"
+        )
+
+        (file,) = parse_diff(diff)
+
+        assert file.old_path == "docs/a b/notes.txt"
+        assert file.new_path == "docs/a b/notes.txt"
+        assert file.is_mode_only is True
+
+    def test_rename_paths_come_from_the_rename_headers(self) -> None:
+        diff = (
+            "diff --git a/x b/y.txt b/z b/w.txt\n"
+            "similarity index 100%\n"
+            "rename from x b/y.txt\n"
+            "rename to z b/w.txt\n"
+        )
+
+        (file,) = parse_diff(diff)
+
+        assert (file.old_path, file.new_path) == ("x b/y.txt", "z b/w.txt")
+        assert file.status is FileStatus.RENAMED
+        assert file.is_rename_only is True
+
+    def test_rename_plus_mode_is_mode_only_not_rename_only(self) -> None:
+        diff = (
+            "diff --git a/old.sh b/new.sh\n"
+            "old mode 100644\n"
+            "new mode 100755\n"
+            "similarity index 100%\n"
+            "rename from old.sh\n"
+            "rename to new.sh\n"
+        )
+
+        (file,) = parse_diff(diff)
+
+        assert (file.old_path, file.new_path) == ("old.sh", "new.sh")
+        assert file.is_mode_only is True
+        assert file.is_rename_only is False
+        assert file.mode_change == "mode 100644 -> 100755"
+
+    def test_quoted_non_ascii_rename_is_unquoted_and_decoded(self) -> None:
+        # What git writes for a renamed and edited dir/old.txt -> dir/\u00e9.txt
+        # with the default core.quotePath.
+        diff = (
+            'diff --git a/dir/old.txt "b/dir/\\303\\251.txt"\n'
+            "similarity index 80%\n"
+            "rename from dir/old.txt\n"
+            'rename to "dir/\\303\\251.txt"\n'
+            "index d68dd40..9405325 100644\n"
+            "--- a/dir/old.txt\n"
+            '+++ "b/dir/\\303\\251.txt"\n'
+            "@@ -2,3 +2,4 @@ a\n"
+            " b\n"
+            " c\n"
+            " d\n"
+            "+e\n"
+        )
+
+        (file,) = parse_diff(diff)
+
+        assert (file.old_path, file.new_path) == ("dir/old.txt", "dir/\u00e9.txt")
+        assert file.status is FileStatus.RENAMED
+        assert file.additions == 1
+
+    def test_quoted_copy_paths_decode_c_escapes(self) -> None:
+        diff = (
+            'diff --git "a/\\303\\251/q\\"t.txt" "b/a\\\\b\\tc\\nd.txt"\n'
+            "similarity index 100%\n"
+            'copy from "\\303\\251/q\\"t.txt"\n'
+            'copy to "a\\\\b\\tc\\nd.txt"\n'
+        )
+
+        (file,) = parse_diff(diff)
+
+        assert (file.old_path, file.new_path) == (
+            '\u00e9/q"t.txt',
+            "a\\b\tc\nd.txt",
+        )
+        assert file.is_rename_only is True
+
+    def test_quoted_names_on_the_diff_git_line_are_split_and_decoded(self) -> None:
+        diff = (
+            'diff --git "a/bin/\\303\\251 b/run.sh" "b/bin/\\303\\251 b/run.sh"\n'
+            "old mode 100644\n"
+            "new mode 100755\n"
+        )
+
+        (file,) = parse_diff(diff)
+
+        assert file.old_path == file.new_path == "bin/\u00e9 b/run.sh"
+        assert file.mode_change == "mode 100644 -> 100755"
+
+    def test_unquote_path_leaves_plain_paths_alone(self) -> None:
+        assert unquote_path("dir/plain.txt") == "dir/plain.txt"
+        assert unquote_path('"') == '"'
+        assert unquote_path('"dir/\\303\\251.txt"') == "dir/\u00e9.txt"
+
+    def test_malformed_mode_is_ignored(self) -> None:
+        diff = "diff --git a/f b/f\nold mode 100644\nnew mode [red]x\n"
+
+        assert parse_diff(diff) == []

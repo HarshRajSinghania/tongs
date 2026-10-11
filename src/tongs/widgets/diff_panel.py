@@ -3,24 +3,23 @@
 from __future__ import annotations
 
 import difflib
+import re
+from collections import OrderedDict
 from enum import Enum
 from typing import ClassVar
 
 from rich.style import Style
 from rich.syntax import Syntax
-from rich.text import Text
+from rich.text import Span, Text
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.color import Color as TextualColor
 from textual.containers import Horizontal, Vertical
 from textual.content import Content
 from textual.message import Message
-from textual.strip import Strip
-from textual.style import Style as VisualStyle
 from textual.widget import Widget
 from textual.widgets import Markdown, OptionList, Static, Tree
-from textual.widgets._option_list import Option
+from textual.widgets.option_list import Option
 
 from tongs.diff.models import DiffFile, DiffHunk, DiffLine, LineType
 from tongs.forges.models import Discussion
@@ -33,6 +32,7 @@ from tongs.widgets.split_diff import (
     DiffSelection,
     DiffSelectionChanged,
     DiffViewMode,
+    HighlightMap,
     SplitCommentRequested,
     SplitDiffView,
     SplitReplyRequested,
@@ -40,7 +40,17 @@ from tongs.widgets.split_diff import (
     is_actionable,
     placeholder_message,
 )
+from tongs.widgets.tinted_option_list import TintedOptionList
 from tongs.widgets.two_press import TwoPressConfirm
+
+SYNTAX_THEME = "monokai"
+"""Pygments theme for diff code; only token colours and weights are used."""
+
+_TOKEN_SPLIT = re.compile(r"(\s+)")
+"""Word diff tokens: runs of non-space text and the whitespace between them."""
+
+_TAB_SIZE = 4
+"""Tab stop the lexers expand tabs to: Rich's ``Syntax`` default."""
 
 
 class CommentMode(Enum):
@@ -135,7 +145,7 @@ class _ThreadToggled(Message):
     """Internal message: discussion expansion state changed, re-render needed."""
 
 
-class DiffOptionList(OptionList):
+class DiffOptionList(TintedOptionList):
     """Per-line interactive diff list with cursor navigation."""
 
     DEFAULT_CSS = """
@@ -192,7 +202,6 @@ class DiffOptionList(OptionList):
     def __init__(self, **kwargs) -> None:
         super().__init__(compact=True, markup=False, **kwargs)
         self._line_map: dict[int, DiffLine] = {}
-        self._line_types: dict[int, LineType] = {}
         self._current_file: DiffFile | None = None
         self._selection_anchor: int | None = None
         self._comment_map: dict[int, list[Discussion]] = {}
@@ -200,10 +209,6 @@ class DiffOptionList(OptionList):
         self._comment_indices: list[int] = []
         self._resolve_confirm = TwoPressConfirm()
         self._explicit_selection_side: DiffSide | None = None
-
-    _ADDITION_BG = VisualStyle(background=TextualColor(0, 40, 0))
-    _DELETION_BG = VisualStyle(background=TextualColor(40, 0, 0))
-    _SELECTION_BG = VisualStyle(background=TextualColor(0, 50, 100))
 
     @property
     def selection(self) -> DiffSelection | None:
@@ -264,51 +269,6 @@ class DiffOptionList(OptionList):
             ),
             None,
         )
-
-    def render_line(self, y: int) -> Strip:
-        line_number = self.scroll_offset.y + y
-        try:
-            option_index, line_offset = self._lines[line_number]
-            option = self.options[option_index]
-        except IndexError:
-            return Strip.blank(
-                self.scrollable_content_region.width,
-                self.get_visual_style("option-list--option").rich_style,
-            )
-
-        mouse_over = self._mouse_hovering_over == option_index
-        component_class = ""
-        if option.disabled:
-            component_class = "option-list--option-disabled"
-        elif self.highlighted == option_index:
-            component_class = "option-list--option-highlighted"
-        elif mouse_over:
-            component_class = "option-list--option-hover"
-
-        if component_class:
-            style = self.get_visual_style("option-list--option", component_class)
-        else:
-            style = self.get_visual_style("option-list--option")
-
-        if component_class != "option-list--option-highlighted":
-            if self._in_selection_range(option_index):
-                style = style + self._SELECTION_BG
-            elif not option.disabled:
-                line_type = self._line_types.get(option_index)
-                if line_type == LineType.ADDITION:
-                    style = style + self._ADDITION_BG
-                elif line_type == LineType.DELETION:
-                    style = style + self._DELETION_BG
-
-        strips = self._get_option_render(option, style)
-        try:
-            strip = strips[line_offset]
-        except IndexError:
-            return Strip.blank(
-                self.scrollable_content_region.width,
-                self.get_visual_style("option-list--option").rich_style,
-            )
-        return strip
 
     def _in_selection_range(self, option_index: int) -> bool:
         """Check whether an option index falls within the active visual selection."""
@@ -544,6 +504,8 @@ class DiffContent(Widget):
     """Container coordinating unified, split, and Markdown diff views."""
 
     MIN_SPLIT_WIDTH = 88
+    HIGHLIGHT_CACHE_FILES = 16
+    """Highlighted files kept for revisits; the least recently shown goes."""
 
     DEFAULT_CSS = """
     DiffContent {
@@ -564,6 +526,11 @@ class DiffContent(Widget):
         self._effective_mode = DiffViewMode.UNIFIED
         self._preview_selection: DiffSelection | None = None
         self._draft_markers: tuple[DraftMarker, ...] = ()
+        # Highlight maps by id(file), holding the file so a reused id misses,
+        # least recently shown first.
+        self._highlight_cache: OrderedDict[int, tuple[DiffFile, HighlightMap]] = (
+            OrderedDict()
+        )
 
     def compose(self) -> ComposeResult:
         yield DiffOptionList(id="diff-option-list")
@@ -649,18 +616,47 @@ class DiffContent(Widget):
             unified._expanded_threads.update(split.expanded_threads)
 
     def show_file(
-        self, file: DiffFile, discussions: list[Discussion] | None = None
+        self,
+        file: DiffFile,
+        discussions: list[Discussion] | None = None,
+        draft_markers: tuple[DraftMarker, ...] | None = None,
     ) -> None:
+        """Render one file, with its draft markers when given, in one pass."""
         self._showing_preview = False
         self._current_file = file
         self._file_discussions = discussions or []
+        if draft_markers is not None:
+            self._draft_markers = draft_markers
         self._render_current_file()
 
     def set_draft_markers(self, markers: tuple[DraftMarker, ...]) -> None:
-        """Replace durable marker projections and preserve the current selection."""
+        """Replace durable marker projections and preserve the current selection.
+
+        Unchanged markers leave the diff as it is, so saving or refreshing a
+        draft that moves no marker does not redraw the file.
+        """
+        if markers == self._draft_markers:
+            return
         self._draft_markers = markers
         if self._current_file is not None:
             self._render_current_file(self.selection)
+
+    def clear_highlight_cache(self) -> None:
+        """Forget highlighted files, for example when a new diff is loaded."""
+        self._highlight_cache.clear()
+
+    def _highlight_map(self, file: DiffFile) -> HighlightMap:
+        """Return the file's highlight map, running Pygments only once per file."""
+        cached = self._highlight_cache.get(id(file))
+        if cached is not None and cached[0] is file:
+            self._highlight_cache.move_to_end(id(file))
+            return cached[1]
+        highlight_map = _build_highlight_map(file)
+        self._highlight_cache[id(file)] = (file, highlight_map)
+        self._highlight_cache.move_to_end(id(file))
+        while len(self._highlight_cache) > self.HIGHLIGHT_CACHE_FILES:
+            self._highlight_cache.popitem(last=False)
+        return highlight_map
 
     def _render_current_file(self, selection: DiffSelection | None = None) -> None:
         file = self._current_file
@@ -671,7 +667,7 @@ class DiffContent(Widget):
             split.show_file(
                 file,
                 self._file_discussions,
-                _build_highlight_map(file),
+                self._highlight_map(file),
                 selection,
                 self._draft_markers,
             )
@@ -721,7 +717,7 @@ class DiffContent(Widget):
         comment_lines = _build_comment_lines(self._file_discussions)
         expanded = option_list._expanded_threads
 
-        highlight_map = _build_highlight_map(file)
+        highlight_map = self._highlight_map(file)
         renderer = DiffRenderer(
             file.language,
             comment_lines=comment_lines,
@@ -855,6 +851,7 @@ class DiffContent(Widget):
         self._current_file = None
         self._file_discussions = []
         self._draft_markers = ()
+        self._highlight_cache.clear()
         self._show_active_diff()
         self.post_message(DiffSelectionChanged(None))
 
@@ -910,12 +907,12 @@ class DiffRenderer:
         self,
         language: str = "",
         comment_lines: dict[tuple[int | None, int | None], bool] | None = None,
-        highlight_map: dict[int, Text] | None = None,
+        highlight_map: HighlightMap | None = None,
         protected_lines: set[tuple[int | None, int | None]] | None = None,
     ):
         self._language = language or "text"
         self._comment_lines = comment_lines or {}
-        self._highlight_map = highlight_map or {}
+        self._highlight_map = highlight_map or HighlightMap()
         self._protected_lines = protected_lines or set()
 
     CONTEXT_LINES = 3
@@ -1030,27 +1027,25 @@ class DiffRenderer:
         """Render a single diff line using foreground-only styling.
 
         Background colors are NOT set here; they are applied by
-        DiffOptionList.render_line() so the OptionList cursor highlight
+        TintedOptionList.render_line() so the OptionList cursor highlight
         does not conflict.
         """
         gutter = self._gutter(dl)
-        cached = self._highlight_map.get(id(dl))
-        content = cached if cached is not None else self._highlight_content(dl.content)
 
         line = Text()
         line.append_text(gutter)
 
         if dl.line_type == LineType.ADDITION:
             line.append("+", Style(color="green"))
-            line.append_text(content)
+            line.append_text(self._content_text(dl))
         elif dl.line_type == LineType.DELETION:
             line.append("-", Style(color="red"))
-            line.append_text(content)
+            line.append_text(self._content_text(dl))
         elif dl.line_type == LineType.NO_NEWLINE:
             line.append(dl.content, Style(dim=True))
         else:
             line.append(" ")
-            line.append_text(content)
+            line.append_text(self._content_text(dl))
 
         return line
 
@@ -1059,46 +1054,49 @@ class DiffRenderer:
     ) -> Text:
         """Render one side of a word-diff pair.
 
-        Changed words are shown bold + underlined. No bgcolor is applied;
-        line-level backgrounds come from DiffOptionList.render_line().
+        The line keeps its syntax colours and its whitespace exactly; changed
+        tokens, including changed runs of indentation, are bold and
+        underlined. No bgcolor is applied; line-level backgrounds come from
+        TintedOptionList.render_line().
         """
         dl = old_dl if is_old else new_dl
-        gutter = self._gutter(dl)
-
-        old_words = old_dl.content.split()
-        new_words = new_dl.content.split()
-        sm = difflib.SequenceMatcher(None, old_words, new_words)
-
         line = Text()
-        line.append_text(gutter)
-
+        line.append_text(self._gutter(dl))
         if is_old:
             line.append("-", Style(color="red"))
-            highlight = Style(color="red", bold=True, underline=True)
         else:
             line.append("+", Style(color="green"))
-            highlight = Style(color="green", bold=True, underline=True)
 
-        words = old_words if is_old else new_words
-        changed_indices: set[int] = set()
+        content = self._content_text(dl).copy()
+        highlight = Style(bold=True, underline=True)
+        if not content.spans:
+            # Without syntax colours, colour the change like the line marker.
+            highlight += Style(color="red" if is_old else "green")
 
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
-            if tag == "equal":
-                continue
-            if is_old and tag in ("delete", "replace"):
-                changed_indices.update(range(i1, i2))
-            elif not is_old and tag in ("insert", "replace"):
-                changed_indices.update(range(j1, j2))
+        # Compare the raw contents, so a tab replaced by the spaces the lexer
+        # expands it to still shows as a change, then map the changed ranges
+        # onto the highlighted text.
+        ranges = _changed_ranges(old_dl.content, new_dl.content, is_old)
+        offsets = _raw_offsets(dl.content, content.plain)
+        if offsets is None:
+            ranges = _changed_ranges(
+                self._content_text(old_dl).plain,
+                self._content_text(new_dl).plain,
+                is_old,
+            )
+        for start, end in ranges:
+            if offsets is not None:
+                start, end = offsets[start], offsets[end]
+            if start < end:
+                content.stylize(highlight, start, end)
 
-        for idx, word in enumerate(words):
-            if idx > 0:
-                line.append(" ")
-            if idx in changed_indices:
-                line.append(word, highlight)
-            else:
-                line.append(word)
-
+        line.append_text(content)
         return line
+
+    def _content_text(self, dl: DiffLine) -> Text:
+        """Return a line's highlighted content, from the map when it has it."""
+        cached = self._highlight_map.get(dl)
+        return cached if cached is not None else self._highlight_content(dl.content)
 
     def _highlight_content(self, content: str) -> Text:
         if not content or self._language == "text":
@@ -1107,13 +1105,13 @@ class DiffRenderer:
             syntax = Syntax(
                 content,
                 self._language,
-                theme="monokai",
+                theme=SYNTAX_THEME,
                 line_numbers=False,
                 word_wrap=False,
             )
             highlighted = syntax.highlight(content)
             highlighted.rstrip()
-            return highlighted
+            return _without_backgrounds(highlighted)
         except Exception:  # noqa: BLE001 - Third-party lexer failures must leave the diff readable.
             return Text(content)
 
@@ -1251,38 +1249,167 @@ def _render_thread_block(discussions: list[Discussion]) -> list[Text]:
     return result
 
 
-def _build_highlight_map(file: DiffFile) -> dict[int, Text]:
-    """Bulk-highlight all diff lines in one Pygments call, keyed by id(DiffLine)."""
+def _tokenize(content: str) -> list[str]:
+    """Split a line into word and whitespace tokens that join back exactly."""
+    return [token for token in _TOKEN_SPLIT.split(content) if token]
+
+
+def _changed_ranges(old: str, new: str, is_old: bool) -> list[tuple[int, int]]:
+    """Return the character ranges of one side that a word diff changed."""
+    old_tokens = _tokenize(old)
+    new_tokens = _tokenize(new)
+    tokens = old_tokens if is_old else new_tokens
+    offsets = [0]
+    for token in tokens:
+        offsets.append(offsets[-1] + len(token))
+    matcher = difflib.SequenceMatcher(None, old_tokens, new_tokens, autojunk=False)
+    ranges: list[tuple[int, int]] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        start, end = (i1, i2) if is_old else (j1, j2)
+        if tag != "equal" and start < end:
+            ranges.append((offsets[start], offsets[end]))
+    return ranges
+
+
+def _raw_offsets(raw: str, plain: str) -> list[int] | None:
+    """Map every offset of a line's raw content onto its highlighted text.
+
+    The lexer expands a tab to the next tab stop and reads a lone carriage
+    return as a line break, and a line highlighted on its own loses its
+    trailing whitespace. The result has ``len(raw) + 1`` entries, or is None
+    when the two texts do not line up.
+    """
+    offsets: list[int] = []
+    j = 0
+    for index, char in enumerate(raw):
+        offsets.append(j)
+        if j < len(plain) and (plain[j] == char or (char == "\r" and plain[j] == "\n")):
+            j += 1
+            continue
+        if char == "\t":
+            column = j - plain.rfind("\n", 0, j) - 1
+            width = _TAB_SIZE - column % _TAB_SIZE
+            if plain[j : j + width] == " " * width:
+                j += width
+                continue
+        if j == len(plain) and raw[index:].isspace():
+            offsets.extend([j] * (len(raw) - index - 1))
+            break
+        return None
+    offsets.append(j)
+    return offsets
+
+
+def _without_background(style: Style) -> Style:
+    """Keep a token's colour and weight but drop its background."""
+    if style.bgcolor is None:
+        return style
+    return Style(
+        color=style.color,
+        bold=style.bold,
+        dim=style.dim,
+        italic=style.italic,
+        underline=style.underline,
+        strike=style.strike,
+    )
+
+
+def _without_backgrounds(text: Text) -> Text:
+    """Drop theme backgrounds so the diff and cursor rows show through code.
+
+    Pygments themes such as monokai give every token the theme background,
+    which would otherwise paint over the addition, deletion, cursor and
+    selection backgrounds the option lists apply to whole rows.
+    """
+    if isinstance(text.style, Style):
+        text.style = _without_background(text.style)
+    text.spans = [
+        Span(span.start, span.end, _without_background(span.style))
+        if isinstance(span.style, Style)
+        else span
+        for span in text.spans
+    ]
+    return text
+
+
+def _highlight_stream(
+    syntax: Syntax, lines: list[DiffLine], into: dict[int, Text]
+) -> None:
+    """Lex consecutive lines of one side as one stream, keyed by ``id(line)``.
+
+    Pygments reads a lone carriage return as a line break. A line with one
+    before its last character is therefore lexed on its own from the start,
+    because a stream ending in an empty line would hide the extra break and
+    shift every later line's colours by one. A line count that still does
+    not match also falls back to lexing each line on its own.
+    """
+    if not lines:
+        return
+    parts: list[Text] = []
+    if not any("\r" in dl.content[:-1] for dl in lines):
+        highlighted = syntax.highlight("\n".join(dl.content for dl in lines))
+        parts = list(highlighted.split("\n", allow_blank=True))
+        if len(parts) == len(lines) + 1 and not parts[-1].plain:
+            parts.pop()
+    if len(parts) != len(lines):
+        parts = []
+        for dl in lines:
+            single = syntax.highlight(dl.content)
+            single.rstrip()
+            parts.append(single)
+    for dl, part in zip(lines, parts):
+        into[id(dl)] = _without_backgrounds(part)
+
+
+def _build_highlight_map(file: DiffFile) -> HighlightMap:
+    """Highlight a file once, lexing each hunk's old and new side separately.
+
+    The old stream is context plus deletions and the new stream is context
+    plus additions, so an unterminated string or comment on one side cannot
+    colour lines of the other side or of a later hunk.
+    """
     language = file.language or "text"
     if language == "text" or not file.hunks:
-        return {}
+        return HighlightMap()
 
-    all_lines: list[DiffLine] = []
-    for hunk in file.hunks:
-        all_lines.extend(hunk.lines)
-
-    if not all_lines:
-        return {}
-
-    bulk_content = "\n".join(dl.content for dl in all_lines)
+    old: dict[int, Text] = {}
+    new: dict[int, Text] = {}
     try:
         syntax = Syntax(
-            bulk_content,
+            "",
             language,
-            theme="monokai",
+            theme=SYNTAX_THEME,
             line_numbers=False,
             word_wrap=False,
         )
-        highlighted = syntax.highlight(bulk_content)
-        highlighted.rstrip()
-        parts = highlighted.split("\n")
-        result: dict[int, Text] = {}
-        for dl, part in zip(all_lines, parts):
-            part.rstrip()
-            result[id(dl)] = part
-        return result
+        lexer = syntax.lexer
+        if lexer is not None:
+            # Resolve the lexer once instead of on every stream.
+            syntax = Syntax(
+                "", lexer, theme=SYNTAX_THEME, line_numbers=False, word_wrap=False
+            )
+        for hunk in file.hunks:
+            _highlight_stream(
+                syntax,
+                [
+                    dl
+                    for dl in hunk.lines
+                    if dl.line_type in (LineType.CONTEXT, LineType.DELETION)
+                ],
+                old,
+            )
+            _highlight_stream(
+                syntax,
+                [
+                    dl
+                    for dl in hunk.lines
+                    if dl.line_type in (LineType.CONTEXT, LineType.ADDITION)
+                ],
+                new,
+            )
     except Exception:  # noqa: BLE001 - Third-party lexer failures must leave the diff readable.
-        return {}
+        return HighlightMap()
+    return HighlightMap(old=old, new=new)
 
 
 def _build_discussion_index(
@@ -1428,6 +1555,7 @@ class DiffPanel(Widget):
             self.show_placeholder("No changes")
             return
         self._files = files
+        self.query_one("#diff-content", DiffContent).clear_highlight_cache()
         self.set_changes_overflow(changes_overflow)
         self._discussions_by_file = {}
         for d in discussions or []:
@@ -1491,20 +1619,22 @@ class DiffPanel(Widget):
             file_discs = self._discussions_by_file.get(file.new_path, [])
 
             header = self.query_one("#diff-file-header", Static)
+            mode_change = file.mode_change
             header.update(
                 Content.from_markup(
                     "[bold]$path[/]  [green]+$additions[/] [red]-$deletions[/]  "
-                    "[dim]$language[/]",
+                    + ("[yellow]$mode[/]  " if mode_change else "")
+                    + "[dim]$language[/]",
                     path=file.new_path,
                     additions=file.additions,
                     deletions=file.deletions,
+                    mode=mode_change,
                     language=file.language or "",
                 )
             )
 
             content = self.query_one("#diff-content", DiffContent)
-            content.set_draft_markers(self._draft_markers)
-            content.show_file(file, file_discs)
+            content.show_file(file, file_discs, self._draft_markers)
 
     def action_next_file(self) -> None:
         if self._files:

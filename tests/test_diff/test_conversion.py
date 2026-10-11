@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
+import pytest
+
+import tongs.diff.parser as parser_module
 from tongs.diff.conversion import convert_forge_changes
 from tongs.diff.models import FileStatus, LineType
+from tongs.diff.parser import parse_diff
 
 
 def test_converts_github_patch_and_preserves_metadata() -> None:
@@ -547,3 +553,152 @@ def test_gitlab_rename_with_mode_change_is_not_rename_only() -> None:
     assert renamed_chmod_with_content.is_rename_only is False
     assert renamed_chmod_with_content.is_mode_only is False
     assert renamed_chmod_with_content.is_metadata_only is False
+
+
+@pytest.fixture
+def lexer_lookups(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
+    """Record every Pygments lookup, starting and ending with a cold cache."""
+    lookups: list[str] = []
+    lookup = parser_module.get_lexer_for_filename
+
+    def recording_lookup(name: str) -> object:
+        lookups.append(name)
+        return lookup(name)
+
+    monkeypatch.setattr(parser_module, "get_lexer_for_filename", recording_lookup)
+    parser_module._language_for_name.cache_clear()
+    yield lookups
+    parser_module._language_for_name.cache_clear()
+
+
+def test_converting_one_file_looks_up_its_lexer_once(
+    lexer_lookups: list[str],
+) -> None:
+    files = convert_forge_changes(
+        (
+            {
+                "filename": "src/widget.py",
+                "status": "modified",
+                "patch": "@@ -1 +1 @@\n-old\n+new",
+            },
+        )
+    )
+
+    assert files[0].language == "python"
+    assert lexer_lookups == ["widget.py"]
+
+
+def test_full_header_patch_shares_one_lookup_with_its_path(
+    lexer_lookups: list[str],
+) -> None:
+    files = convert_forge_changes(
+        (
+            {
+                "old_path": "src/widget.py",
+                "new_path": "src/widget.py",
+                "diff": "--- a/src/widget.py\n+++ b/src/widget.py\n@@ -1 +1 @@\n-a\n+b",
+            },
+        )
+    )
+
+    assert files[0].language == "python"
+    assert lexer_lookups == ["widget.py"]
+
+
+def test_lexer_lookup_is_remembered_by_file_name(lexer_lookups: list[str]) -> None:
+    changes = tuple(
+        {
+            "filename": f"{directory}/{name}",
+            "status": "modified",
+            "patch": "@@ -1 +1 @@\n-old\n+new",
+        }
+        for directory in ("a", "b", "c")
+        for name in ("widget.py", "Makefile", "notes.unknown-type")
+    )
+
+    files = convert_forge_changes(changes)
+    again = convert_forge_changes(changes)
+
+    assert [file.language for file in files] == ["python", "make", ""] * 3
+    assert [file.language for file in again] == [file.language for file in files]
+    assert sorted(lexer_lookups) == ["Makefile", "notes.unknown-type", "widget.py"]
+    assert not any("__tongs" in name for name in lexer_lookups)
+
+
+def test_parse_diff_can_skip_language_detection(lexer_lookups: list[str]) -> None:
+    text = "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b"
+
+    assert parse_diff(text, detect_language=False)[0].language == ""
+    assert lexer_lookups == []
+    assert parse_diff(text)[0].language == "python"
+    assert lexer_lookups == ["x.py"]
+
+
+def test_gitlab_modes_reach_the_diff_file() -> None:
+    """GitLab's ``a_mode``/``b_mode`` become the file's modes (#397)."""
+    chmod, edited, added, odd = convert_forge_changes(
+        [
+            {
+                "old_path": "bin/run.sh",
+                "new_path": "bin/run.sh",
+                "a_mode": "100644",
+                "b_mode": "100755",
+                "diff": "",
+            },
+            {
+                "old_path": "bin/build.sh",
+                "new_path": "bin/build.sh",
+                "a_mode": "100644",
+                "b_mode": "100755",
+                "diff": "@@ -1 +1 @@\n-a\n+b\n",
+            },
+            {
+                "old_path": "new.py",
+                "new_path": "new.py",
+                "a_mode": "0",
+                "b_mode": "100644",
+                "new_file": True,
+                "diff": "@@ -0,0 +1 @@\n+x\n",
+            },
+            {
+                "old_path": "odd.py",
+                "new_path": "odd.py",
+                "a_mode": "[red]",
+                "b_mode": "",
+                "diff": "@@ -1 +1 @@\n-a\n+b\n",
+            },
+        ]
+    )
+
+    assert (chmod.old_mode, chmod.new_mode) == ("100644", "100755")
+    assert chmod.is_mode_only is True
+    assert chmod.mode_change == "mode 100644 -> 100755"
+    assert edited.is_mode_only is False
+    assert edited.mode_change == "mode 100644 -> 100755"
+    assert (added.old_mode, added.new_mode) == (None, "100644")
+    assert added.mode_change == ""
+    assert (odd.old_mode, odd.new_mode) == (None, None)
+
+
+def test_github_files_carry_no_modes() -> None:
+    (file,) = convert_forge_changes(
+        [{"filename": "a.py", "status": "modified", "patch": "@@ -1 +1 @@\n-a\n+b"}]
+    )
+
+    assert (file.old_mode, file.new_mode) == (None, None)
+    assert file.mode_change == ""
+
+
+def test_git_patch_modes_are_used_when_the_forge_sends_none() -> None:
+    (file,) = convert_forge_changes(
+        [
+            {
+                "old_path": "run.sh",
+                "new_path": "run.sh",
+                "diff": "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n",
+            }
+        ]
+    )
+
+    assert (file.old_mode, file.new_mode) == ("100644", "100755")
+    assert file.is_mode_only is True

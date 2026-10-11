@@ -385,7 +385,9 @@ def test_textual_floor_is_the_oldest_release_the_terminal_app_passes_on() -> Non
     2.0), ``notify(markup=False)`` (3.1) and ``OptionList(compact=True)``
     (3.2); python3-textual on Fedora 44 is 4.0.0, so the RPM floor stays
     installable there. The Fedora 44 probe installs exactly 4.0.0, so the core
-    suite runs on the floor itself and not only on the newest release.
+    suite runs on the floor itself and not only on the newest release. The
+    PyPI range stops below the next major, which must cover the locked release
+    build; raise it together with the diff render smoke tests.
     """
     pyproject = (ROOT / "pyproject.toml").read_text()
     release_inputs = (ROOT / "requirements" / "release.in").read_text()
@@ -398,8 +400,11 @@ def test_textual_floor_is_the_oldest_release_the_terminal_app_passes_on() -> Non
     )
     probe = (ROOT / "tests" / "containers" / "Containerfile").read_text()
 
-    assert '"textual>=4.0",' in pyproject
-    assert re.search(r"^textual>=4\.0$", release_inputs, re.MULTILINE)
+    assert '"textual>=4.0,<9",' in pyproject
+    release_lock = (ROOT / "requirements" / "release.lock").read_text()
+    locked = re.search(r"^textual==(\d+)\.", release_lock, re.MULTILINE)
+    assert locked is not None and 4 <= int(locked.group(1)) < 9
+    assert re.search(r"^textual>=4\.0,<9$", release_inputs, re.MULTILINE)
     assert "BuildRequires:  python3dist(textual) >= 4\n" in core_spec
     assert "Requires:       python3dist(textual) >= 4\n" in core_spec
     assert "python3dist(textual) >= 4" in manifest["core_runtime_requirements"]

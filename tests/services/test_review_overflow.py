@@ -88,11 +88,10 @@ class _GitLab:
             return httpx.Response(200, json=_merge_request(self.changes_count))
         if raw_path == f"{prefix}/{_NUMBER}/approvals":
             return httpx.Response(200, json={"approved_by": []})
-        if raw_path == f"{prefix}/{_NUMBER}/changes":
-            body = _merge_request(self.changes_count)
-            body["changes"] = [_change(index) for index in range(_FILES_RETURNED)]
-            body["overflow"] = True
-            return httpx.Response(200, json=body)
+        if raw_path == f"{prefix}/{_NUMBER}/diffs":
+            page = int(request.url.params.get("page", "1"))
+            files = [_change(index) for index in range(_FILES_RETURNED)]
+            return httpx.Response(200, json=files if page == 1 else [])
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
 
@@ -175,7 +174,7 @@ async def test_get_raw_diff_opens_an_overflowed_gitlab_mr(
     assert [change["new_path"] for change in diff.changes] == [
         f"vendor/file_{index}.py" for index in range(_FILES_RETURNED)
     ]
-    assert any(path.endswith("/changes") for path in forge.paths)
+    assert any(path.endswith("/diffs") for path in forge.paths)
 
 
 @pytest.mark.asyncio

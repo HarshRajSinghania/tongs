@@ -432,3 +432,32 @@ async def test_mutation_after_close_does_not_schedule_invalidation(
     assert client._closed is True
     assert client._invalidation_tasks == {}
     inner.add_comment.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_revision_read_bypasses_cache_and_reaches_inner(client, inner) -> None:
+    detail = object()
+    inner.get_mr_revision = AsyncMock(return_value=detail)
+
+    assert await client.get_mr_revision("org/repo", 7) is detail
+    assert await client.get_mr_revision("org/repo", 7) is detail
+
+    assert inner.get_mr_revision.await_count == 2
+    inner.get_mr_revision.assert_awaited_with("org/repo", 7)
+    inner.get_mr.assert_not_awaited()
+    inner.get_mr_fresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_revision_read_falls_back_to_fresh_read_of_older_inner(cache) -> None:
+    detail = object()
+
+    class OlderClient:
+        def __init__(self) -> None:
+            self.get_mr_fresh = AsyncMock(return_value=detail)
+
+    older = OlderClient()
+    wrapped = CachedForgeClient(inner=older, cache=cache, hostname="example.com")
+
+    assert await wrapped.get_mr_revision("org/repo", 7) is detail
+    older.get_mr_fresh.assert_awaited_once_with("org/repo", 7)
