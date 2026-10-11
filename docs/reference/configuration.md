@@ -34,6 +34,7 @@ ascii_mode = false
 [cache]
 mr_list_ttl = 60
 diff_ttl = 300
+file_content_ttl = "1d"
 max_size_mb = 100
 
 [concurrency]
@@ -115,10 +116,20 @@ screen does not wait on the network.
 |-----|------|---------|-------------|
 | `mr_list_ttl` | integer | `60` | How long, in seconds, a cached list of MRs stays fresh. |
 | `diff_ttl` | integer | `300` | How long, in seconds, a cached diff stays fresh. |
+| `file_content_ttl` | string | `"1d"` | How long a file read at a commit, to expand diff context, stays in the cache. |
 | `max_size_mb` | integer | `100` | The size limit of the cache database, in megabytes. |
 
-- **What is cached.** MR lists and diffs. Job logs are never cached. Reads that
-  check a review's current revision always go to the forge.
+Write `file_content_ttl` as a whole number followed by `h` for hours or `d`
+for days, for example `"12h"` or `"7d"`. The unit is lowercase, and the value
+must be from `"1h"` to `"365d"`. Any other value logs a warning and the
+default of one day applies.
+
+- **What is cached.** MR lists, diffs, and the files tongs reads at a commit
+  when you expand the context around a diff. Only file bodies of 1 MiB or
+  less are kept in the cache database; larger ones are read again in a new
+  session. A file at a commit never changes, so commenting on or approving a
+  review leaves these entries in place. Job logs are never cached. Reads that check a review's
+  current revision always go to the forge.
 - **When it refreshes.** An entry older than its time-to-live is fetched again.
   Approving, merging, commenting or submitting a review clears the affected
   entries, so the next read is fresh.

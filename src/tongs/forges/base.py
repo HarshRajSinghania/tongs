@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
+from tongs.errors import UnsupportedFileReadError
 from tongs.forges.models import (
     CIStatus,
     Commit,
@@ -112,6 +113,19 @@ class ForgeClient(ABC):
     async def get_mr_diff_fresh(self, repo_path: str, number: int) -> list[dict]:
         """Read diff changes without a response-cache result when supported."""
         return await self.get_mr_diff(repo_path, number)
+
+    async def get_file_at_ref(
+        self, repo_path: str, path: str, ref: str, *, max_bytes: int
+    ) -> bytes:
+        """Read one file's raw bytes at a commit.
+
+        ``path`` is the file's path in the repository and ``ref`` a commit SHA;
+        callers validate both before any request is built. A body larger than
+        ``max_bytes`` raises ContentTooLargeError, and a missing file raises
+        NotFoundError. Forge clients override this; a client without a file
+        read raises UnsupportedFileReadError.
+        """
+        raise UnsupportedFileReadError()
 
     @abstractmethod
     async def list_mr_commits(self, repo_path: str, number: int) -> list[Commit]: ...
@@ -366,3 +380,17 @@ async def read_mr_revision(
     if lookup is None:
         return await client.get_mr_fresh(repo_path, number)
     return await lookup(repo_path, number)
+
+
+async def read_file_at_ref(
+    client: ForgeClient, repo_path: str, path: str, ref: str, *, max_bytes: int
+) -> bytes:
+    """Read one file at a commit from any client.
+
+    A client without ``get_file_at_ref`` (a duck-typed test double or an older
+    plugin) raises UnsupportedFileReadError without contacting the forge.
+    """
+    lookup = getattr(client, "get_file_at_ref", None)
+    if lookup is None:
+        raise UnsupportedFileReadError()
+    return await lookup(repo_path, path, ref, max_bytes=max_bytes)

@@ -14,11 +14,13 @@ import httpx
 from tongs.errors import (
     AuthError,
     ConflictError,
+    ContentTooLargeError,
     ForgeError,
     ForgePermissionError,
     NetworkError,
     NotFoundError,
     RateLimitError,
+    UnsupportedFileReadError,
     ValidationError,
     redact_credentials,
 )
@@ -428,29 +430,142 @@ async def _send(
 
     if response.status_code >= 400:
         err = map_http_error(response)
-        if (
-            isinstance(err, RateLimitError)
-            and not _retried
-            and method.upper() in _RETRYABLE_METHODS
-        ):
-            delay = (
-                err.retry_after
-                if err.retry_after is not None
-                else DEFAULT_RETRY_AFTER_SECONDS
-            )
-            if delay > MAX_RETRY_AFTER_SECONDS:
-                log.warning(
-                    "Rate limited on %s %s for %ds; not retrying", method, path, delay
-                )
-                raise err
-            log.warning("Rate limited on %s %s, retrying in %ds", method, path, delay)
-            # The response is already read and closed, so no host request slot
-            # is held while sleeping.
-            await _sleep(delay)
-            return await _send(client, method, path, _retried=True, **kwargs)
+        if not _retried and method.upper() in _RETRYABLE_METHODS:
+            delay = _rate_limit_retry_delay(err, method, path)
+            if delay is not None:
+                # The response is already read and closed, so no host request
+                # slot is held while sleeping.
+                await _sleep(delay)
+                return await _send(client, method, path, _retried=True, **kwargs)
         raise err
 
     return response
+
+
+def _rate_limit_retry_delay(err: ForgeError, method: str, path: str) -> int | None:
+    """Return how long to wait before retrying ``err`` once, or ``None``.
+
+    Only a rate limit is retried, and only when the forge asks for a wait of
+    at most ``MAX_RETRY_AFTER_SECONDS``.
+    """
+    if not isinstance(err, RateLimitError):
+        return None
+    delay = (
+        err.retry_after if err.retry_after is not None else DEFAULT_RETRY_AFTER_SECONDS
+    )
+    if delay > MAX_RETRY_AFTER_SECONDS:
+        log.warning("Rate limited on %s %s for %ds; not retrying", method, path, delay)
+        return None
+    log.warning("Rate limited on %s %s, retrying in %ds", method, path, delay)
+    return delay
+
+
+#: The most bytes of an error body ``request_bytes`` reads before mapping it.
+ERROR_BODY_LIMIT = 64 * 1024
+
+# Headers that describe the wire body, dropped when an error body that was
+# already decoded is rebuilt for ``map_http_error``.
+_WIRE_BODY_HEADERS = frozenset(
+    {"content-encoding", "content-length", "transfer-encoding"}
+)
+
+
+async def request_bytes(
+    client: httpx.AsyncClient,
+    path: str,
+    *,
+    max_bytes: int,
+    params: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> bytes:
+    """GET ``path`` and return its body, refusing bodies over ``max_bytes``.
+
+    The response is streamed, so its host request slot is given back on every
+    exit: a body past the limit, a cancellation and an error status. A
+    ``Content-Length`` over the limit is refused before reading, and the limit
+    counts decoded bytes, so a compressed body cannot pass it. Redirects are
+    not followed, because they may lead to another host with the forge token;
+    a 3xx raises UnsupportedFileReadError. An error status is mapped with
+    ``map_http_error`` from at most ``ERROR_BODY_LIMIT`` bytes of its body, and
+    a rate limit is retried once, as ``request`` does.
+    """
+    if max_bytes < 0:
+        raise ValueError("max_bytes must not be negative")
+    result = await _stream_bytes(client, path, max_bytes, params, headers)
+    if isinstance(result, bytes):
+        return result
+    delay = _rate_limit_retry_delay(result, "GET", path)
+    if delay is None:
+        raise result
+    # The first response is closed, so no host request slot is held here.
+    await _sleep(delay)
+    retried = await _stream_bytes(client, path, max_bytes, params, headers)
+    if isinstance(retried, bytes):
+        return retried
+    raise retried
+
+
+async def _stream_bytes(
+    client: httpx.AsyncClient,
+    path: str,
+    max_bytes: int,
+    params: dict[str, str] | None,
+    headers: dict[str, str] | None,
+) -> bytes | ForgeError:
+    """Read one response; return its body or the error its status maps to."""
+    try:
+        async with client.stream(
+            "GET", path, params=params, headers=headers, follow_redirects=False
+        ) as response:
+            status = response.status_code
+            if 300 <= status < 400:
+                raise UnsupportedFileReadError(
+                    f"The forge answered the file read with a redirect ({status})"
+                )
+            if status >= 400:
+                body = await _read_prefix(response, ERROR_BODY_LIMIT)
+                return map_http_error(_error_response(response, body))
+            length = response.headers.get("Content-Length")
+            if (
+                length is not None
+                and _is_bounded_digits(length.strip())
+                and int(length.strip()) > max_bytes
+            ):
+                raise ContentTooLargeError(max_bytes)
+            data = bytearray()
+            async for chunk in response.aiter_bytes():
+                if len(data) + len(chunk) > max_bytes:
+                    raise ContentTooLargeError(max_bytes)
+                data.extend(chunk)
+            return bytes(data)
+    except httpx.TimeoutException as e:
+        raise NetworkError(f"Request timed out: {redact_credentials(str(e))}") from e
+    except httpx.RequestError as e:
+        raise NetworkError(f"Transport error: {redact_credentials(str(e))}") from e
+
+
+async def _read_prefix(response: httpx.Response, limit: int) -> bytes:
+    data = bytearray()
+    async for chunk in response.aiter_bytes():
+        data.extend(chunk[: limit - len(data)])
+        if len(data) >= limit:
+            break
+    return bytes(data)
+
+
+def _error_response(response: httpx.Response, body: bytes) -> httpx.Response:
+    """Rebuild a streamed error response around its already decoded prefix."""
+    headers = [
+        (name, value)
+        for name, value in response.headers.multi_items()
+        if name.lower() not in _WIRE_BODY_HEADERS
+    ]
+    return httpx.Response(
+        response.status_code,
+        headers=headers,
+        content=body,
+        request=response.request,
+    )
 
 
 async def paginate(

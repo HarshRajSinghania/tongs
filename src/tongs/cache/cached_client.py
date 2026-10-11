@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import re
 from dataclasses import asdict, replace
 from datetime import datetime
 from typing import Any
 
 from tongs.cache.store import CacheStore
+from tongs.config import DEFAULT_FILE_CONTENT_TTL
+from tongs.errors import UnsupportedFileReadError
 from tongs.forges.base import (
     ForgeClient,
     read_mr_ci_status,
@@ -27,6 +31,14 @@ from tongs.forges.models import (
 )
 
 _MAX_BACKGROUND_INVALIDATIONS = 64
+
+#: The default time a file body read at a commit stays cached, in seconds.
+FILE_CONTENT_TTL = int(DEFAULT_FILE_CONTENT_TTL.total_seconds())
+#: The largest file body kept in the cache database. Larger bodies are
+#: returned to the caller and never stored.
+FILE_CACHE_MAX_BYTES = 1024 * 1024
+# A full commit SHA (SHA-1 or SHA-256). Only these refs name immutable content.
+_FULL_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _BACKGROUND_CLOSE_TIMEOUT = 1.0
 
 
@@ -136,12 +148,14 @@ class CachedForgeClient:
         hostname: str,
         mr_list_ttl: int = 60,
         diff_ttl: int = 300,
+        file_content_ttl: int = FILE_CONTENT_TTL,
     ) -> None:
         self._inner = inner
         self._cache = cache
         self._hostname = hostname
         self._mr_list_ttl = mr_list_ttl
         self._diff_ttl = diff_ttl
+        self._file_content_ttl = file_content_ttl
         self._dirty_review_prefixes: dict[str, int] = {}
         self._dirty_generation = 0
         # The latest generation that marked each prefix dirty, kept after the
@@ -367,6 +381,43 @@ class CachedForgeClient:
     async def get_mr_diff_fresh(self, repo_path: str, number: int) -> list[dict]:
         """Bypass cached diff payloads for revision-bound reads."""
         return await self._inner.get_mr_diff_fresh(repo_path, number)
+
+    async def get_file_at_ref(
+        self, repo_path: str, path: str, ref: str, *, max_bytes: int
+    ) -> bytes:
+        """Read one file at a commit, keeping bodies of up to 1 MiB.
+
+        Content at a full commit SHA never changes, so no mutation drops it;
+        clearing the cache or the repository's cached reads does. Any other
+        ref is read from the forge every time. The path is hashed in the key,
+        because store prefix matching ignores case and a path may hold ':'.
+        A cached body longer than ``max_bytes`` counts as a miss, so the
+        forge read applies the caller's limit. Errors are never cached.
+        """
+        lookup = getattr(self._inner, "get_file_at_ref", None)
+        if lookup is None:
+            raise UnsupportedFileReadError()
+        if _FULL_SHA.fullmatch(ref) is None:
+            return await lookup(repo_path, path, ref, max_bytes=max_bytes)
+        digest = hashlib.sha256(path.encode("utf-8", "surrogatepass")).hexdigest()
+        key = self._key(repo_path, "file", ref, digest)
+        if self._is_dirty(key):
+            return await lookup(repo_path, path, ref, max_bytes=max_bytes)
+        cached = await self._cache.get(key)
+        if cached is not None and len(cached) <= max_bytes:
+            return cached
+        generation = self._begin_read()
+        try:
+            body = await lookup(repo_path, path, ref, max_bytes=max_bytes)
+            if (
+                isinstance(body, bytes)
+                and len(body) <= FILE_CACHE_MAX_BYTES
+                and self._may_store(key, generation)
+            ):
+                await self._cache.put(key, body, self._file_content_ttl)
+        finally:
+            self._end_read(generation)
+        return body
 
     # -- Mutations that invalidate cache --
 
