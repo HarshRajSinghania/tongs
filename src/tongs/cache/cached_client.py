@@ -39,6 +39,9 @@ FILE_CONTENT_TTL = int(DEFAULT_FILE_CONTENT_TTL.total_seconds())
 FILE_CACHE_MAX_BYTES = 1024 * 1024
 # A full commit SHA (SHA-1 or SHA-256). Only these refs name immutable content.
 _FULL_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+#: How long the merge base of two commits stays cached, in seconds. Two
+#: commits always have the same merge base, so only the cache size bounds it.
+MERGE_BASE_TTL = 7 * 24 * 60 * 60
 _BACKGROUND_CLOSE_TIMEOUT = 1.0
 
 
@@ -418,6 +421,32 @@ class CachedForgeClient:
         finally:
             self._end_read(generation)
         return body
+
+    async def get_merge_base(self, repo_path: str, base_sha: str, head_sha: str) -> str:
+        """Return the merge base of two commits, cached for seven days per pair.
+
+        The merge base of two full commit SHAs never changes, so no mutation
+        drops it; clearing the cache or the repository's cached reads does.
+        Only a full SHA answer is stored, and errors are never cached.
+        """
+        lookup = getattr(self._inner, "get_merge_base", None)
+        if lookup is None:
+            raise UnsupportedFileReadError("This forge can't find a merge base")
+        if (
+            _FULL_SHA.fullmatch(base_sha) is None
+            or _FULL_SHA.fullmatch(head_sha) is None
+        ):
+            return await lookup(repo_path, base_sha, head_sha)
+        key = self._key(repo_path, "merge_base", base_sha, head_sha)
+        cached = await self._cache.get(key)
+        if cached is not None:
+            text = cached.decode("ascii", "replace")
+            if _FULL_SHA.fullmatch(text) is not None:
+                return text
+        merge_base = await lookup(repo_path, base_sha, head_sha)
+        if isinstance(merge_base, str) and _FULL_SHA.fullmatch(merge_base):
+            await self._cache.put(key, merge_base.encode("ascii"), MERGE_BASE_TTL)
+        return merge_base
 
     # -- Mutations that invalidate cache --
 

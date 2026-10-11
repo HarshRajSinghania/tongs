@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -20,6 +21,14 @@ from tongs.forges.models import (
     PipelineJob,
     ReviewDecision,
 )
+
+# A full lowercase commit SHA (SHA-1 or SHA-256).
+_FULL_COMMIT_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def is_full_commit_sha(value: object) -> bool:
+    """Whether ``value`` is a full lowercase SHA-1 or SHA-256 commit id."""
+    return isinstance(value, str) and _FULL_COMMIT_SHA.fullmatch(value) is not None
 
 
 class ForgeClient(ABC):
@@ -126,6 +135,24 @@ class ForgeClient(ABC):
         read raises UnsupportedFileReadError.
         """
         raise UnsupportedFileReadError()
+
+    @property
+    def revision_base_is_merge_base(self) -> bool:
+        """Whether a review revision's base commit is its merge base.
+
+        GitLab's ``diff_refs.base_sha`` is the merge base. GitHub's base is
+        the target branch tip, which may have moved on since the branch
+        started, so its merge base is read with ``get_merge_base``.
+        """
+        return False
+
+    async def get_merge_base(self, repo_path: str, base_sha: str, head_sha: str) -> str:
+        """Return the full SHA of the merge base of two commits.
+
+        A forge that cannot find one raises NotFoundError, and a client
+        without this read raises UnsupportedFileReadError.
+        """
+        raise UnsupportedFileReadError("This forge can't find a merge base")
 
     @abstractmethod
     async def list_mr_commits(self, repo_path: str, number: int) -> list[Commit]: ...
@@ -394,3 +421,26 @@ async def read_file_at_ref(
     if lookup is None:
         raise UnsupportedFileReadError()
     return await lookup(repo_path, path, ref, max_bytes=max_bytes)
+
+
+def revision_base_is_merge_base(client: ForgeClient) -> bool:
+    """Whether ``client``'s revision base commits are merge bases.
+
+    Anything other than a plain ``True`` (a duck-typed double, an older
+    plugin) counts as no, so the merge base is read instead of assumed.
+    """
+    return getattr(client, "revision_base_is_merge_base", False) is True
+
+
+async def read_merge_base(
+    client: ForgeClient, repo_path: str, base_sha: str, head_sha: str
+) -> str:
+    """Read the merge base of two commits from any client.
+
+    A client without ``get_merge_base`` raises UnsupportedFileReadError
+    without contacting the forge.
+    """
+    lookup = getattr(client, "get_merge_base", None)
+    if lookup is None:
+        raise UnsupportedFileReadError("This forge can't find a merge base")
+    return await lookup(repo_path, base_sha, head_sha)

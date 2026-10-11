@@ -52,7 +52,7 @@ from tongs.services.mr_actions import (
     ReviewActionTarget,
     UnapproveReviewCommand,
 )
-from tongs.services.review_files import EXPAND_LIMITS, FileRead
+from tongs.services.review_files import EXPAND_LIMITS, FileRead, GeneratedDiff
 from tongs.services.review_mutations import (
     DiffAnchor,
     GeneralComment,
@@ -260,6 +260,14 @@ class TUIServiceAdapter:
         """Read one review file at a commit within the context expansion limits."""
         return await self.session.review_files.read_file(
             self.review_ref(summary), path, ref, limits=EXPAND_LIMITS
+        )
+
+    async def generate_file_diff(
+        self, summary: MRSummary, revision: ReviewRevision, file: DiffFile
+    ) -> GeneratedDiff:
+        """Generate a truncated file's diff locally from its two versions."""
+        return await self.session.review_files.generate_file_diff(
+            self.review_ref(summary), revision, file
         )
 
     async def get_discussions(self, summary: MRSummary) -> tuple[Discussion, ...]:
