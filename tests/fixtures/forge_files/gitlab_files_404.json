@@ -1,0 +1,88 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "gitlab",
+    "question": "2: the 404 shape",
+    "finding": "Each 404 names what is missing: File, Commit or Project. All are application/json."
+  },
+  "exchanges": [
+    {
+      "case": "missing_path",
+      "request": {
+        "method": "GET",
+        "path": "/projects/72724/repository/files/no%2Fsuch%2Ffile.txt/raw",
+        "params": {
+          "ref": "ddd0f15ae83993f5cb66a927a28673882e99100b"
+        }
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "Content-Length": "32",
+          "Content-Type": "application/json",
+          "Ratelimit-Limit": "2000",
+          "Ratelimit-Name": "throttle_authenticated_api",
+          "Ratelimit-Observed": "11",
+          "Ratelimit-Remaining": "1989",
+          "Ratelimit-Reset": "1791690060"
+        },
+        "body_bytes": 32,
+        "body_json": {
+          "message": "404 File Not Found"
+        }
+      }
+    },
+    {
+      "case": "missing_commit",
+      "request": {
+        "method": "GET",
+        "path": "/projects/72724/repository/files/README.md/raw",
+        "params": {
+          "ref": "0000000000000000000000000000000000000001"
+        }
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "Content-Length": "34",
+          "Content-Type": "application/json",
+          "Ratelimit-Limit": "2000",
+          "Ratelimit-Name": "throttle_authenticated_api",
+          "Ratelimit-Observed": "12",
+          "Ratelimit-Remaining": "1988",
+          "Ratelimit-Reset": "1791690060"
+        },
+        "body_bytes": 34,
+        "body_json": {
+          "message": "404 Commit Not Found"
+        }
+      }
+    },
+    {
+      "case": "missing_project",
+      "request": {
+        "method": "GET",
+        "path": "/projects/alustosa%2Fno-such-project-r0/repository/files/README.md/raw",
+        "params": {
+          "ref": "ddd0f15ae83993f5cb66a927a28673882e99100b"
+        }
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "Content-Length": "35",
+          "Content-Type": "application/json",
+          "Ratelimit-Limit": "2000",
+          "Ratelimit-Name": "throttle_authenticated_api",
+          "Ratelimit-Observed": "13",
+          "Ratelimit-Remaining": "1987",
+          "Ratelimit-Reset": "1791690060"
+        },
+        "body_bytes": 35,
+        "body_json": {
+          "message": "404 Project Not Found"
+        }
+      }
+    }
+  ]
+}

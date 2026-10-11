@@ -1,0 +1,56 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "github",
+    "question": "5: what the files endpoint sends for a truncated patch",
+    "source": "nodejs/node PR 66537 (3000 files, the files endpoint cap) and PR 60523",
+    "finding": "GitHub withholds the whole 'patch' key per file; no partial patch was seen. Across 4,598 files with a patch in three PRs, the +/- line counts always matched additions and deletions. The largest patch sent was 101,351 bytes, and files were withheld from about 100 KB of patch text regardless of position in the list, so the limit is per file. 168 of 3000 files in PR 66537 had no patch with positive counts.",
+    "stats": {
+      "files": 3000,
+      "withheld_with_changes": 17,
+      "largest_patch_bytes_sent": 101351
+    }
+  },
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/repos/nodejs/node/pulls/66537/files",
+        "params": {
+          "per_page": "100"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body_json": [
+          {
+            "sha": "c9437d50cf32ce48a498c625cda2ca4e198a7922",
+            "filename": "deps/crates/vendor/syn-v3/src/expr.rs",
+            "status": "added",
+            "additions": 4237,
+            "deletions": 0,
+            "changes": 4237
+          },
+          {
+            "sha": "376a65fce40f451c2758094a7aed5a526d536981",
+            "filename": "deps/crates/vendor/syn-v3/src/gen/debug.rs",
+            "status": "added",
+            "additions": 3399,
+            "deletions": 0,
+            "changes": 3399
+          },
+          {
+            "sha": "df3a4554feb356ed7a2afa57a9cd88e0d944d344",
+            "filename": "deps/crates/vendor/syn-v3/src/gen/fold.rs",
+            "status": "added",
+            "additions": 3934,
+            "deletions": 0,
+            "changes": 3934
+          }
+        ],
+        "body_trimmed": true,
+        "note": "entries without a patch key, as sent; blob_url, raw_url and contents_url dropped"
+      }
+    }
+  ]
+}

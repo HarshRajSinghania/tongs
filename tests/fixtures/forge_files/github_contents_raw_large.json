@@ -1,0 +1,106 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "github",
+    "question": "1: raw contents read of a 1 to 100 MB file at a SHA",
+    "source": "torvalds/linux (public)",
+    "finding": "200 with Content-Length equal to the blob size and the ETag equal to the git blob SHA-1; no redirect; raw contents were not compressed. The default JSON accept returns content '' and encoding 'none' above 1 MB."
+  },
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/repos/torvalds/linux/contents/drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_3_2_0_sh_mask.h",
+        "params": {
+          "ref": "a5ebb76233b79db01e82e061173cb73c6d2b5c6b"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Length": "24009174",
+          "Content-Type": "application/vnd.github.raw; charset=utf-8",
+          "Etag": "\"a89fe19c4c8425af8fdff92d810b00c9804b320e\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4996",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "4"
+        },
+        "body_bytes": 24009174,
+        "body_omitted": "third-party or bulky file content; size and git blob id recorded",
+        "body_git_blob_sha1": "a89fe19c4c8425af8fdff92d810b00c9804b320e",
+        "note": "elapsed 1.02 s"
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/repos/torvalds/linux/contents/drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_3_0_0_sh_mask.h",
+        "params": {
+          "ref": "a5ebb76233b79db01e82e061173cb73c6d2b5c6b"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Length": "7633124",
+          "Content-Type": "application/vnd.github.raw; charset=utf-8",
+          "Etag": "\"92c3ba54effa3d1e73bee21e506c919a00400a31\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4995",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "5"
+        },
+        "body_bytes": 7633124,
+        "body_omitted": "third-party or bulky file content; size and git blob id recorded",
+        "body_git_blob_sha1": "92c3ba54effa3d1e73bee21e506c919a00400a31",
+        "note": "elapsed 0.64 s"
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/repos/torvalds/linux/contents/drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_3_0_0_sh_mask.h",
+        "params": {
+          "ref": "a5ebb76233b79db01e82e061173cb73c6d2b5c6b"
+        },
+        "headers": {
+          "Accept": "application/vnd.github+json"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Length": "1237",
+          "Content-Type": "application/json; charset=utf-8",
+          "Etag": "\"92c3ba54effa3d1e73bee21e506c919a00400a31\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4994",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "6"
+        },
+        "body_bytes": 1237,
+        "body_json": {
+          "name": "dcn_3_0_0_sh_mask.h",
+          "path": "drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_3_0_0_sh_mask.h",
+          "sha": "92c3ba54effa3d1e73bee21e506c919a00400a31",
+          "size": 7633124,
+          "type": "file",
+          "content": "",
+          "encoding": "none",
+          "download_url": "https://raw.githubusercontent.com/torvalds/linux/a5ebb76233b79db01e82e061173cb73c6d2b5c6b/drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_3_0_0_sh_mask.h"
+        },
+        "body_trimmed": true
+      }
+    }
+  ]
+}

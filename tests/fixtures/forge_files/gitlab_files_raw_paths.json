@@ -1,0 +1,138 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "gitlab",
+    "question": "2: path encoding, nested paths, spaces and unicode",
+    "source": "gitlab-org/gitlab-test (project 72724, MIT)",
+    "finding": "quote(path, safe='') works: '/' must be %2F. An unencoded '/' in the path gives a route-level 404 {'error': '404 Not Found'}, distinct from the files 404 {'message': '404 File Not Found'}. No public GitLab file with '#', '?' or '%' was found; the quoted '#' probe is a normal files 404. The unicode file starts with a UTF-8 BOM."
+  },
+  "exchanges": [
+    {
+      "case": "space_nested",
+      "repo_path": "with space/README.md",
+      "request": {
+        "method": "GET",
+        "path": "/projects/72724/repository/files/with%20space%2FREADME.md/raw",
+        "params": {
+          "ref": "ddd0f15ae83993f5cb66a927a28673882e99100b"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Disposition": "inline; filename=\"README.md\"; filename*=UTF-8''README.md",
+          "Content-Length": "36",
+          "Content-Type": "text/plain; charset=utf-8",
+          "Ratelimit-Limit": "2000",
+          "Ratelimit-Name": "throttle_authenticated_api",
+          "Ratelimit-Observed": "7",
+          "Ratelimit-Remaining": "1993",
+          "Ratelimit-Reset": "1791690060",
+          "X-Gitlab-Blob-Id": "8c3014aceae45386c3c026a7ea4a1f68660d51d6",
+          "X-Gitlab-Commit-Id": "ddd0f15ae83993f5cb66a927a28673882e99100b",
+          "X-Gitlab-Content-Sha256": "4067b9365f5e1b5b1bf9f70ef91908e6566a655667d1f31e9d165e47ff386b64",
+          "X-Gitlab-Encoding": "base64",
+          "X-Gitlab-Execute-Filemode": "false",
+          "X-Gitlab-File-Name": "README.md",
+          "X-Gitlab-File-Path": "with space/README.md",
+          "X-Gitlab-Last-Commit-Id": "38008cb17ce1466d8fec2dfa6f6ab8dcfe5cf49e",
+          "X-Gitlab-Ref": "ddd0f15ae83993f5cb66a927a28673882e99100b",
+          "X-Gitlab-Size": "36"
+        },
+        "body_bytes": 36,
+        "body_text": "This is a directory with much space.",
+        "body_git_blob_sha1": "8c3014aceae45386c3c026a7ea4a1f68660d51d6"
+      }
+    },
+    {
+      "case": "unicode_with_bom",
+      "repo_path": "encoding/テスト.txt",
+      "request": {
+        "method": "GET",
+        "path": "/projects/72724/repository/files/encoding%2F%E3%83%86%E3%82%B9%E3%83%88.txt/raw",
+        "params": {
+          "ref": "ddd0f15ae83993f5cb66a927a28673882e99100b"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Disposition": "inline; filename=\"%3F%3F%3F.txt\"; filename*=UTF-8''%E3%83%86%E3%82%B9%E3%83%88.txt",
+          "Content-Type": "text/plain; charset=utf-8",
+          "Ratelimit-Limit": "2000",
+          "Ratelimit-Name": "throttle_authenticated_api",
+          "Ratelimit-Observed": "8",
+          "Ratelimit-Remaining": "1992",
+          "Ratelimit-Reset": "1791690060",
+          "X-Gitlab-Blob-Id": "f3064a3aa9c14277483f690250072e987e2c8356",
+          "X-Gitlab-Commit-Id": "ddd0f15ae83993f5cb66a927a28673882e99100b",
+          "X-Gitlab-Content-Sha256": "fd17c7d168de2252c0dc31c867eaf6ab79c1ee5494e562441d211b04a5f83f0c",
+          "X-Gitlab-Encoding": "base64",
+          "X-Gitlab-Execute-Filemode": "true",
+          "X-Gitlab-File-Name": "ãã¹ã.txt",
+          "X-Gitlab-File-Path": "encoding/テスト.txt",
+          "X-Gitlab-Last-Commit-Id": "913c66a37b4a45b9769037c55c2d238bd0942d2e",
+          "X-Gitlab-Ref": "ddd0f15ae83993f5cb66a927a28673882e99100b",
+          "X-Gitlab-Size": "340"
+        },
+        "body_bytes": 340,
+        "body_text": "﻿これはテスト\n追記\nマージしてください\nさらに追記\nWebHookの確認\nもう一回WebHookの確認\nもう一回WebHookの確認\nもう一回WebHookの確認\nもう一回WebHookの確認\nもう一回WebHookの確認\npost-recieve hookのテスト\nもう一回post-recieve hookのテスト\nエクセルファイルを追加",
+        "body_git_blob_sha1": "f3064a3aa9c14277483f690250072e987e2c8356"
+      }
+    },
+    {
+      "case": "nested_unencoded",
+      "repo_path": "with space/README.md",
+      "request": {
+        "method": "GET",
+        "path": "/projects/72724/repository/files/with%20space/README.md/raw",
+        "params": {
+          "ref": "ddd0f15ae83993f5cb66a927a28673882e99100b"
+        }
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "Content-Length": "25",
+          "Content-Type": "application/json",
+          "Ratelimit-Limit": "2000",
+          "Ratelimit-Name": "throttle_authenticated_api",
+          "Ratelimit-Observed": "9",
+          "Ratelimit-Remaining": "1991",
+          "Ratelimit-Reset": "1791690060"
+        },
+        "body_bytes": 25,
+        "body_json": {
+          "error": "404 Not Found"
+        }
+      }
+    },
+    {
+      "case": "hash_quoted_probe",
+      "repo_path": "files/C#/x.cs",
+      "request": {
+        "method": "GET",
+        "path": "/projects/72724/repository/files/files%2FC%23%2Fx.cs/raw",
+        "params": {
+          "ref": "ddd0f15ae83993f5cb66a927a28673882e99100b"
+        }
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "Content-Length": "32",
+          "Content-Type": "application/json",
+          "Ratelimit-Limit": "2000",
+          "Ratelimit-Name": "throttle_authenticated_api",
+          "Ratelimit-Observed": "10",
+          "Ratelimit-Remaining": "1990",
+          "Ratelimit-Reset": "1791690060"
+        },
+        "body_bytes": 32,
+        "body_json": {
+          "message": "404 File Not Found"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,80 @@
+{
+  "_meta": {
+    "recorded": "2026-10-10",
+    "forge": "github",
+    "question": "1: a fork PR's head SHA read through the base repository",
+    "source": "github-linguist/linguist PR 8265 (open, from a fork) and PR 8227 (closed, fork deleted)",
+    "finding": "Both reads through the base repository return 200 and the ETag equals the blob sha the pulls/files entry reports for that file, so the fork head content resolves through the base repo even after the fork is deleted."
+  },
+  "exchanges": [
+    {
+      "case": "open_fork_pr",
+      "pull": {
+        "number": 8265,
+        "head_sha": "4c8de62af1693131afcc568dde2da47244187c8f",
+        "files_entry_sha": "c886a94b83691b6a709c05ecbbcba6f8e727aee7"
+      },
+      "request": {
+        "method": "GET",
+        "path": "/repos/github-linguist/linguist/contents/lib/linguist/generated.rb",
+        "params": {
+          "ref": "4c8de62af1693131afcc568dde2da47244187c8f"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Length": "31383",
+          "Content-Type": "application/vnd.github.raw; charset=utf-8",
+          "Etag": "\"c886a94b83691b6a709c05ecbbcba6f8e727aee7\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4959",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "41"
+        },
+        "body_bytes": 31383,
+        "body_omitted": "third-party or bulky file content; size and git blob id recorded",
+        "body_git_blob_sha1": "c886a94b83691b6a709c05ecbbcba6f8e727aee7"
+      }
+    },
+    {
+      "case": "deleted_fork_pr",
+      "pull": {
+        "number": 8227,
+        "head_repo": null,
+        "head_sha": "678db5a1b89888a043abd0944d2e13c1160c83ae",
+        "files_entry_sha": "6f128fd18cb8a7a3c074d43a4c6f3abd9c0b8bb1"
+      },
+      "request": {
+        "method": "GET",
+        "path": "/repos/github-linguist/linguist/contents/lib/linguist/languages.yml",
+        "params": {
+          "ref": "678db5a1b89888a043abd0944d2e13c1160c83ae"
+        },
+        "headers": {
+          "Accept": "application/vnd.github.raw"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Length": "166091",
+          "Content-Type": "application/vnd.github.raw; charset=utf-8",
+          "Etag": "\"6f128fd18cb8a7a3c074d43a4c6f3abd9c0b8bb1\"",
+          "X-Ratelimit-Limit": "5000",
+          "X-Ratelimit-Remaining": "4955",
+          "X-Ratelimit-Reset": "1791693135",
+          "X-Ratelimit-Resource": "core",
+          "X-Ratelimit-Used": "45"
+        },
+        "body_bytes": 166091,
+        "body_omitted": "third-party or bulky file content; size and git blob id recorded",
+        "body_git_blob_sha1": "6f128fd18cb8a7a3c074d43a4c6f3abd9c0b8bb1"
+      }
+    }
+  ]
+}
