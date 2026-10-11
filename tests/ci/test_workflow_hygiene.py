@@ -630,7 +630,11 @@ def test_the_builder_runs_weekly_on_dispatch_and_on_builder_pushes_to_main(
 
 
 def _push_paths_match(patterns: list[str], path: str) -> bool:
-    """Evaluate GitHub push path filters in order: the last match decides."""
+    """Evaluate GitHub push path filters in order: the last match decides.
+
+    ``fnmatch`` lets a single ``*`` cross ``/``, which GitHub's filter does not,
+    so this only models ``**`` globs and literal paths, the forms used here.
+    """
     matched = False
     for pattern in patterns:
         negated = pattern.startswith("!")

@@ -222,7 +222,10 @@ branch does nothing.
   `packaging/rpm/builder/image.json` with `scripts/pin_rpm_builder.py` and
   opens or updates one pull request from the `automation/rpm-builder-pin`
   branch, force-pushing that branch each time. When the pin already holds the
-  new digest it does nothing.
+  new digest it does nothing, but Podman builds are not reproducible, so in
+  practice every run produces a new digest and a pin pull request is expected
+  each week. Two runs from the same commit on the same UTC day push the same
+  tag; the digest, not the tag, identifies an image.
 
 The image carries the source builder and companion builder tool sets, the
 tools of each rebuild layer and every declared `BuildRequires` of the
@@ -249,9 +252,12 @@ One-time setup, in this order:
 3. In the package settings, make `tongs-rpm-builder` public (this cannot be
    undone) and keep "Inherit access from repository", so fork pull requests
    and local Podman runs pull it without credentials.
-4. Approve the CI run of each pin pull request, which GitHub requires for
-   pull requests opened with the workflow token, then review and merge it like
-   any other. A pin change under `packaging/` runs the full graph.
+4. Start CI on each pin pull request by hand. GitHub starts no workflow runs
+   for events the workflow token causes, so the pull request opens with no
+   `CI aggregate` check. Close and reopen it (or push to its branch); that
+   event comes from you and runs `ci.yml`. If GitHub instead shows an
+   "Approve and run" button, use that. Then review and merge it like any
+   other. A pin change under `packaging/` runs the full graph.
 
 Keep every published version: a release tag must stay rebuildable from the
 digest it pins.
