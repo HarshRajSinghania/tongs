@@ -87,14 +87,13 @@ jobs:
           REGISTRY_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # One runner-scoped credential file that podman and the attest
-          # action both read; it is removed at the end of the job.
-          auth_dir="$RUNNER_TEMP/registry-auth"
-          install -d -m 700 "$auth_dir"
-          printf 'DOCKER_CONFIG=%s\n' "$auth_dir" >> "$GITHUB_ENV"
-          printf 'REGISTRY_AUTH_FILE=%s/config.json\n' "$auth_dir" >> "$GITHUB_ENV"
+          # actions/attest reads only ~/.docker/config.json and ignores
+          # DOCKER_CONFIG, so podman writes the credential there for both.
+          # The last step logs out again.
+          install -d -m 700 "$HOME/.docker"
+          printf 'REGISTRY_AUTH_FILE=%s/.docker/config.json\n' "$HOME" >> "$GITHUB_ENV"
           printf '%s' "$REGISTRY_TOKEN" | podman login ghcr.io \
-            --authfile "$auth_dir/config.json" \
+            --authfile "$HOME/.docker/config.json" \
             --username "$GITHUB_ACTOR" --password-stdin
       - name: Push the image and record its digest
         id: push
@@ -123,8 +122,7 @@ jobs:
       - name: Remove the registry credentials
         if: ${{ always() }}
         run: |
-          podman logout --authfile "$RUNNER_TEMP/registry-auth/config.json" ghcr.io || true
-          rm -rf -- "$RUNNER_TEMP/registry-auth"
+          podman logout --authfile "$HOME/.docker/config.json" ghcr.io || true
 
   pin:
     name: Propose the new builder pin

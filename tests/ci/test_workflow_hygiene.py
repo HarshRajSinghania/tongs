@@ -718,9 +718,16 @@ def test_the_builder_publish_job_pushes_by_digest_and_attests_it(
     for step in job["steps"]:
         if step is not login:
             assert "github.token" not in str(step), step.get("name")
+    # actions/attest reads only ~/.docker/config.json, so the login writes
+    # there and the last step always removes the credential again.
+    assert '--authfile "$HOME/.docker/config.json"' in login["run"]
+    assert "DOCKER_CONFIG=" not in str(job)
     cleanup = job["steps"][-1]
     assert cleanup["if"] == "${{ always() }}"
-    assert "registry-auth" in cleanup["run"]
+    assert (
+        'podman logout --authfile "$HOME/.docker/config.json" ghcr.io'
+        in (cleanup["run"])
+    )
 
 
 def test_the_builder_pin_job_only_proposes_a_pull_request(

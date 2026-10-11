@@ -213,7 +213,8 @@ branch does nothing.
   `attestations: write`) checks `packaging/rpm/builder/packages.txt` against
   the RPM sources, resolves the current `registry.fedoraproject.org/fedora:44`
   digest, builds from that digest, logs in with `podman login ghcr.io`
-  reading the workflow token on stdin, pushes the tag
+  reading the workflow token on stdin (into `~/.docker/config.json`, the only
+  file `actions/attest` reads; the job logs out at the end), pushes the tag
   `fedora44-<YYYYMMDD>-<12-character sha>` with `podman push --digestfile`,
   and attests the pushed digest with the same `actions/attest` pin as the
   release (`push-to-registry: true`). It is the only job in the repository
