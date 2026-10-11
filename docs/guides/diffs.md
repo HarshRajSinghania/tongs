@@ -95,7 +95,9 @@ long the file is. Long unchanged stretches inside a change fold the same way.
 - **Read-only lines.** You can't comment on an expanded line. GitHub accepts
   comments only on lines inside the changed parts, and tongs checks the same
   rule for every forge. ++c++, ++f3++, ++d++, ++r++ and ++shift+r++ on an
-  expanded line say so, and a selection can't stretch across a gap row.
+  expanded line say so. On a fold inside a change they ask you to press ++e++
+  first. A selection can't cross a gap row between changes, but it can span a
+  fold inside a change.
 - **Limits.** tongs expands files up to 2 MiB and 20,000 lines. Past that,
   pressing ++e++ says the file is too large. ++shift+f++ also stops at 20,000
   lines on screen and asks you to expand single gaps instead.
@@ -113,7 +115,8 @@ GitLab marks it as too large. tongs keeps the file in the tree and shows:
 > locally (downloads both versions of the file).
 
 When the forge sends only part of a file's diff, the same notice stands above
-the parts it sent, in both views.
+the parts it sent, in both views. ++e++ on a fold inside those parts opens the
+fold; anywhere else it generates the diff.
 
 | Key | Action |
 |-----|--------|

@@ -43,6 +43,7 @@ from tongs.helpers import relative_time
 from tongs.state.drafts import DiffSide
 from tongs.widgets.review_draft import DraftMarker
 from tongs.widgets.split_diff import (
+    FOLD_READ_ONLY_MESSAGE,
     GENERATED_COMMENT_MESSAGE,
     RANGE_CROSSES_GAP_MESSAGE,
     READ_ONLY_LINE_MESSAGE,
@@ -383,7 +384,10 @@ class DiffOptionList(TintedOptionList):
     def _refuse_read_only(self, *, commenting: bool = False) -> bool:
         """Notify and return True when the cursor or range cannot take a comment."""
         if self._on_read_only_row():
-            self.app.notify(READ_ONLY_LINE_MESSAGE)
+            # A fold inside a hunk hides lines that take a comment once shown.
+            gap = self.cursor_gap()
+            fold = gap is not None and gap.position is GapPosition.INSIDE
+            self.app.notify(FOLD_READ_ONLY_MESSAGE if fold else READ_ONLY_LINE_MESSAGE)
             return True
         if commenting and self._range_crosses_read_only_row():
             self.app.notify(RANGE_CROSSES_GAP_MESSAGE)
@@ -1041,9 +1045,10 @@ class DiffContent(Widget):
     def expand_gap(self, file: DiffFile, gap_index: int) -> bool:
         """Open one gap of a file whose lines are loaded.
 
-        The cursor lands on the first newly shown line, in either layout.
-        Returns False when the gap has no lines, which happens when the file
-        ends at the last hunk.
+        The cursor lands on the first newly shown line, in either layout, if
+        it is still on that gap's row. A reader who moved on while the file
+        was read keeps their cursor and selection. Returns False when the gap
+        has no lines, which happens when the file ends at the last hunk.
         """
         model = self.context_model(file)
         if model is None:
@@ -1054,8 +1059,15 @@ class DiffContent(Widget):
             return False
         self._set_expansion(file, self.file_expansion(file).expand(gap_index))
         if self._current_file is file and not self._showing_preview:
-            self._render_current_file()
-            self._land_on_read_only(lines[0])
+            gap = self.cursor_gap()
+            on_gap = (
+                gap is not None
+                and gap.position is not GapPosition.INSIDE
+                and gap.index == gap_index
+            )
+            self._render_current_file(self.selection)
+            if on_gap:
+                self._land_on_read_only(lines[0])
             self.post_message(DiffSelectionChanged(self.selection))
         return True
 
@@ -1095,9 +1107,13 @@ class DiffContent(Widget):
         if not current:
             return
         self._render_current_file(selection)
-        if selection is None and target is not None:
-            # The cursor was on a gap row or an expanded line: stay on the
-            # same line, or on the gap row that now holds it.
+        restored = self.selection
+        if target is not None and (
+            selection is None or restored is None or restored.line is not selection.line
+        ):
+            # The cursor was on a gap row or an expanded line, or on a line
+            # that now folds away: stay on the same line, or on the gap row
+            # or fold that now holds it.
             self._land_on(target)
         self.post_message(DiffSelectionChanged(self.selection))
 
@@ -1717,7 +1733,9 @@ class DiffRenderer:
         new = f"{dl.new_lineno:>4}" if dl.new_lineno is not None else "    "
         gutter = Text(f"{old} {new} ", style=Style(dim=True))
         key = (dl.old_lineno, dl.new_lineno)
-        if key in self._comment_lines:
+        # A thread on a line outside the hunks cannot be opened from the
+        # diff, so an expanded line never shows a thread marker.
+        if dl.line_type is not LineType.EXPANDED and key in self._comment_lines:
             all_resolved = self._comment_lines[key]
             if all_resolved:
                 gutter.append("* ", Style(dim=True))
@@ -2354,7 +2372,13 @@ class DiffPanel(Widget):
 
     def _owns(self, file: DiffFile) -> bool:
         """Whether a file object belongs to the files on screen now."""
-        return any(candidate is file for candidate in self._files)
+        return self.index_of(file) is not None
+
+    def index_of(self, file: DiffFile) -> int | None:
+        """Return where a file object sits in the files on screen, or None."""
+        return next(
+            (index for index, shown in enumerate(self._files) if shown is file), None
+        )
 
     def action_expand_context(self) -> None:
         """Open the gap under the cursor, reading the file the first time.
@@ -2366,11 +2390,16 @@ class DiffPanel(Widget):
         file = self._shown_file()
         if file is None:
             return
-        if file.is_truncated and not file.is_binary:
-            self._toggle_generation(file)
-            return
         content = self.query_one("#diff-content", DiffContent)
         gap = content.cursor_gap()
+        if file.is_truncated and not file.is_binary:
+            # A partly sent file still folds long context inside its hunks,
+            # and those rows say e opens them.
+            if gap is not None and gap.position is GapPosition.INSIDE:
+                content.reveal_fold(file, gap)
+            else:
+                self._toggle_generation(file)
+            return
         if gap is None:
             self.app.notify(MOVE_TO_GAP_MESSAGE)
             return
@@ -2420,7 +2449,12 @@ class DiffPanel(Widget):
         self.post_message(ContextRequested(file, None))
 
     def _show_full_file(self, file: DiffFile, model: FileContextModel | None) -> None:
-        rows = model.full_view_rows() if model is not None else 0
+        # With no read, the hunks hold the whole file: count their lines.
+        rows = (
+            model.full_view_rows()
+            if model is not None
+            else sum(len(hunk.lines) for hunk in file.hunks)
+        )
         if rows > FULL_FILE_MAX_ROWS:
             self.app.notify(FULL_FILE_TOO_LARGE_MESSAGE.format(rows=rows), markup=False)
             return

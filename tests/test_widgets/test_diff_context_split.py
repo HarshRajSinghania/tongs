@@ -11,6 +11,7 @@ from tongs.diff.models import DiffFile, LineType
 from tongs.diff.parser import parse_diff
 from tongs.state.drafts import DiffSide
 from tongs.widgets.diff_panel import (
+    FOLD_READ_ONLY_MESSAGE,
     RANGE_CROSSES_GAP_MESSAGE,
     READ_ONLY_LINE_MESSAGE,
     CommentRequested,
@@ -372,6 +373,43 @@ async def test_inside_fold_opens_with_no_read_in_the_unified_view() -> None:
         assert [n for n in numbers if n is not None and 13 <= n <= 22] == list(
             range(13, 23)
         )
+
+
+@pytest.mark.parametrize("mode", [DiffViewMode.UNIFIED, DiffViewMode.SPLIT])
+@pytest.mark.parametrize("key", ["c", "f3", "d", "r", "R"])
+@pytest.mark.asyncio
+async def test_comment_keys_on_a_fold_ask_to_show_its_lines_first(
+    key: str, mode: DiffViewMode
+) -> None:
+    app = _SplitApp()
+    async with app.run_test(size=(200, 60), notifications=True) as pilot:
+        panel = app.query_one(DiffPanel)
+        panel.set_files([_file(WIDE_CONTEXT)])
+        panel.request_mode(mode)
+        await pilot.pause()
+        column = (
+            _columns(app)[1]
+            if mode is DiffViewMode.SPLIT
+            else app.query_one(DiffOptionList)
+        )
+        column.focus()
+        await pilot.pause()
+        fold = min(
+            index
+            for index, gap in column._gap_rows.items()
+            if gap.position is GapPosition.INSIDE
+        )
+
+        column.highlighted = fold
+        await pilot.pause()
+        await pilot.press(key)
+        await pilot.pause()
+
+        assert _messages(app) == [FOLD_READ_ONLY_MESSAGE]
+        assert FOLD_READ_ONLY_MESSAGE == (
+            "Press e to show these lines, then comment on one."
+        )
+        assert app.comments == []
 
 
 def test_fold_markers_still_read_as_text() -> None:

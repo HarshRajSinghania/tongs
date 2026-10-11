@@ -481,9 +481,13 @@ async def request_bytes(
     """GET ``path`` and return its body, refusing bodies over ``max_bytes``.
 
     The response is streamed, so its host request slot is given back on every
-    exit: a body past the limit, a cancellation and an error status. A
-    ``Content-Length`` over the limit is refused before reading, and the limit
-    counts decoded bytes, so a compressed body cannot pass it. An error status
+    exit: a body past the limit, a cancellation and an error status. The read
+    asks for ``Accept-Encoding: identity``, so the wire bytes are the counted
+    bytes: a ``Content-Length`` over the limit is refused before reading, and
+    the limit counts the bytes as they arrive. A forge that compresses the body
+    anyway is still capped on decoded bytes, but its ``Content-Length`` is not
+    trusted for the early refusal, and one wire chunk may briefly decode past
+    the limit before the read is refused. An error status
     is mapped with ``map_http_error`` from at most ``ERROR_BODY_LIMIT`` bytes
     of its body, and a rate limit is retried once, as ``request`` does.
 
@@ -495,6 +499,7 @@ async def request_bytes(
     """
     if max_bytes < 0:
         raise ValueError("max_bytes must not be negative")
+    headers = {**(headers or {}), "Accept-Encoding": "identity"}
     target: str | httpx.URL = path
     request_params = params
     hops = 0
@@ -574,7 +579,7 @@ async def _stream_bytes(
     target: str | httpx.URL,
     max_bytes: int,
     params: dict[str, str] | None,
-    headers: dict[str, str] | None,
+    headers: dict[str, str],
     first_params: dict[str, str] | None,
 ) -> bytes | httpx.URL | ForgeError:
     """Read one response.
@@ -594,8 +599,10 @@ async def _stream_bytes(
                 body = await _read_prefix(response, ERROR_BODY_LIMIT)
                 return map_http_error(_error_response(response, body))
             length = response.headers.get("Content-Length")
+            encoding = response.headers.get("Content-Encoding", "identity")
             if (
                 length is not None
+                and encoding.strip().lower() == "identity"
                 and _is_bounded_digits(length.strip())
                 and int(length.strip()) > max_bytes
             ):

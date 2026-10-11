@@ -539,3 +539,52 @@ async def test_comments_on_a_generated_diff_never_reach_the_editor(
             await pilot.pause()
         assert not editor.display
         assert _messages(app).count(GENERATED_COMMENT_MESSAGE) == before + 2
+
+
+@pytest.mark.asyncio
+async def test_a_quick_start_cancel_start_ends_generated_not_cancelled(
+    tmp_path: Path,
+) -> None:
+    app, _forge, http = await _build(tmp_path, GITHUB)
+    async with http, app.run_test(size=(200, 60), notifications=True) as pilot:
+        panel = await _open_diff(app, pilot)
+        truncated = panel._files[0]
+
+        # Three presses land before the screen handles any of their messages:
+        # start, cancel, start. The cancel must stop only the first download.
+        for _ in range(3):
+            panel.action_expand_context()
+        assert panel.is_generating(truncated)
+
+        await _until(pilot, _wait_for_generation(app))
+        assert panel._files[0].generated_locally
+        assert GENERATION_CANCELLED_MESSAGE not in _rows(app)
+        _check_numbers(_unified_lines(app))
+
+
+@pytest.mark.parametrize("same_files", [False, True], ids=["rebuilt", "copied"])
+@pytest.mark.asyncio
+async def test_generation_finds_the_file_in_the_panel_list(
+    tmp_path: Path, same_files: bool
+) -> None:
+    app, _forge, http = await _build(tmp_path, GITHUB)
+    async with http, app.run_test(size=(200, 60), notifications=True) as pilot:
+        panel = await _open_diff(app, pilot)
+        screen = app.screen
+        assert isinstance(screen, MRDetailScreen)
+        truncated = panel._files[0]
+        # Loading discussions after a refresh can rebuild the screen's list
+        # from its own diff read, with other file objects.
+        cached = list(panel._files) if same_files else [replace(truncated)]
+        screen._cached_diff_files = cached
+
+        await pilot.press("e")
+        await _until(pilot, _wait_for_generation(app))
+
+        generated = panel._files[0]
+        assert generated.generated_locally
+        if same_files:
+            assert cached[0] is generated
+        else:
+            assert cached[0] is not generated
+            assert cached[0].is_truncated

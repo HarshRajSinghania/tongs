@@ -48,6 +48,9 @@ READ_ONLY_LINE_MESSAGE = (
 )
 """Shown when a comment key is pressed on a gap row or an expanded line."""
 
+FOLD_READ_ONLY_MESSAGE = "Press e to show these lines, then comment on one."
+"""Shown when a comment key is pressed on a fold inside a hunk."""
+
 RANGE_CROSSES_GAP_MESSAGE = "A comment range must stay inside one hunk."
 """Shown when a J/K range includes a gap row or an expanded line."""
 
@@ -361,7 +364,10 @@ class SplitDiffColumn(TintedOptionList):
     def _refuse_read_only(self, *, commenting: bool = False) -> bool:
         """Notify and return True when the cursor or range cannot take a comment."""
         if self._on_read_only_row():
-            self.app.notify(READ_ONLY_LINE_MESSAGE)
+            # A fold inside a hunk hides lines that take a comment once shown.
+            gap = self.cursor_gap()
+            fold = gap is not None and gap.position is GapPosition.INSIDE
+            self.app.notify(FOLD_READ_ONLY_MESSAGE if fold else READ_ONLY_LINE_MESSAGE)
             return True
         if commenting and self._range_crosses_read_only_row():
             self.app.notify(RANGE_CROSSES_GAP_MESSAGE)
@@ -1338,6 +1344,7 @@ def _thread_lines(discussions: list[Discussion]) -> list[Text]:
 
 
 __all__ = [
+    "FOLD_READ_ONLY_MESSAGE",
     "GENERATED_COMMENT_MESSAGE",
     "RANGE_CROSSES_GAP_MESSAGE",
     "READ_ONLY_LINE_MESSAGE",
