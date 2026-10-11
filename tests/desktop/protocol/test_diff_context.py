@@ -890,6 +890,11 @@ async def test_generate_refuses_without_headroom_for_rows(tmp_path: Path) -> Non
 
         assert generated["status"] == "too_large"
         assert generated["message"] == GENERATE_NO_ROOM_MESSAGE
+        # Desktop-only wording in the terminal's style: the cause, then the fix.
+        assert generated["message"] == (
+            "The generated diff is too large to show with the other diffs "
+            "already open. Close one and try again."
+        )
         await wired.wire.call(
             "diff.page",
             {"snapshot": page["snapshot_id"], "resource": wired.review, "cursor": 0},

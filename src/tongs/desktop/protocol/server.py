@@ -161,8 +161,10 @@ CONTEXT_MISMATCH_MESSAGE = (
 """The terminal's wording for a file read that disagrees with the hunks."""
 DIFF_EXPIRED_MESSAGE = "This diff is no longer open. Reload it to continue."
 GENERATE_NO_ROOM_MESSAGE = (
-    "The generated diff is too large to show with the diffs already open."
+    "The generated diff is too large to show with the other diffs already open. "
+    "Close one and try again."
 )
+"""Desktop only: the terminal has no snapshot store, so it never refuses this."""
 
 SUPPORTED_CAPABILITIES = frozenset(
     {
