@@ -483,45 +483,113 @@ async def request_bytes(
     The response is streamed, so its host request slot is given back on every
     exit: a body past the limit, a cancellation and an error status. A
     ``Content-Length`` over the limit is refused before reading, and the limit
-    counts decoded bytes, so a compressed body cannot pass it. Redirects are
-    not followed, because they may lead to another host with the forge token;
-    a 3xx raises UnsupportedFileReadError. An error status is mapped with
-    ``map_http_error`` from at most ``ERROR_BODY_LIMIT`` bytes of its body, and
-    a rate limit is retried once, as ``request`` does.
+    counts decoded bytes, so a compressed body cannot pass it. An error status
+    is mapped with ``map_http_error`` from at most ``ERROR_BODY_LIMIT`` bytes
+    of its body, and a rate limit is retried once, as ``request`` does.
+
+    The client's own redirect handling is turned off for this read. A forge
+    answers a read of a renamed or transferred repository with a redirect to
+    the same API, so up to ``MAX_READ_REDIRECTS`` such redirects are followed
+    by hand (see ``_redirect_target``); any other redirect raises
+    UnsupportedFileReadError, because it may lead the forge token elsewhere.
     """
     if max_bytes < 0:
         raise ValueError("max_bytes must not be negative")
-    result = await _stream_bytes(client, path, max_bytes, params, headers)
-    if isinstance(result, bytes):
-        return result
-    delay = _rate_limit_retry_delay(result, "GET", path)
-    if delay is None:
-        raise result
-    # The first response is closed, so no host request slot is held here.
-    await _sleep(delay)
-    retried = await _stream_bytes(client, path, max_bytes, params, headers)
-    if isinstance(retried, bytes):
-        return retried
-    raise retried
+    target: str | httpx.URL = path
+    request_params = params
+    hops = 0
+    retried = False
+    while True:
+        result = await _stream_bytes(
+            client, target, max_bytes, request_params, headers, params
+        )
+        if isinstance(result, bytes):
+            return result
+        if isinstance(result, httpx.URL):
+            hops += 1
+            if hops > MAX_READ_REDIRECTS:
+                raise UnsupportedFileReadError(
+                    "The forge redirected the read too many times"
+                )
+            # The redirect target carries the query, checked against params.
+            target = result
+            request_params = None
+            continue
+        delay = None if retried else _rate_limit_retry_delay(result, "GET", path)
+        if delay is None:
+            raise result
+        retried = True
+        # The response is closed, so no host request slot is held here.
+        await _sleep(delay)
+
+
+#: The most same-API redirects one bounded read follows.
+MAX_READ_REDIRECTS = 2
+_FOLLOWED_REDIRECTS = frozenset({301, 302, 307, 308})
+
+
+def _redirect_target(
+    client: httpx.AsyncClient,
+    response: httpx.Response,
+    params: dict[str, str] | None,
+) -> httpx.URL:
+    """Return where a redirect may be followed, or raise UnsupportedFileReadError.
+
+    Only a 301, 302, 307 or 308 is followed, and only to a Location that,
+    resolved against the request, has the scheme, host and port of the
+    client's base URL, stays under its path (``/`` for api.github.com,
+    ``/api/v3/`` for GitHub Enterprise, ``/api/v4/`` for GitLab), carries no
+    user info or dot segment, and keeps every query parameter of the first
+    request, so a read never moves to another commit.
+    """
+    status = response.status_code
+    refused = UnsupportedFileReadError(
+        f"The forge answered the file read with a redirect ({status})"
+    )
+    location = response.headers.get("Location")
+    if status not in _FOLLOWED_REDIRECTS or not location:
+        raise refused
+    try:
+        target = response.request.url.join(location)
+    except (httpx.InvalidURL, ValueError):
+        raise refused from None
+    base = client.base_url
+    if (
+        target.scheme != base.scheme
+        or target.host != base.host
+        or target.port != base.port
+        or target.userinfo
+        or not target.path.startswith(base.path)
+        or any(segment in {".", ".."} for segment in target.path.split("/"))
+    ):
+        raise refused
+    for name, value in (params or {}).items():
+        if target.params.get_list(name) != [value]:
+            raise refused
+    return target.copy_with(fragment=None)
 
 
 async def _stream_bytes(
     client: httpx.AsyncClient,
-    path: str,
+    target: str | httpx.URL,
     max_bytes: int,
     params: dict[str, str] | None,
     headers: dict[str, str] | None,
-) -> bytes | ForgeError:
-    """Read one response; return its body or the error its status maps to."""
+    first_params: dict[str, str] | None,
+) -> bytes | httpx.URL | ForgeError:
+    """Read one response.
+
+    Return its body, the URL of a redirect that may be followed, or the error
+    its status maps to. ``first_params`` are the first request's query
+    parameters, which a followed redirect must keep.
+    """
     try:
         async with client.stream(
-            "GET", path, params=params, headers=headers, follow_redirects=False
+            "GET", target, params=params, headers=headers, follow_redirects=False
         ) as response:
             status = response.status_code
             if 300 <= status < 400:
-                raise UnsupportedFileReadError(
-                    f"The forge answered the file read with a redirect ({status})"
-                )
+                return _redirect_target(client, response, first_params)
             if status >= 400:
                 body = await _read_prefix(response, ERROR_BODY_LIMIT)
                 return map_http_error(_error_response(response, body))

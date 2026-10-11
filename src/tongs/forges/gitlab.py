@@ -208,6 +208,11 @@ class GitLabClient(ForgeClient):
         self._host = host
         self._http = http_client
 
+    @property
+    def revision_base_is_merge_base(self) -> bool:
+        """GitLab's ``diff_refs.base_sha`` is the merge base of the review."""
+        return True
+
     async def list_mrs(
         self,
         repo_path: str,
