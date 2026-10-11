@@ -245,7 +245,12 @@ async def test_e_on_a_fold_of_a_partial_file_opens_it_and_elsewhere_generates(
         ]
         assert len(remaining) == 2
 
-        # Away from a fold, e still generates the whole diff.
+        # Away from a fold and the lines it showed, e still generates the
+        # whole diff.
+        column.highlighted = next(
+            index for index, line in column._line_map.items() if line.new_lineno == 13
+        )
+        await pilot.pause()
         await pilot.press("e")
         await pilot.pause()
         assert [event.file is file for event in app.generate] == [True]

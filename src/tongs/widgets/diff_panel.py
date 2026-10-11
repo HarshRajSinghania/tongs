@@ -76,8 +76,11 @@ _TOKEN_SPLIT = re.compile(r"(\s+)")
 _TAB_SIZE = 4
 """Tab stop the lexers expand tabs to: Rich's ``Syntax`` default."""
 
-MOVE_TO_GAP_MESSAGE = 'Move to a "... unchanged lines ..." row to expand it.'
-"""Shown when ``e`` is pressed away from a gap row."""
+MOVE_TO_GAP_MESSAGE = (
+    'Move to a "... unchanged lines ..." row to expand it, '
+    "or to an expanded line to collapse it."
+)
+"""Shown when ``e`` is pressed on a row it can neither expand nor collapse."""
 
 NO_MORE_LINES_MESSAGE = "No more lines below."
 """Shown when the file turns out to end where the last hunk ends."""
@@ -431,6 +434,13 @@ class DiffOptionList(TintedOptionList):
             return gap.new_start
         line = self._readonly_rows.get(highlighted) or self._line_map.get(highlighted)
         return line.new_lineno if line is not None else None
+
+    def cursor_line(self) -> DiffLine | None:
+        """Return the expanded or hunk line under the cursor, if any."""
+        highlighted = self.highlighted
+        if highlighted is None:
+            return None
+        return self._readonly_rows.get(highlighted) or self._line_map.get(highlighted)
 
     def land_on(self, new_line: int) -> bool:
         """Move the cursor to the row that shows a new-side line number."""
@@ -1027,6 +1037,11 @@ class DiffContent(Widget):
             return self.query_one(SplitDiffView).cursor_gap()
         return self.query_one(DiffOptionList).cursor_gap()
 
+    def _cursor_line(self) -> DiffLine | None:
+        if self._effective_mode is DiffViewMode.SPLIT:
+            return self.query_one(SplitDiffView).cursor_line()
+        return self.query_one(DiffOptionList).cursor_line()
+
     def _cursor_new_line(self) -> int | None:
         if self._effective_mode is DiffViewMode.SPLIT:
             return self.query_one(SplitDiffView).cursor_new_line()
@@ -1091,6 +1106,59 @@ class DiffContent(Widget):
             self._render_current_file()
             self._land_on(gap.new_start)
             self.post_message(DiffSelectionChanged(self.selection))
+
+    def collapse_at_cursor(self, file: DiffFile) -> bool:
+        """Hide again the expanded line or opened fold under the cursor.
+
+        An expanded line collapses its whole gap back to its row, and a line
+        shown from a fold inside a hunk folds again; the cursor lands on that
+        row. In the whole-file view either one also turns the view off,
+        keeping what was open before it. The lines stay loaded, so ``e``
+        opens them again with no read. Returns False, changing nothing, when
+        the cursor is on neither, including a context line the hunk always
+        showed.
+        """
+        if self._current_file is not file or self._showing_preview:
+            return False
+        line = self._cursor_line()
+        if line is None or line.new_lineno is None:
+            return False
+        expansion = self.file_expansion(file)
+        if line.line_type is LineType.EXPANDED:
+            gap = next(
+                (
+                    segment.gap
+                    for segment in self._layout(file).segments
+                    if isinstance(segment, ExpandedBlock)
+                    and any(shown is line for shown in segment.lines)
+                ),
+                None,
+            )
+            if gap is None:
+                return False
+            self._set_expansion(file, expansion.collapse(gap.index))
+            self._render_current_file()
+            self._land_on(gap.new_start)
+            self.post_message(DiffSelectionChanged(self.selection))
+            return True
+        if line.line_type is not LineType.CONTEXT:
+            return False
+        refolded = expansion.refold(line.new_lineno)
+        if refolded == expansion:
+            return False
+        selection = self.selection
+        self._set_expansion(file, refolded)
+        self._render_current_file()
+        self._land_on(line.new_lineno)
+        fold = self.cursor_gap()
+        if fold is None or fold.position is not GapPosition.INSIDE:
+            # A thread or a draft keeps the line on screen, or it sits at the
+            # edge of a run where the hunk always shows it: nothing folded.
+            self._set_expansion(file, expansion)
+            self._render_current_file(selection)
+            return False
+        self.post_message(DiffSelectionChanged(self.selection))
+        return True
 
     def set_full_file(self, file: DiffFile, full: bool) -> None:
         """Switch the whole-file view of one file, keeping the reader's place.
@@ -2152,7 +2220,7 @@ class DiffPanel(Widget):
         Binding("N", "prev_file", "Prev file", show=False, key_display="N"),
         Binding("m", "preview_markdown", "Preview MD", show=False),
         Binding("v", "toggle_diff_mode", "Unified/Split", show=True),
-        Binding("e", "expand_context", "Expand", show=True),
+        Binding("e", "expand_context", "Expand/Collapse", show=True),
         Binding("F", "toggle_full_file", "Full file", show=True, key_display="F"),
     ]
 
@@ -2381,18 +2449,23 @@ class DiffPanel(Widget):
         )
 
     def action_expand_context(self) -> None:
-        """Open the gap under the cursor, reading the file the first time.
+        """Open the gap under the cursor, or close the one the cursor is in.
 
-        A fold inside a hunk opens at once: the forge already sent its lines.
-        On a file the forge truncated, ``e`` on a fold inside a hunk opens
-        it; on any other row it generates the diff locally, and pressing it
-        again cancels that.
+        The file is read the first time a gap opens. A fold inside a hunk
+        opens at once: the forge already sent its lines. On an expanded line,
+        or a line shown from a fold, ``e`` hides those lines again with no
+        read. On a file the forge truncated, ``e`` on any other row generates
+        the diff locally, and pressing it again cancels that.
         """
         file = self._shown_file()
         if file is None:
             return
         content = self.query_one("#diff-content", DiffContent)
         gap = content.cursor_gap()
+        if gap is None and content.collapse_at_cursor(file):
+            # Collapsing in the whole-file view turns it off.
+            self._update_header(file)
+            return
         if file.is_truncated and not file.is_binary:
             # A partly sent file still folds long context inside its hunks,
             # and those rows say e opens them.

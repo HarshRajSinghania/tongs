@@ -159,6 +159,34 @@ async def test_opening_makes_no_read_and_e_reads_the_head_once(
 
 
 @pytest.mark.asyncio
+async def test_e_collapses_an_expanded_gap_and_reexpands_with_no_read(
+    tmp_path: Path,
+) -> None:
+    reads = _Reads()
+    app = _install(tmp_path, reads)
+    async with app.run_test(size=(120, 50), notifications=True) as pilot:
+        _, option_list = await _open(app, pilot)
+        await _press_e_on_gap(app, pilot, option_list, 1)
+        assert "  15   15    line 15" in _rows(option_list)
+
+        option_list.highlighted = next(
+            index
+            for index, line in option_list._readonly_rows.items()
+            if line.new_lineno == 15
+        )
+        await pilot.press("e")
+        await _settle(app)
+        assert "  15   15    line 15" not in _rows(option_list)
+        cursor = _rows(option_list)[option_list.highlighted]
+        assert cursor.strip() == "... 3 unchanged lines (e to expand) ..."
+
+        await pilot.press("e")
+        await _settle(app)
+        assert "  15   15    line 15" in _rows(option_list)
+        assert len(reads.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_comment_on_an_expanded_line_is_refused_before_any_request(
     tmp_path: Path,
 ) -> None:

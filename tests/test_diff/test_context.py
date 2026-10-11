@@ -448,3 +448,47 @@ def test_file_expansion_is_immutable() -> None:
     assert opened.shown == frozenset({2})
     assert full.full is True and full.is_shown(7)
     assert full.toggle_full().full is False
+
+
+def test_collapse_hides_one_gap_and_keeps_the_others() -> None:
+    opened = FileExpansion().expand(0).expand(2)
+
+    collapsed = opened.collapse(0)
+    assert collapsed.shown == frozenset({2})
+    assert not collapsed.is_shown(0) and collapsed.is_shown(2)
+    # Hiding a gap that is not open changes nothing; opening it again works.
+    assert collapsed.collapse(0) == collapsed
+    assert collapsed.expand(0) == opened
+    assert opened.shown == frozenset({0, 2})
+
+
+def test_collapse_in_the_whole_file_view_turns_it_off_and_keeps_the_rest() -> None:
+    before = FileExpansion().expand(1).expand(2)
+    full = before.with_full(True)
+
+    collapsed = full.collapse(2)
+    assert collapsed.full is False
+    assert collapsed.shown == frozenset({1})
+    assert collapsed.is_shown(1) and not collapsed.is_shown(0)
+    # A gap that was not open before the whole-file view stays closed.
+    assert full.collapse(0) == before.with_full(False)
+
+
+def test_refold_closes_only_the_fold_that_shows_the_line() -> None:
+    file = _parse("two_hunks")
+    first = file.hunks[0].lines[0]
+    fold = DiffGap(-1, GapPosition.INSIDE, 0, 10, 10, 5)
+    other = DiffGap(-1, GapPosition.INSIDE, 0, 40, 40, 3)
+    opened = FileExpansion().reveal_fold(fold).reveal_fold(other).expand(1)
+
+    assert opened.refold(12).folds == frozenset({(40, 3)})
+    assert opened.refold(10).folds == frozenset({(40, 3)})
+    assert opened.refold(14).folds == frozenset({(40, 3)})
+    # Lines outside every opened fold close nothing.
+    assert opened.refold(15) == opened
+    assert opened.refold(9) == opened
+    # Gaps stay as they were, and the whole-file view turns off.
+    assert opened.refold(12).shown == frozenset({1})
+    assert opened.with_full(True).refold(15) == opened
+    assert not opened.refold(12).reveals(replace(first, new_lineno=12))
+    assert opened.refold(12).reveals(replace(first, new_lineno=41))

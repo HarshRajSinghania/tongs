@@ -19,6 +19,7 @@ import {
   createDiffFeature,
   fullFileTooLargeMessage,
   gapLabel,
+  hideLabel,
   resolveDiscussionTarget,
 } from "../../../desktop/dist/src/renderer/features/diff/index.js";
 import { clearPendingEdit } from "../../../desktop/dist/src/renderer/features/review/drawer.js";
@@ -424,6 +425,10 @@ function clickText(view, selector, text) {
   fireEvent.click(node);
 }
 
+function hideTexts(view) {
+  return texts(view, ".diff-unified .diff-gap-hide-button");
+}
+
 function warnings(view) {
   return texts(view, ".notice-warning > span:first-child");
 }
@@ -531,7 +536,8 @@ test("a gap longer than one read is read in chunks and short replies continue", 
   );
   // The rows window draws the first 200 rows of the 2,500 expanded ones.
   assert.equal(expandedLines(view)[0], "1/1:line 1");
-  assert.deepEqual(texts(view, ".window-position"), ["1-200 of 2503"]);
+  // The window counts the hide row above the expanded lines too.
+  assert.deepEqual(texts(view, ".window-position"), ["1-200 of 2504"]);
 });
 
 test("an empty gap after the last hunk says there are no more lines", async () => {
@@ -595,6 +601,139 @@ test("a refused read shows the terminal's message and leaves the gap", async () 
   assert.equal(CONTEXT_STATUS_MESSAGES.not_found, "The file was not found at this commit.");
   assert.equal(CONTEXT_STATUS_MESSAGES.binary, "Binary file, there are no lines to expand.");
   assert.equal(expandedLines(view).length, 0);
+});
+
+// ---------------------------------------------------------------- collapse
+
+test("a hide row collapses an expanded gap and expanding again reads nothing", async () => {
+  const review = "review-collapse";
+  const bridge = diffBridge(review, (layout) => expandableRows(layout));
+  const view = renderDiff(review, bridge);
+  await waitFor(() => assert.equal(gapTexts(view).length, 3));
+  assert.deepEqual(hideTexts(view), []);
+
+  clickText(view, ".diff-gap-button", "3 unchanged lines");
+  await waitFor(() => assert.equal(expandedLines(view).length, 3));
+  assert.deepEqual(hideTexts(view), ["... hide 3 lines"]);
+  // The hide row leads the expanded lines and is a button with a name.
+  assert.deepEqual(
+    [
+      ...view.container.querySelectorAll(
+        ".diff-unified .diff-hunk:not(.diff-gap), .diff-unified .diff-gap-hide, .diff-unified .line-expanded",
+      ),
+    ].map((node) =>
+      node.classList.contains("diff-gap-hide")
+        ? "hide"
+        : node.classList.contains("diff-hunk")
+          ? "hunk"
+          : "expanded",
+    ),
+    ["hunk", "hide", "expanded", "expanded", "expanded", "hunk"],
+  );
+  const hide = view.container.querySelector(".diff-gap-hide-button");
+  assert.equal(hide.tagName, "BUTTON");
+  assert.equal(hide.getAttribute("aria-label"), "Hide 3 unchanged lines");
+  assert.equal(hideLabel(1), "... hide 1 line");
+  assert.equal(hideLabel(12_345), "... hide 12,345 lines");
+  assert.ok([...hideLabel(12_345)].every((char) => char.charCodeAt(0) < 128));
+
+  // Enter on the hide row collapses the gap; focus moves to its gap row.
+  hide.focus();
+  fireEvent.keyDown(hide, { key: "Enter" });
+  await waitFor(() => assert.equal(expandedLines(view).length, 0));
+  assert.deepEqual(hideTexts(view), []);
+  assert.deepEqual(gapTexts(view), [
+    "4 unchanged lines",
+    "3 unchanged lines",
+    "7 unchanged lines",
+  ]);
+  assert.equal(document.activeElement?.textContent, "3 unchanged lines");
+  assert.equal(bridge.calls.context.length, 1);
+
+  // Expanding again uses the lines already read.
+  clickText(view, ".diff-gap-button", "3 unchanged lines");
+  await waitFor(() => assert.equal(expandedLines(view).length, 3));
+  assert.deepEqual(hideTexts(view), ["... hide 3 lines"]);
+  assert.equal(bridge.calls.context.length, 1);
+
+  // A click collapses it too.
+  clickText(view, ".diff-gap-hide-button", "... hide 3 lines");
+  await waitFor(() => assert.equal(expandedLines(view).length, 0));
+  assert.equal(bridge.calls.context.length, 1);
+});
+
+test("hiding a gap with Full file on turns it off and keeps the gaps shown before", async () => {
+  const review = "review-collapse-full";
+  const bridge = diffBridge(review, (layout) => expandableRows(layout));
+  const view = renderDiff(review, bridge);
+  await waitFor(() => assert.equal(gapTexts(view).length, 3));
+
+  clickText(view, ".diff-gap-button", "3 unchanged lines");
+  await waitFor(() => assert.equal(expandedLines(view).length, 3));
+  fireEvent.click(view.getByText("Full file"));
+  await waitFor(() => assert.equal(expandedLines(view).length, 14));
+  assert.deepEqual(hideTexts(view), [
+    "... hide 4 lines",
+    "... hide 3 lines",
+    "... hide 7 lines",
+  ]);
+  const reads = bridge.calls.context.length;
+
+  clickText(view, ".diff-gap-hide-button", "... hide 4 lines");
+  await waitFor(() => assert.equal(fullFileState(view).pressed, "false"));
+  // The middle gap was expanded before Full file, so it stays expanded.
+  assert.deepEqual(gapTexts(view), ["4 unchanged lines", "7 unchanged lines"]);
+  assert.deepEqual(expandedLines(view), [
+    "8/9:line 9",
+    "9/10:line 10",
+    "10/11:line 11",
+  ]);
+  assert.deepEqual(hideTexts(view), ["... hide 3 lines"]);
+  assert.equal(bridge.calls.context.length, reads);
+
+  // Full file on and off again behaves as before.
+  fireEvent.click(view.getByText("Full file"));
+  await waitFor(() => assert.equal(expandedLines(view).length, 14));
+  fireEvent.click(view.getByText("Full file"));
+  await waitFor(() => assert.equal(fullFileState(view).pressed, "false"));
+  assert.equal(expandedLines(view).length, 3);
+  assert.equal(bridge.calls.context.length, reads);
+});
+
+test("split view draws the hide row in both panes and either one collapses", async () => {
+  const review = "review-collapse-split";
+  const bridge = diffBridge(review, (layout) => expandableRows(layout));
+  const view = renderDiff(review, bridge);
+  await waitFor(() => assert.equal(gapTexts(view).length, 3));
+  fireEvent.click(view.getByText("Split"));
+  await waitFor(() =>
+    assert.equal(texts(view, ".split-pane-new .diff-gap-button").length, 3),
+  );
+
+  clickText(view, ".split-pane-new .diff-gap-button", "3 unchanged lines");
+  await waitFor(() =>
+    assert.equal(texts(view, ".split-pane-new .line-expanded").length, 3),
+  );
+  assert.deepEqual(texts(view, ".split-pane-old .diff-gap-hide-button"), [
+    "... hide 3 lines",
+  ]);
+  assert.deepEqual(texts(view, ".split-pane-new .diff-gap-hide-button"), [
+    "... hide 3 lines",
+  ]);
+
+  clickText(view, ".split-pane-old .diff-gap-hide-button", "... hide 3 lines");
+  await waitFor(() =>
+    assert.equal(texts(view, ".split-pane-new .line-expanded").length, 0),
+  );
+  assert.equal(texts(view, ".diff-gap-hide-button").length, 0);
+  assert.equal(texts(view, ".split-pane-old .diff-gap-button").length, 3);
+  // Focus lands on the gap row of the pane the reader used.
+  assert.equal(document.activeElement?.textContent, "3 unchanged lines");
+  assert.equal(
+    document.activeElement?.closest(".split-pane")?.classList.contains("split-pane-old"),
+    true,
+  );
+  assert.equal(bridge.calls.context.length, 1);
 });
 
 // ---------------------------------------------------------------- Full file

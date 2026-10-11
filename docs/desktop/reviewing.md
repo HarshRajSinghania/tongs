@@ -71,6 +71,12 @@ lines below** until tongs knows how long the file is.
   per request, and keeps them while the diff is open, so expanding again or
   turning on **Full file** reads nothing more. **Refresh** and a layout switch
   start again with every gap collapsed.
+- **Collapse a gap.** Each expanded gap starts with a row such as
+  **... hide 42 lines**. Click it, or focus it and press ++enter++, to put the
+  gap row back; focus moves to that gap row. Collapsing reads nothing, and
+  expanding the gap again uses the lines already read. With **Full file** on,
+  hiding a gap turns **Full file** off and keeps the gaps you had expanded
+  before.
 - **Full file.** The toolbar's **Full file** expands every gap of the selected
   file. Turning it off brings back the gaps you had expanded before, and moving
   to another file turns it off. It stops at 20,000 lines on screen and asks

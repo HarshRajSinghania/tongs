@@ -683,8 +683,22 @@ class SplitDiffView(Widget):
         line = new_column._readonly_rows.get(index) or new_column._line_map.get(index)
         return line.new_lineno if line is not None else None
 
+    def cursor_line(self) -> DiffLine | None:
+        """Return the expanded or unchanged line under the cursor, if any.
+
+        Both are drawn in the new column too, so it answers for either side.
+        """
+        index = self._cursor_column().highlighted
+        if index is None:
+            return None
+        new_column = self._column(DiffSide.NEW)
+        return new_column._readonly_rows.get(index) or new_column._line_map.get(index)
+
     def land_on(self, new_line: int) -> bool:
-        """Move the cursor to the row that shows a new-side line number."""
+        """Move the cursor to the row that shows a new-side line number.
+
+        A line that a gap row or a fold now hides lands on that row.
+        """
         new_column = self._column(DiffSide.NEW)
         rows = {**new_column._line_map, **new_column._readonly_rows}
         index = next(

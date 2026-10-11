@@ -180,6 +180,11 @@ export function gapLabel(count: number | null): string {
   return `${count.toLocaleString("en-US")} unchanged ${count === 1 ? "line" : "lines"}`;
 }
 
+/** The text of the row above an expanded gap, which collapses it again. */
+export function hideLabel(count: number): string {
+  return `... hide ${count.toLocaleString("en-US")} ${count === 1 ? "line" : "lines"}`;
+}
+
 /** The progress line while a file's diff is generated locally. */
 export function generatingNotice(file: DiffFileRow): string {
   const oneSide = file.status === "added" || file.status === "deleted";
@@ -787,8 +792,22 @@ type FeatureContributionParameters = Parameters<
   FeatureContribution["render"]
 >[0];
 
-/** A row the diff view draws: a snapshot row, or an expanded unchanged line. */
-type DiffViewRow = DiffWireRow | DiffContextRow;
+/**
+ * The row above an expanded gap's lines. It exists only in the renderer and
+ * collapses the gap back to its gap row without asking the sidecar.
+ */
+interface DiffHideRow {
+  readonly kind: "hide";
+  readonly file_index: number;
+  readonly gap_index: number;
+  readonly count: number;
+}
+
+/**
+ * A row the diff view draws: a snapshot row, an expanded unchanged line, or
+ * the row that hides an expanded gap again.
+ */
+type DiffViewRow = DiffWireRow | DiffContextRow | DiffHideRow;
 
 /** One gap's unchanged lines, read once per open diff. */
 type GapLines = readonly DiffContextRow[];
@@ -1010,6 +1029,30 @@ class DiffContextStore {
       fullLoading: false,
     });
     this.succeed();
+  }
+
+  /**
+   * Collapses one expanded gap back to its gap row. Its lines stay cached, so
+   * expanding it again reads nothing. With Full file on, collapsing a gap
+   * turns Full file off and keeps the gaps that were expanded before it.
+   */
+  collapse(fileIndex: number, gapIndex: number): boolean {
+    const current = this.file(fileIndex);
+    if (current.fullLoading) return false;
+    if (current.full !== null) {
+      this.update(fileIndex, {
+        shown: withoutItem(current.full, gapIndex),
+        full: null,
+        message: null,
+      });
+      return true;
+    }
+    if (!current.shown.has(gapIndex)) return false;
+    this.update(fileIndex, {
+      shown: withoutItem(current.shown, gapIndex),
+      message: null,
+    });
+    return true;
   }
 
   /** Turns Full file off for a file the reader has left. */
@@ -1304,7 +1347,8 @@ class DiffContextStore {
 }
 
 /**
- * One file's rows with its expanded gaps replaced by their unchanged lines.
+ * One file's rows with its expanded gaps replaced by their unchanged lines,
+ * each led by the row that hides them again.
  * A collapsed gap stays a gap row; the gap after the last hunk takes its
  * length once a read has said how long the file is, and disappears when the
  * file ends where the last hunk ends.
@@ -1324,6 +1368,15 @@ function expandFileRows(
       ? context.lines.get(row.gap_index)
       : undefined;
     if (lines !== undefined) {
+      if (lines.length > 0)
+        result.push(
+          Object.freeze({
+            kind: "hide",
+            file_index: row.file_index,
+            gap_index: row.gap_index,
+            count: lines.length,
+          }),
+        );
       for (const line of lines) result.push(line);
       continue;
     }
@@ -1349,9 +1402,18 @@ function generatedSlice(rows: readonly DiffWireRow[]): FileSlice {
   return slice;
 }
 
+/** Where keyboard focus goes once a gap collapses: its gap row, in one pane. */
+interface CollapsedFocus {
+  current: { readonly gap: number; readonly side: "old" | "new" | null } | null;
+}
+
 /** Row presentation that depends on the file's context and generation. */
 interface RowExtras {
   readonly expandGap: (gap: DiffGapRow) => void;
+  /** Collapses an expanded gap again, with no sidecar call; false if not. */
+  readonly collapseGap: (row: DiffHideRow) => boolean;
+  /** Set when a gap collapses, so its gap row takes focus once it mounts. */
+  readonly collapsedFocus: CollapsedFocus;
   readonly loadingGaps: ReadonlySet<number>;
   /** Shows a refusal for this file, such as a comment on an expanded line. */
   readonly refuse: (message: string) => void;
@@ -1591,6 +1653,8 @@ function DiffWorkspace({
   // Full file belongs to the file it was turned on for: leaving the file turns
   // it off and brings back the gaps shown before.
   const fullFileOf = useRef(selected);
+  // The gap row that takes focus after its hide row collapses it.
+  const collapsedFocus = useRef<CollapsedFocus["current"]>(null);
   useEffect(() => {
     if (fullFileOf.current === selected) return;
     contextStore.leaveFull(fullFileOf.current);
@@ -1624,6 +1688,8 @@ function DiffWorkspace({
         : fullFileRefusal(selectedFile, selectedSlice.rows, selectedGenerated);
   const extras: RowExtras = {
     expandGap: (gap) => void contextStore.expand(gap),
+    collapseGap: (row) => contextStore.collapse(row.file_index, row.gap_index),
+    collapsedFocus,
     loadingGaps: fileContext.loading,
     refuse: (message) => contextStore.notify(selected, message),
     readOnly: selectedGenerated,
@@ -2114,7 +2180,8 @@ function DiffRowsWindow({
   const sourceItems = useMemo(
     () =>
       items.filter(
-        (row): row is DiffRow => row.kind !== "gap" && row.kind !== "context",
+        (row): row is DiffRow =>
+          row.kind !== "gap" && row.kind !== "context" && row.kind !== "hide",
       ),
     [items],
   );
@@ -2374,6 +2441,7 @@ function DiffRowView({
     );
   if (row.kind === "split") return null;
   if (row.kind === "gap") return <GapRowView row={row} extras={extras} />;
+  if (row.kind === "hide") return <HideRowView row={row} extras={extras} />;
   if (row.kind === "context")
     return (
       <div
@@ -2958,7 +3026,10 @@ function SplitPaneRow({
       </div>
     );
   // A gap spans both panes, so each pane draws it and either one expands it.
-  if (row.kind === "gap") return <GapRowView row={row} extras={extras} split />;
+  if (row.kind === "gap")
+    return <GapRowView row={row} extras={extras} side={side} />;
+  if (row.kind === "hide")
+    return <HideRowView row={row} extras={extras} side={side} />;
   if (row.kind === "context") {
     const line = side === "old" ? row.old_line : row.new_line;
     return (
@@ -3159,26 +3230,40 @@ function FileBadges({
   );
 }
 
-/** A collapsed gap: activating it reads and shows its unchanged lines. */
+/**
+ * A collapsed gap: activating it reads and shows its unchanged lines. `side`
+ * names the split pane that draws it; a unified row has none.
+ */
 function GapRowView({
   row,
   extras,
-  split = false,
+  side = null,
 }: {
   readonly row: DiffGapRow;
   readonly extras: RowExtras;
-  readonly split?: boolean;
+  readonly side?: "old" | "new" | null;
 }): ReactNode {
   const loading = extras.loadingGaps.has(row.gap_index);
   const expand = (): void => extras.expandGap(row);
+  const button = useRef<HTMLButtonElement>(null);
+  // A gap that was just collapsed from its hide row takes the focus that row
+  // had, in the same pane, so the keyboard stays where the reader was.
+  useEffect(() => {
+    const target = extras.collapsedFocus.current;
+    if (target === null || target.gap !== row.gap_index || target.side !== side)
+      return;
+    extras.collapsedFocus.current = null;
+    button.current?.focus();
+  }, [extras.collapsedFocus, row.gap_index, side]);
   return (
     <div
-      className={`diff-hunk diff-gap${split ? " split-metadata" : ""}`}
+      className={`diff-hunk diff-gap${side === null ? "" : " split-metadata"}`}
       role="listitem"
       data-gap-index={row.gap_index}
       data-gap-position={row.position}
     >
       <button
+        ref={button}
         className="button button-quiet diff-gap-button"
         aria-busy={loading}
         aria-label={
@@ -3190,6 +3275,38 @@ function GapRowView({
         onKeyDown={(event) => activateOnKeyboard(event, expand)}
       >
         {loading ? "Loading…" : gapLabel(row.count)}
+      </button>
+    </div>
+  );
+}
+
+/** The row above an expanded gap: activating it collapses the gap again. */
+function HideRowView({
+  row,
+  extras,
+  side = null,
+}: {
+  readonly row: DiffHideRow;
+  readonly extras: RowExtras;
+  readonly side?: "old" | "new" | null;
+}): ReactNode {
+  const hide = (): void => {
+    extras.collapsedFocus.current = { gap: row.gap_index, side };
+    if (!extras.collapseGap(row)) extras.collapsedFocus.current = null;
+  };
+  return (
+    <div
+      className={`diff-hunk diff-gap diff-gap-hide${side === null ? "" : " split-metadata"}`}
+      role="listitem"
+      data-gap-index={row.gap_index}
+    >
+      <button
+        className="button button-quiet diff-gap-hide-button"
+        aria-label={`Hide ${row.count.toLocaleString("en-US")} unchanged ${row.count === 1 ? "line" : "lines"}`}
+        onClick={hide}
+        onKeyDown={(event) => activateOnKeyboard(event, hide)}
+      >
+        {hideLabel(row.count)}
       </button>
     </div>
   );

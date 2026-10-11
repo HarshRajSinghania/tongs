@@ -80,13 +80,20 @@ long the file is. Long unchanged stretches inside a change fold the same way.
 
 | Key | Action |
 |-----|--------|
-| ++e++ | Expand the gap row under the cursor |
+| ++e++ | Expand the gap row under the cursor, or collapse the expanded lines under it |
 | ++shift+f++ | Show the whole file, or go back to what you had expanded |
 
 - **One request per file.** The first ++e++ or ++shift+f++ on a file reads it
   from the forge at the review's latest commit, once. Later expands and the
   whole-file view use that copy. Opening a diff never reads a file, and a fold
   inside a change opens without any request.
+- **Collapse.** ++e++ toggles. On an expanded line it hides that gap again and
+  puts the cursor on its gap row. On a line shown from a fold inside a change
+  it folds those lines again. Lines a change always showed stay as they are.
+  Collapsing needs no request, and ++e++ on the gap row brings the lines back
+  from the copy tongs already has. In the whole-file view, ++e++ on a line it
+  showed turns the view off and hides that gap or fold, keeping the gaps you
+  had expanded before.
 - **Both views.** Expanding works the same in unified and split view, and
   ++v++ keeps what you expanded. Expanded lines show both line numbers and the
   same syntax highlighting as the rest of the file.
@@ -116,7 +123,8 @@ GitLab marks it as too large. tongs keeps the file in the tree and shows:
 
 When the forge sends only part of a file's diff, the same notice stands above
 the parts it sent, in both views. ++e++ on a fold inside those parts opens the
-fold; anywhere else it generates the diff.
+fold, and on a line the fold showed it folds them again; anywhere else it
+generates the diff.
 
 | Key | Action |
 |-----|--------|
@@ -132,9 +140,9 @@ fold; anywhere else it generates the diff.
   (downloading 2 files). Press e again to cancel." Press ++e++ again to stop
   it. ++ctrl+r++, leaving the review and reloading the diff stop it too. The
   notice then says "Cancelled. Press e to try again."
-- **Expanding a generated diff.** Gap rows and ++shift+f++ work as described
-  in [Expanding context](#expanding-context), with no further request,
-  because tongs already has the file.
+- **Expanding a generated diff.** Gap rows, collapsing and ++shift+f++ work
+  as described in [Expanding context](#expanding-context), with no further
+  request, because tongs already has the file.
 - **Kept while tongs runs.** tongs keeps the last 8 generated diffs in memory,
   so generating the same file again, for example after reopening the review,
   needs no download. A new commit on the review starts over.

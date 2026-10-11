@@ -190,7 +190,10 @@ Unchanged lines outside the hunks expand in place. `e` (`expand_context`) and
 `F` (`toggle_full_file`, "Full file") are bound on `DiffPanel`, so they work
 from either layout and from both split columns, and the help panel lists them.
 `e` opens the gap row under the cursor; on an in-hunk fold it opens with no
-read. `F` shows the whole current file in both layouts, per file, and resets
+read. `e` on an expanded line, or on a context line shown from a fold, hides
+it again through `DiffContent.collapse_at_cursor()` (`FileExpansion.collapse`
+and `refold`), with no read, and lands on the gap row or fold; in the
+whole-file view that also turns `F` off. `F` shows the whole current file in both layouts, per file, and resets
 when another file is shown. The widgets never read files: they post
 `ContextRequested(file, gap_index)` (None for `F`), and `MRDetailScreen` reads
 the file at the displayed head once and answers through

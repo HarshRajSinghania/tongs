@@ -461,7 +461,7 @@ async def test_help_panel_lists_expand_and_full_file() -> None:
         console.print(table)
         listed = console.file.getvalue()
 
-        assert "Expand" in listed
+        assert "Expand/Collapse" in listed
         assert "Full file" in listed
 
 

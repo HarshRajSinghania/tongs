@@ -386,6 +386,27 @@ class FileExpansion:
         """Return this expansion with one more in-hunk fold shown."""
         return replace(self, folds=self.folds | {(gap.new_start, gap.length or 0)})
 
+    def collapse(self, gap_index: int) -> FileExpansion:
+        """Return this expansion with one gap hidden again.
+
+        Hiding a gap means the reader no longer wants the whole file, so the
+        whole-file view turns off and the gaps opened before it stay open.
+        """
+        return replace(self, shown=self.shown - {gap_index}, full=False)
+
+    def refold(self, new_line: int) -> FileExpansion:
+        """Return this expansion with the folds showing a line closed again.
+
+        Like :meth:`collapse`, it turns the whole-file view off, keeping the
+        folds and gaps that were open before it.
+        """
+        folds = frozenset(
+            (start, length)
+            for start, length in self.folds
+            if not start <= new_line < start + length
+        )
+        return replace(self, folds=folds, full=False)
+
     def toggle_full(self) -> FileExpansion:
         """Return this expansion with the whole-file view switched."""
         return replace(self, full=not self.full)
