@@ -2384,8 +2384,9 @@ class DiffPanel(Widget):
         """Open the gap under the cursor, reading the file the first time.
 
         A fold inside a hunk opens at once: the forge already sent its lines.
-        On a file the forge truncated, ``e`` on any row generates its diff
-        locally instead, and pressing it again cancels that.
+        On a file the forge truncated, ``e`` on a fold inside a hunk opens
+        it; on any other row it generates the diff locally, and pressing it
+        again cancels that.
         """
         file = self._shown_file()
         if file is None:

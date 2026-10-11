@@ -932,7 +932,9 @@ class DiffContextStore {
     )
       return;
     if (!current.lines.has(gap.gap_index)) {
-      if ((await this.load(gap, false)) !== "ok") return;
+      const outcome = await this.load(gap, false);
+      if (outcome === "empty") this.succeed();
+      if (outcome !== "ok") return;
     }
     const now = this.file(gap.file_index);
     this.update(gap.file_index, {
