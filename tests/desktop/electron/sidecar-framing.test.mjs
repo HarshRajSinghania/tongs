@@ -139,3 +139,22 @@ test("a terminated frame one byte over the limit is an invalid frame", async () 
   await assert.rejects(pending.result, { code: "invalid_frame" });
   assert.deepEqual(crashes, ["invalid_frame"]);
 });
+
+test("a bad frame fails the connection, and the frames after it are not read", async () => {
+  const fake = harness();
+  const transport = transportFor(fake);
+  await transport.start();
+  const crashes = watchCrashes(transport);
+  const events = [];
+  transport.on("event", (event) => events.push(event.name));
+  const pending = transport.requestRead("reviews.list", {});
+  const event = (sequence) =>
+    `${JSON.stringify({ v: 1, type: "event", sequence, event: "tick", data: {} })}\n`;
+  fake.children[0].stdout.write(Buffer.from(`not json\n${event(1)}`));
+  await assert.rejects(pending.result, { code: "invalid_frame" });
+  // A later chunk from the same child is not read either.
+  fake.children[0].stdout.write(Buffer.from(event(2)));
+  await nextTurn();
+  assert.deepEqual(events, []);
+  assert.deepEqual(crashes, ["invalid_frame"]);
+});

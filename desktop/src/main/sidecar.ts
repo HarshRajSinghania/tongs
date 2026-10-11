@@ -479,7 +479,9 @@ export class SidecarTransport extends EventEmitter {
   }
 
   private consume(child: ChildProcessWithoutNullStreams, generation: number, chunk: Buffer): void {
-    if (this.child !== child || this.generation !== generation) return;
+    // A failed connection reads nothing more: the child is being stopped, and
+    // a frame after the bad one must not reach a listener.
+    if (this.child !== child || this.generation !== generation || this.failureReported) return;
     let start = 0;
     while (true) {
       // Only the new chunk is scanned: the held tail is known to hold no newline.
@@ -497,7 +499,7 @@ export class SidecarTransport extends EventEmitter {
         return;
       }
       this.consumeFrame(child, generation, raw);
-      if (this.child !== child || this.generation !== generation) return;
+      if (this.child !== child || this.generation !== generation || this.failureReported) return;
     }
   }
 
