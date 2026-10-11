@@ -86,14 +86,59 @@ export type DiffLayout = "unified" | "split";
 export interface SplitDiffCell { readonly old_line: number | null; readonly new_line: number | null; readonly content: string; readonly line_type: string; readonly anchor_side: "old" | "new" | null; }
 export interface SplitDiffRow { readonly kind: "split"; readonly file_index: number; readonly hunk_index: number; readonly row_index: number; readonly old: SplitDiffCell | null; readonly new: SplitDiffCell | null; }
 export type DiffRow = DiffFileRow | DiffHunkRow | DiffLineRow | SplitDiffRow;
+export type DiffGapPosition = "before" | "between" | "after";
+export const DIFF_GAP_POSITIONS: readonly DiffGapPosition[] = Object.freeze(["before", "between", "after"]);
+/**
+ * Unchanged lines the diff does not show, before the hunk that follows it or,
+ * for `after`, past the file's last hunk. Only a diff opened with `gaps: true`
+ * carries these rows. `count` is null only for `after`, whose length is known
+ * once the file is read (`line_count` of a context read), and may be zero.
+ */
+export interface DiffGapRow { readonly kind: "gap"; readonly file_index: number; readonly gap_index: number; readonly position: DiffGapPosition; readonly old_start: number; readonly new_start: number; readonly count: number | null; }
+/** Every row a diff snapshot can hold, gap rows included. */
+export type DiffWireRow = DiffRow | DiffGapRow;
 export interface SnapshotPage<T, R extends JsonObject> { readonly snapshot_id: string; readonly resource: OpaqueHandle; readonly revision: R; readonly cursor: number; readonly next_cursor: number | null; readonly entries: readonly T[]; }
-export type DiffPage = SnapshotPage<DiffRow, ReviewRevisionDto & JsonObject>;
+export type DiffPage<T extends DiffWireRow = DiffRow> = SnapshotPage<T, ReviewRevisionDto & JsonObject>;
 /**
  * `from_snapshot` names a diff snapshot already open for this review. The
  * sidecar then projects the same read again in `layout`, with no forge request,
- * or reads the forge afresh when it no longer holds that read.
+ * or reads the forge afresh when it no longer holds that read. `gaps` adds gap
+ * rows around the hunks of every file whose unchanged lines can be shown.
  */
-export interface OpenDiffParams { readonly review: OpaqueHandle; readonly layout?: DiffLayout; readonly max_items?: number; readonly from_snapshot?: string; }
+export interface OpenDiffParams { readonly review: OpaqueHandle; readonly layout?: DiffLayout; readonly max_items?: number; readonly from_snapshot?: string; readonly gaps?: boolean; }
+/** The most unchanged lines one `diff.context` read returns. */
+export const MAX_DIFF_CONTEXT_LINES = 1000;
+/**
+ * Unchanged lines from `new_start` in one gap of file `file_index` of the
+ * open diff `snapshot`. The service never takes a path or a commit.
+ */
+export interface DiffContextParams { readonly review: OpaqueHandle; readonly snapshot: string; readonly file_index: number; readonly new_start: number; readonly count: number; }
+export type DiffContextStatus = "ok" | "too_large" | "binary" | "not_found" | "mismatch" | "unsupported" | "expired";
+export const DIFF_CONTEXT_STATUSES: readonly DiffContextStatus[] = Object.freeze(["ok", "too_large", "binary", "not_found", "mismatch", "unsupported", "expired"]);
+/** One unchanged, read-only line: never a comment anchor. */
+export interface DiffContextRow { readonly kind: "context"; readonly file_index: number; readonly old_line: number; readonly new_line: number; readonly content: string; }
+/**
+ * `rows` stop at the end of the gap, at `count`, or at the response size
+ * bound; ask again from the next line for the rest. `line_count` is the new
+ * file's length when the read succeeded. Any other status has a `message` and
+ * no rows; `expired` means the open diff is gone and must be reloaded.
+ */
+export interface DiffContextResult { readonly status: DiffContextStatus; readonly message: string | null; readonly line_count: number | null; readonly rows: readonly DiffContextRow[]; }
+export interface GenerateDiffParams { readonly review: OpaqueHandle; readonly snapshot: string; readonly file_index: number; }
+export type GenerateDiffStatus = "ok" | "too_large" | "binary" | "not_found" | "unsupported" | "not_truncated" | "no_merge_base" | "expired";
+export const GENERATE_DIFF_STATUSES: readonly GenerateDiffStatus[] = Object.freeze(["ok", "too_large", "binary", "not_found", "unsupported", "not_truncated", "no_merge_base", "expired"]);
+/**
+ * A generated diff is the first page of a one-file diff snapshot at the
+ * file's original index; later pages come from `pageDiff`. Any other status
+ * carries a message and no snapshot.
+ */
+export type GenerateDiffResult =
+  | (DiffPage & { readonly status: "ok"; readonly message: null; readonly generated: true })
+  | {
+      readonly status: Exclude<GenerateDiffStatus, "ok">; readonly message: string; readonly generated: false;
+      readonly snapshot_id: null; readonly resource: null; readonly revision: null;
+      readonly cursor: null; readonly next_cursor: null; readonly entries: readonly [];
+    };
 export interface PageParams { readonly snapshot: string; readonly resource: OpaqueHandle; readonly cursor: number; readonly max_items?: number; }
 
 /** `file_path` is null on a review-level note, which carries no inline position. */
@@ -149,8 +194,12 @@ export interface DesktopBridge extends CIDesktopBridge, ReviewDesktopBridge, Wor
   listReviews(params: ListReviewsParams): DesktopRead<ReviewListResult>;
   getReview(review: OpaqueHandle): DesktopRead<ReviewSnapshotDto>;
   getReviewCIStatus(params: ReviewCIStatusParams): DesktopRead<ReviewCIStatusResult>;
+  openDiff(params: OpenDiffParams & { readonly gaps: true }): DesktopRead<DiffPage<DiffWireRow>>;
   openDiff(params: OpenDiffParams): DesktopRead<DiffPage>;
-  pageDiff(params: PageParams): DesktopRead<DiffPage>;
+  /** Pages of a snapshot opened with `gaps: true` hold gap rows too: pass `DiffWireRow`. */
+  pageDiff<T extends DiffWireRow = DiffRow>(params: PageParams): DesktopRead<DiffPage<T>>;
+  getDiffContext(params: DiffContextParams): DesktopRead<DiffContextResult>;
+  generateDiff(params: GenerateDiffParams): DesktopRead<GenerateDiffResult>;
   listDiscussions(review: OpaqueHandle): DesktopRead<DiscussionsPage>;
   pageDiscussions(params: PageParams): DesktopRead<DiscussionsPage>;
   listCommits(review: OpaqueHandle): DesktopRead<CommitsResult>;
@@ -174,7 +223,7 @@ export const IPC_CHANNELS = Object.freeze({
   discoverRepositories: "tongs:repositories.discover", openRepository: "tongs:repositories.open",
   listReviews: "tongs:reviews.list", getReview: "tongs:reviews.get",
   getReviewCIStatus: "tongs:reviews.ci-status", openDiff: "tongs:diff.open",
-  pageDiff: "tongs:diff.page", listDiscussions: "tongs:discussions.list",
+  pageDiff: "tongs:diff.page", getDiffContext: "tongs:diff.context", generateDiff: "tongs:diff.generate", listDiscussions: "tongs:discussions.list",
   pageDiscussions: "tongs:discussions.page", listCommits: "tongs:commits.list",
   listPipelines: "tongs:pipelines.list", listReviewPipelines: "tongs:review-pipelines.list", listJobs: "tongs:jobs.list",
   openLog: "tongs:logs.open", pageLog: "tongs:logs.page", listPlugins: "tongs:plugins.list",

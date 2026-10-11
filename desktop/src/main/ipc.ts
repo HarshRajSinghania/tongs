@@ -60,6 +60,8 @@ const OPERATIONS = new Map<string, string>([
   [IPC_CHANNELS.getReviewCIStatus, "reviews.ci_status"],
   [IPC_CHANNELS.openDiff, "diff.open"],
   [IPC_CHANNELS.pageDiff, "diff.page"],
+  [IPC_CHANNELS.getDiffContext, "diff.context"],
+  [IPC_CHANNELS.generateDiff, "diff.generate"],
   [IPC_CHANNELS.listDiscussions, "discussions.list"],
   [IPC_CHANNELS.pageDiscussions, "discussions.page"],
   [IPC_CHANNELS.listCommits, "commits.list"],
